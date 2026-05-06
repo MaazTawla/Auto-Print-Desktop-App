@@ -1,0 +1,1461 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tawla Print Agent</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #080a0e;
+      --surface: #10141c;
+      --surface-hi: #161c27;
+      --border: #1e2533;
+      --border-hi: #2a3344;
+      --text: #e8eaf0;
+      --muted: #7a8499;
+      --accent: #00d4a0;
+      --accent-dim: #062920;
+      --red: #ff5c7a;
+      --red-dim: #2a1018;
+      --yellow: #e8b84a;
+      --yellow-dim: #2a2210;
+      --mono: 'Consolas', 'Courier New', monospace;
+      --display: 'Segoe UI', system-ui, sans-serif;
+    }
+
+    :root[data-theme="light"] {
+      --bg: #f3f6fb;
+      --surface: #ffffff;
+      --surface-hi: #f7f9fd;
+      --border: #d7dfea;
+      --border-hi: #b7c3d6;
+      --text: #1b2230;
+      --muted: #5e6b82;
+      --accent: #0a8f73;
+      --accent-dim: #d9f2ec;
+      --red: #c53a56;
+      --red-dim: #fce3e8;
+      --yellow: #9a6b00;
+      --yellow-dim: #fff1cc;
+    }
+
+    html, body {
+      height: 100%; width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      overflow: hidden;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    #titlebar {
+      -webkit-app-region: drag;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 42px;
+      padding: 0 18px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #titlebar .brand {
+      font-family: var(--display);
+      font-weight: 800;
+      font-size: 14px;
+      letter-spacing: 0.06em;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #titlebar .brand .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent);
+      animation: pulse 2.5s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    #titlebar .win-controls {
+      -webkit-app-region: no-drag;
+      display: flex;
+      gap: 6px;
+    }
+    #titlebar .titlebar-right {
+      -webkit-app-region: no-drag;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .theme-quick {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid var(--border-hi);
+      border-radius: 10px;
+      background: var(--surface-hi);
+    }
+    .theme-opt {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 54px;
+      height: 24px;
+      border-radius: 7px;
+      font-family: var(--display);
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+      cursor: pointer;
+      transition: all 0.15s;
+      user-select: none;
+    }
+    .theme-opt input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .theme-opt.active {
+      color: var(--accent);
+      background: var(--accent-dim);
+    }
+    .wbtn {
+      width: 30px; height: 30px;
+      border-radius: 8px;
+      border: 1px solid var(--border-hi);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+      transition: all 0.15s;
+    }
+    .wbtn:hover { background: var(--border-hi); color: var(--text); }
+    .wbtn.close:hover { background: var(--red-dim); border-color: var(--red); color: var(--red); }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+
+    /* ── Tab bar ─────────────────────────────────────── */
+    #tabs-bar {
+      display: flex;
+      gap: 4px;
+      padding: 10px 18px 0;
+      background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .tab {
+      padding: 10px 20px;
+      font-family: var(--display);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      cursor: pointer;
+      border-radius: 10px 10px 0 0;
+      border: 1px solid transparent;
+      border-bottom: none;
+      margin-bottom: -1px;
+      transition: color 0.15s, background 0.15s, border-color 0.15s;
+    }
+    .tab:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+    .tab.active {
+      color: var(--accent);
+      background: var(--bg);
+      border-color: var(--border);
+      border-bottom-color: var(--bg);
+    }
+
+    #panels {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .panel {
+      display: none;
+      flex: 1;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+    }
+    .panel.active { display: flex; }
+
+    .panel-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 22px 28px;
+    }
+
+    /* Home: cap width on ultrawide / large monitors so the diagram doesn’t stretch */
+    #panel-home .panel-scroll,
+    #panel-settings .panel-scroll {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+    }
+    .home-shell,
+    .settings-shell {
+      width: 100%;
+      max-width: min(1040px, 100%);
+      margin: 0 auto;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .panel-title {
+      font-family: var(--display);
+      font-weight: 700;
+      font-size: 18px;
+      margin-bottom: 6px;
+      letter-spacing: -0.02em;
+    }
+    .panel-sub {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+      margin-bottom: 20px;
+      max-width: 52em;
+    }
+
+    /* ── Home topology ───────────────────────────────── */
+    .topo-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 28px;
+      width: 100%;
+    }
+    .topo-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 10px 12px;
+      width: 100%;
+      max-width: 100%;
+    }
+    .topo-node {
+      background: var(--surface-hi);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+      min-width: min(160px, 28vw);
+      max-width: 220px;
+      flex: 0 1 auto;
+      text-align: center;
+      transition: border-color 0.25s, box-shadow 0.25s;
+    }
+    .topo-node.highlight {
+      border-color: var(--accent-dim);
+      box-shadow: 0 0 0 1px rgba(0, 212, 160, 0.15);
+    }
+    .topo-node.clickable {
+      cursor: pointer;
+    }
+    .topo-node.clickable:hover {
+      border-color: var(--accent);
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
+    }
+    .topo-icon {
+      font-size: 28px;
+      line-height: 1;
+      margin-bottom: 8px;
+    }
+    .topo-label {
+      font-family: var(--display);
+      font-weight: 700;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+    .topo-meta {
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.35;
+      word-break: break-all;
+    }
+    .topo-link {
+      flex: 0 0 clamp(40px, 8vw, 88px);
+      width: clamp(40px, 8vw, 88px);
+      max-width: 88px;
+      height: 4px;
+      border-radius: 4px;
+      margin: 28px 0 0;
+      align-self: center;
+      position: relative;
+      background: var(--border-hi);
+      transition: background 0.3s, opacity 0.3s;
+    }
+    .topo-link.ok {
+      background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+      opacity: 1;
+    }
+    .topo-link.bad {
+      background: linear-gradient(90deg, var(--red-dim), var(--red));
+      opacity: 0.85;
+    }
+    .topo-link.warn {
+      background: linear-gradient(90deg, var(--yellow-dim), var(--yellow));
+      opacity: 0.9;
+    }
+    .topo-link-label {
+      position: absolute;
+      left: 50%;
+      top: -20px;
+      transform: translateX(-50%);
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .home-details {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
+      gap: 12px;
+      width: 100%;
+    }
+
+    @media (min-width: 1400px) {
+      .home-shell,
+      .settings-shell {
+        max-width: min(1080px, 92vw);
+      }
+    }
+    .detail-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .detail-k {
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .detail-v {
+      font-family: var(--display);
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text);
+      word-break: break-word;
+    }
+    .detail-v.ok { color: var(--accent); }
+    .detail-v.err { color: var(--red); }
+    .detail-v.warn { color: var(--yellow); }
+    .detail-v .mono { font-family: var(--mono); font-weight: 400; font-size: 12px; }
+
+    /* ── Queue table ─────────────────────────────────── */
+    #panel-queue {
+      overflow: hidden;
+    }
+    .queue-toolbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+    .queue-toolbar .hint {
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.45;
+      max-width: 560px;
+    }
+    .btn-small {
+      padding: 8px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border-hi);
+      background: var(--surface-hi);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-small:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .jobs-wrap {
+      flex: 1;
+      overflow: auto;
+    }
+    .jobs-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .jobs-table thead {
+      position: sticky;
+      top: 0;
+      background: var(--surface);
+      z-index: 1;
+    }
+    .jobs-table th {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .jobs-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+      word-break: break-word;
+    }
+    .jobs-table tbody tr:hover { background: rgba(255,255,255,0.02); }
+    .jobs-table .mono { font-family: var(--mono); font-size: 11px; }
+    .jobs-table .st { font-weight: 600; }
+    .jobs-table .st.completed { color: var(--accent); }
+    .jobs-table .st.dlq, .jobs-table .st.failed-setup { color: var(--red); }
+    .jobs-table .st.retry-scheduled, .jobs-table .st.printing, .jobs-table .st.in-queue { color: var(--yellow); }
+    .jobs-empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 36px 16px !important;
+    }
+    .job-btn {
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border-hi);
+      background: var(--surface-hi);
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 11px;
+      cursor: pointer;
+      margin-right: 4px;
+      transition: all 0.12s;
+    }
+    .job-btn:hover {
+      border-color: var(--accent);
+      background: var(--accent-dim);
+    }
+    .job-btn.secondary {
+      color: var(--muted);
+    }
+    .job-act-muted {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    /* ── Settings collapsibles ───────────────────────── */
+    details.settings-section {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 10px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    details.settings-section summary {
+      padding: 14px 18px;
+      cursor: pointer;
+      font-family: var(--display);
+      font-weight: 700;
+      font-size: 13px;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      user-select: none;
+      transition: background 0.2s ease;
+    }
+    details.settings-section summary:hover {
+      background: rgba(255, 255, 255, 0.03);
+    }
+    details.settings-section summary::-webkit-details-marker { display: none; }
+    details.settings-section summary::after {
+      content: '▶';
+      display: inline-block;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1;
+      transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+      transform: rotate(0deg);
+      flex-shrink: 0;
+    }
+    details.settings-section[open] summary::after {
+      transform: rotate(90deg);
+    }
+    details.settings-section .settings-body {
+      display: grid;
+      grid-template-rows: 0fr;
+      transition: grid-template-rows 0.38s cubic-bezier(0.4, 0, 0.2, 1);
+      padding: 0;
+      border-top: 1px solid transparent;
+    }
+    details.settings-section[open] .settings-body {
+      grid-template-rows: 1fr;
+      border-top-color: var(--border);
+    }
+    .settings-body-inner {
+      overflow: hidden;
+      min-height: 0;
+      padding: 14px 18px 18px;
+    }
+    .field {
+      margin-bottom: 14px;
+    }
+    .field label {
+      display: block;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .field input[type="text"],
+    .field input[type="number"],
+    .field input[type="password"] {
+      width: 100%;
+      max-width: 400px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border-hi);
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+    .field input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .field-hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .btn-primary {
+      padding: 10px 18px;
+      border-radius: 10px;
+      border: 1px solid var(--accent-dim);
+      background: var(--accent-dim);
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-primary:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: var(--surface-hi);
+    }
+    .btn-primary:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .inline-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .err-text {
+      font-size: 11px;
+      color: var(--red);
+      margin-top: 8px;
+      min-height: 16px;
+    }
+    .printer-pick-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 220px;
+      overflow-y: auto;
+      margin-top: 8px;
+    }
+    .printer-pick-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .printer-pick-row:hover { border-color: var(--border-hi); }
+    .printer-pick-row.selected {
+      border-color: var(--accent);
+      background: var(--accent-dim);
+    }
+    .printer-pick-name {
+      font-family: var(--display);
+      font-weight: 600;
+      font-size: 12px;
+    }
+    .printer-pick-st {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 99px;
+      background: var(--accent-dim);
+      color: var(--accent);
+    }
+    .printer-pick-st.warn {
+      background: var(--yellow-dim);
+      color: var(--yellow);
+    }
+
+    /* ── Modal ───────────────────────────────────────── */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      align-items: center;
+      justify-content: center;
+      z-index: 200;
+      padding: 20px;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      width: 100%;
+      max-width: 440px;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 24px 80px rgba(0,0,0,0.55);
+    }
+    .modal-head {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .modal-head h3 {
+      font-family: var(--display);
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .modal-body {
+      padding: 14px 18px 18px;
+      overflow-y: auto;
+      flex: 1;
+    }
+    .modal-close {
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-size: 20px;
+      cursor: pointer;
+      line-height: 1;
+      padding: 4px 8px;
+      border-radius: 8px;
+    }
+    .modal-close:hover { color: var(--text); background: var(--border); }
+
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 6px; }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .detail-card, .topo-node { animation: fadeUp 0.35s ease both; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinning { display: inline-block; animation: spin 0.8s linear infinite; }
+  </style>
+</head>
+<body>
+
+<div id="titlebar">
+  <div class="brand">
+    <div class="dot"></div>
+    TAWLA PRINT AGENT
+  </div>
+  <div class="titlebar-right">
+    <div class="theme-quick" role="radiogroup" aria-label="Theme">
+      <label class="theme-opt active" id="theme-opt-light">
+        <input type="radio" name="quick-theme" id="theme-quick-light" value="light" checked />
+        Light
+      </label>
+      <label class="theme-opt" id="theme-opt-dark">
+        <input type="radio" name="quick-theme" id="theme-quick-dark" value="dark" />
+        Dark
+      </label>
+    </div>
+    <div class="win-controls">
+      <button type="button" class="wbtn" onclick="window.api.minimize()">─</button>
+      <button type="button" class="wbtn close" onclick="window.api.close()">✕</button>
+    </div>
+  </div>
+</div>
+
+<div id="app">
+  <div id="tabs-bar">
+    <div class="tab active" data-tab="home" onclick="switchTab('home')">Home</div>
+    <div class="tab" data-tab="queue" onclick="switchTab('queue')">Queue</div>
+    <div class="tab" data-tab="settings" onclick="switchTab('settings')">Settings</div>
+  </div>
+
+  <div id="panels">
+
+    <!-- Home -->
+    <div id="panel-home" class="panel active" data-panel="home">
+      <div class="panel-scroll">
+        <div class="home-shell">
+        <div class="panel-title">Station overview</div>
+        <p class="panel-sub">
+          Live path from your order server to this PC and the receipt printer. Click the printer to choose a default and send a test receipt.
+        </p>
+
+        <div class="topo-wrap">
+          <div class="topo-row">
+            <div class="topo-node highlight">
+              <div class="topo-icon">☁️</div>
+              <div class="topo-label">Order server</div>
+              <div class="topo-meta mono" id="topo-rabbit-addr">—</div>
+            </div>
+            <div class="topo-link" id="link-server-agent">
+              <span class="topo-link-label" id="link-server-agent-lbl">RabbitMQ</span>
+            </div>
+            <div class="topo-node highlight">
+              <div class="topo-icon">🖥️</div>
+              <div class="topo-label">This PC</div>
+              <div class="topo-meta" id="topo-agent-sub">Print Agent</div>
+            </div>
+            <div class="topo-link ok" id="link-agent-printer">
+              <span class="topo-link-label">Default</span>
+            </div>
+            <div class="topo-node clickable highlight" id="topo-printer-node" role="button" tabindex="0" title="Choose printer">
+              <div class="topo-icon">🖨️</div>
+              <div class="topo-label">Printer</div>
+              <div class="topo-meta" id="topo-printer-name">Tap to select</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="home-details">
+          <div class="detail-card">
+            <div class="detail-k">Routing key</div>
+            <div class="detail-v mono" id="home-channel">—</div>
+          </div>
+          <div class="detail-card">
+            <div class="detail-k">Connection</div>
+            <div class="detail-v" id="home-conn-text">—</div>
+          </div>
+          <div class="detail-card">
+            <div class="detail-k">Last order received</div>
+            <div class="detail-v" id="home-last-order">—</div>
+          </div>
+          <div class="detail-card">
+            <div class="detail-k">Last print job</div>
+            <div class="detail-v" id="home-last-print">—</div>
+          </div>
+          <div class="detail-card">
+            <div class="detail-k">Jobs completed (session)</div>
+            <div class="detail-v" id="home-jobs-count">0</div>
+          </div>
+          <div class="detail-card">
+            <div class="detail-k">Agent version</div>
+            <div class="detail-v mono" id="home-version">—</div>
+          </div>
+        </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Queue -->
+    <div id="panel-queue" class="panel" data-panel="queue">
+      <div class="queue-toolbar">
+        <div class="hint">
+          PDFs live under <span class="mono">print-jobs/incoming</span>; status is in <span class="mono">jobs.json</span>.
+          Failures retry up to 3 times (5s → 30s → 1min), then move to <span class="mono">print-jobs/dlq</span>.
+          Use <strong>Retry</strong> after failures or <strong>Resend</strong> to print again.
+        </div>
+        <button type="button" class="btn-small" onclick="window.api.openPrintJobsDir()">Open folder</button>
+      </div>
+      <div class="jobs-wrap">
+        <table class="jobs-table">
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Order ID</th>
+              <th>Status</th>
+              <th>Attempt</th>
+              <th>Channel</th>
+              <th>Next retry</th>
+              <th>Last error</th>
+              <th>Updated</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="jobs-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div id="panel-settings" class="panel" data-panel="settings">
+      <div class="panel-scroll">
+        <div class="settings-shell">
+        <div class="panel-title">Configuration</div>
+        <p class="panel-sub">Branch, RabbitMQ, printer, and startup behaviour. Changes are saved to your profile folder.</p>
+
+        <details class="settings-section" open>
+          <summary>Branch</summary>
+          <div class="settings-body">
+            <div class="settings-body-inner">
+            <div class="field">
+              <label for="settings-branch">Branch ID</label>
+              <input type="text" id="settings-branch" placeholder="e.g. 202" autocomplete="off" />
+              <div class="field-hint">Listens on routing key <span class="mono" id="settings-channel-hint">branch.…</span></div>
+              <div class="err-text" id="settings-branch-err"></div>
+              <button type="button" class="btn-primary" id="settings-branch-save">Save branch</button>
+            </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="settings-section" open>
+          <summary>RabbitMQ server</summary>
+          <div class="settings-body">
+            <div class="settings-body-inner">
+            <div class="field">
+              <label for="settings-rabbit-host">Host</label>
+              <input type="text" id="settings-rabbit-host" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="settings-rabbit-port">Port</label>
+              <input type="number" id="settings-rabbit-port" min="1" max="65535" />
+            </div>
+            <div class="field">
+              <label for="settings-rabbit-username">Username</label>
+              <input type="text" id="settings-rabbit-username" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="settings-rabbit-exchange">Exchange</label>
+              <input type="text" id="settings-rabbit-exchange" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label>Password</label>
+              <p class="field-hint" id="settings-rabbit-pw-hint">—</p>
+              <div class="inline-actions" style="margin-bottom:8px;">
+                <label class="field-hint" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                  <input type="checkbox" id="settings-rabbit-pw-change" />
+                  Set new password
+                </label>
+              </div>
+              <input type="password" id="settings-rabbit-pw-new" placeholder="New password" autocomplete="new-password" disabled style="max-width:400px;" />
+              <div class="inline-actions" style="margin-top:10px;">
+                <button type="button" class="btn-small" id="settings-rabbit-pw-clear">Clear stored password</button>
+              </div>
+            </div>
+            <div class="err-text" id="settings-rabbit-err"></div>
+            <button type="button" class="btn-primary" id="settings-rabbit-save">Save RabbitMQ &amp; reconnect</button>
+            </div>
+          </div>
+        </details>
+
+        <details class="settings-section">
+          <summary>Default printer</summary>
+          <div class="settings-body">
+            <div class="settings-body-inner">
+            <p class="field-hint">Click a printer to set it as default for order PDFs.</p>
+            <div class="printer-pick-list" id="settings-printer-list"></div>
+            </div>
+          </div>
+        </details>
+
+        <details class="settings-section">
+          <summary>Startup</summary>
+          <div class="settings-body">
+            <div class="settings-body-inner">
+            <label class="field-hint" style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+              <input type="checkbox" id="settings-startup-check" style="margin-top:3px;" />
+              <span>Launch on login — also restart automatically if the app crashes (recommended for unattended stations).</span>
+            </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="settings-section">
+          <summary>Appearance</summary>
+          <div class="settings-body">
+            <div class="settings-body-inner">
+            <label class="field-hint" style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+              <input type="checkbox" id="settings-darkmode-check" style="margin-top:3px;" />
+              <span>Enable dark mode</span>
+            </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="settings-section">
+          <summary>Maintenance</summary>
+          <div class="settings-body">
+            <div class="settings-body-inner">
+            <p class="field-hint" id="settings-logs-hint">Logs: —</p>
+            <div class="inline-actions">
+              <button type="button" class="btn-small" id="settings-view-logs">View logs</button>
+              <button type="button" class="btn-small" onclick="window.api.openLogsDir()">Open log folder</button>
+              <button type="button" class="btn-small" onclick="window.api.openPrintJobsDir()">Open print-jobs folder</button>
+              <button type="button" class="btn-small" id="settings-restart-agent">
+                <span id="restart-icon">♻️</span> Restart agent
+              </button>
+            </div>
+            <p class="field-hint" style="margin-top:12px;"><span class="mono" id="settings-userdata">—</span></p>
+            </div>
+          </div>
+        </details>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Printer modal -->
+<div id="printer-modal" class="modal-overlay" aria-hidden="true">
+  <div class="modal-box" role="dialog" aria-labelledby="printer-modal-title">
+    <div class="modal-head">
+      <h3 id="printer-modal-title">Printers</h3>
+      <button type="button" class="modal-close" onclick="closePrinterModal()" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="field-hint" style="margin-bottom:10px;">Select the default receipt printer, then optionally send a narrow test page.</p>
+      <div class="printer-pick-list" id="modal-printer-list"></div>
+      <div style="margin-top:14px;">
+        <button type="button" class="btn-primary" id="modal-test-print" onclick="handleModalTestPrint()">Send test print</button>
+        <div class="err-text" id="modal-test-msg" style="margin-top:8px;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Logs modal -->
+<div id="logs-modal" class="modal-overlay" aria-hidden="true">
+  <div class="modal-box" role="dialog" aria-labelledby="logs-modal-title">
+    <div class="modal-head">
+      <h3 id="logs-modal-title">Session logs</h3>
+      <button type="button" class="modal-close" onclick="closeLogsModal()" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="field-hint" style="margin-bottom:10px;">
+        Live logs from this app session. For full files, use “Open log folder”.
+      </p>
+      <pre id="logs-modal-content" class="mono" style="max-height:340px;overflow:auto;background:var(--card-2);border:1px solid var(--stroke);border-radius:10px;padding:10px;margin:0;white-space:pre-wrap;word-break:break-word;">No logs yet in this session.</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+  let currentTab = 'home';
+  let isRestarting = false;
+  let rabbitPwClearPending = false;
+  let latestState = null;
+
+  function switchTab(name) {
+    currentTab = name;
+    document.querySelectorAll('#tabs-bar .tab').forEach((t) => {
+      t.classList.toggle('active', t.dataset.tab === name);
+    });
+    document.querySelectorAll('#panels .panel').forEach((p) => {
+      p.classList.toggle('active', p.dataset.panel === name);
+    });
+  }
+
+  function openPrinterModal() {
+    const el = document.getElementById('printer-modal');
+    el.classList.add('open');
+    el.setAttribute('aria-hidden', 'false');
+  }
+
+  function closePrinterModal() {
+    const el = document.getElementById('printer-modal');
+    el.classList.remove('open');
+    el.setAttribute('aria-hidden', 'true');
+  }
+
+  function renderLogsModal(s) {
+    const box = document.getElementById('logs-modal-content');
+    if (!box) return;
+    const logs = (s && Array.isArray(s.logs)) ? s.logs : [];
+    if (!logs.length) {
+      box.textContent = 'No logs yet in this session.';
+      return;
+    }
+    box.textContent = logs
+      .map((e) => `${e.icon || 'ℹ️'} ${e.time || '--:--:--'} ${e.msg || ''}`)
+      .join('\n');
+  }
+
+  function openLogsModal() {
+    renderLogsModal(latestState);
+    const el = document.getElementById('logs-modal');
+    if (!el) return;
+    el.classList.add('open');
+    el.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeLogsModal() {
+    const el = document.getElementById('logs-modal');
+    if (!el) return;
+    el.classList.remove('open');
+    el.setAttribute('aria-hidden', 'true');
+  }
+
+  document.getElementById('topo-printer-node').addEventListener('click', () => openPrinterModal());
+  document.getElementById('topo-printer-node').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPrinterModal(); }
+  });
+
+  document.getElementById('printer-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'printer-modal') closePrinterModal();
+  });
+  document.getElementById('logs-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'logs-modal') closeLogsModal();
+  });
+
+  async function handleModalTestPrint() {
+    const btn = document.getElementById('modal-test-print');
+    const msg = document.getElementById('modal-test-msg');
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    msg.textContent = 'Sending…';
+    msg.style.color = '';
+    try {
+      const res = await window.api.testPrint();
+      if (res.ok) {
+        msg.textContent = 'Queued — check the printer.';
+        msg.style.color = 'var(--accent)';
+      } else {
+        msg.textContent = res.error || 'Failed.';
+        msg.style.color = 'var(--red)';
+      }
+    } catch (e) {
+      msg.textContent = String(e && e.message ? e.message : e);
+      msg.style.color = 'var(--red)';
+    }
+    btn.disabled = false;
+  }
+
+  async function handleRestart() {
+    if (isRestarting) return;
+    isRestarting = true;
+    const icon = document.getElementById('restart-icon');
+    if (icon) {
+      icon.textContent = '⏳';
+      icon.classList.add('spinning');
+    }
+    await window.api.restartSystem();
+    setTimeout(() => {
+      isRestarting = false;
+      if (icon) {
+        icon.textContent = '♻️';
+        icon.classList.remove('spinning');
+      }
+    }, 4000);
+  }
+
+  function jobStatusLabel(st) {
+    const m = {
+      'in-queue': 'queued',
+      printing: 'printing',
+      completed: 'completed',
+      'retry-scheduled': 'retry scheduled',
+      dlq: 'dead letter',
+      'failed-setup': 'failed (setup)',
+    };
+    return m[st] || st || '—';
+  }
+
+  function jobActionsHtml(j) {
+    const st = j.status || '';
+    const id = escHtml(j.id || '');
+    if (!id) return '—';
+    if (st === 'completed') {
+      return `<button type="button" class="job-btn" data-action="resend" data-id="${id}">Resend</button>`;
+    }
+    if (st === 'in-queue') {
+      return '<span class="job-act-muted">Printing soon</span>';
+    }
+    if (['dlq', 'retry-scheduled', 'failed-setup', 'printing'].includes(st)) {
+      return `<button type="button" class="job-btn" data-action="retry" data-id="${id}">Retry</button>`;
+    }
+    return '—';
+  }
+
+  function formatLastPrint(lp) {
+    if (!lp || !lp.at) return '—';
+    const d = new Date(lp.at);
+    const t = d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    const file = lp.file ? escHtml(String(lp.file)) : '—';
+    const ch = lp.channel ? ' · ' + escHtml(String(lp.channel)) : '';
+    return t + ' · ' + file + ch;
+  }
+
+  function renderPrinterPick(containerId, s, options) {
+    const wrap = document.getElementById(containerId);
+    if (!wrap) return;
+    const list = s.printers || [];
+    const def = s.defaultPrinter || '';
+    if (list.length === 0) {
+      wrap.innerHTML = '<div class="field-hint">No printers detected yet.</div>';
+      return;
+    }
+    wrap.innerHTML = list.map((p) => {
+      const isOk = !p.status || p.status === 'Ready' || p.status === 'Idle' || p.status === '0';
+      const stClass = isOk ? '' : ' warn';
+      const stText = isOk ? 'Ready' : (p.status || '');
+      const sel = def === p.name ? ' selected' : '';
+      return `
+        <div class="printer-pick-row${sel}" data-printer="${encodeURIComponent(p.name)}">
+          <span class="printer-pick-name">${escHtml(p.name)}</span>
+          <span class="printer-pick-st${stClass}">${escHtml(stText)}</span>
+        </div>`;
+    }).join('');
+    wrap.querySelectorAll('.printer-pick-row').forEach((row) => {
+      row.addEventListener('click', () => {
+        const enc = row.getAttribute('data-printer');
+        if (!enc) return;
+        window.api.setDefaultPrinter(decodeURIComponent(enc));
+        if (options && options.closeModal) closePrinterModal();
+      });
+    });
+  }
+
+  function applyTopology(s) {
+    const host = s.rabbitHost != null ? String(s.rabbitHost) : '—';
+    const port = s.rabbitPort != null ? String(s.rabbitPort) : '—';
+    document.getElementById('topo-rabbit-addr').textContent = host + ':' + port;
+
+    const l1 = document.getElementById('link-server-agent');
+    const l1Lbl = document.getElementById('link-server-agent-lbl');
+    l1.classList.remove('ok', 'bad', 'warn');
+    if (s.rabbitmq === 'connected') {
+      l1.classList.add('ok');
+      l1Lbl.textContent = 'Live';
+    } else if (s.rabbitmq === 'error') {
+      l1.classList.add('bad');
+      l1Lbl.textContent = 'Down';
+    } else {
+      l1.classList.add('warn');
+      l1Lbl.textContent = '…';
+    }
+
+    const l2 = document.getElementById('link-agent-printer');
+    l2.classList.remove('ok', 'bad', 'warn');
+    if (s.defaultPrinter) {
+      l2.classList.add('ok');
+    } else {
+      l2.classList.add('warn');
+    }
+
+    document.getElementById('topo-printer-name').textContent = s.defaultPrinter || 'Click to choose printer';
+
+    const ct = document.getElementById('home-conn-text');
+    ct.className = 'detail-v';
+    if (s.rabbitmq === 'connected') {
+      ct.textContent = 'Connected · ' + (s.channel || '');
+      ct.classList.add('ok');
+    } else if (s.rabbitmq === 'error') {
+      ct.textContent = 'Disconnected — reconnecting…';
+      ct.classList.add('err');
+    } else {
+      ct.textContent = 'Connecting…';
+      ct.classList.add('warn');
+    }
+
+    document.getElementById('home-channel').textContent = s.channel || '—';
+
+    if (s.lastOrder) {
+      const d = new Date(s.lastOrder.timestamp);
+      document.getElementById('home-last-order').textContent =
+        d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) +
+        ' · ' + (s.lastOrder.channel || '');
+    } else {
+      document.getElementById('home-last-order').textContent = 'No orders this session';
+    }
+
+    document.getElementById('home-last-print').innerHTML = formatLastPrint(s.lastPrintJob);
+    document.getElementById('home-jobs-count').textContent = s.printJobs != null ? String(s.printJobs) : '0';
+    document.getElementById('home-version').textContent = s.appVersion != null ? String(s.appVersion) : '—';
+  }
+
+  function applySettingsForm(s) {
+    const b = document.getElementById('settings-branch');
+    if (b && document.activeElement !== b) b.value = s.branchId || '';
+
+    document.getElementById('settings-channel-hint').textContent = s.channel || 'branch.…';
+
+    const rh = document.getElementById('settings-rabbit-host');
+    const rp = document.getElementById('settings-rabbit-port');
+    const ru = document.getElementById('settings-rabbit-username');
+    const re = document.getElementById('settings-rabbit-exchange');
+    if (rh && document.activeElement !== rh) rh.value = s.rabbitHost != null ? String(s.rabbitHost) : '';
+    if (rp && document.activeElement !== rp) rp.value = s.rabbitPort != null ? String(s.rabbitPort) : '';
+    if (ru && document.activeElement !== ru) ru.value = s.rabbitUsername != null ? String(s.rabbitUsername) : '';
+    if (re && document.activeElement !== re) re.value = s.rabbitExchange != null ? String(s.rabbitExchange) : '';
+
+    const pwHint = document.getElementById('settings-rabbit-pw-hint');
+    if (pwHint) {
+      pwHint.textContent = s.rabbitAuthConfigured
+        ? 'A password is saved on this machine (hidden). Use “Set new password” or “Clear” to change it.'
+        : 'No password stored — required for brokers that do not allow guest access.';
+    }
+
+    const startupCb = document.getElementById('settings-startup-check');
+    if (startupCb && document.activeElement !== startupCb) {
+      startupCb.checked = !!(s.launchOnLogin && s.restartOnCrash);
+    }
+    syncThemeControls(s.darkMode !== false);
+
+    document.getElementById('settings-logs-hint').textContent =
+      'Logs: ' + (s.logs ? s.logs.length : 0) + ' entries (session)';
+    document.getElementById('settings-userdata').textContent =
+      s.userDataPath != null ? String(s.userDataPath) : '—';
+
+    renderPrinterPick('settings-printer-list', s, {});
+    renderPrinterPick('modal-printer-list', s, { closeModal: false });
+
+    const modalBtn = document.getElementById('modal-test-print');
+    if (modalBtn) {
+      const canTest = s.platform === 'win32' && !!s.defaultPrinter;
+      modalBtn.disabled = !canTest;
+      modalBtn.title = canTest ? 'Sends a test receipt PDF.' : 'Select a default printer first.';
+    }
+  }
+
+  function applyState(s) {
+    latestState = s;
+    const dark = s.darkMode !== false;
+    applyTheme(dark);
+    syncThemeControls(dark);
+    applyTopology(s);
+    applySettingsForm(s);
+    const logsModal = document.getElementById('logs-modal');
+    if (logsModal && logsModal.classList.contains('open')) {
+      renderLogsModal(s);
+    }
+
+    const jobsBody = document.getElementById('jobs-tbody');
+    if (jobsBody) {
+      const list = s.printJobsList || [];
+      if (list.length === 0) {
+        jobsBody.innerHTML = '<tr><td colspan="9" class="jobs-empty">No print jobs yet.</td></tr>';
+      } else {
+        jobsBody.innerHTML = list.map((j) => {
+          const st = j.status || '';
+          const stSafe = String(st).replace(/[^\w-]/g, '') || 'unknown';
+          const stLabel = jobStatusLabel(st);
+          const att =
+            j.attemptNumber != null && j.attemptNumber > 0 ? `${j.attemptNumber} / 4` : '—';
+          let nr = '—';
+          if (j.nextRetryAt) {
+            nr = new Date(j.nextRetryAt).toLocaleString('en-GB', {
+              day: 'numeric',
+              month: 'short',
+              hour: '2-digit',
+              minute: '2-digit',
+            });
+          }
+          const err = j.lastError ? escHtml(String(j.lastError)) : '—';
+          const upd = j.updatedAt
+            ? new Date(j.updatedAt).toLocaleString('en-GB', {
+                day: 'numeric',
+                month: 'short',
+                hour: '2-digit',
+                minute: '2-digit',
+              })
+            : '—';
+          const actions = jobActionsHtml(j);
+          return `
+          <tr>
+            <td class="mono">${escHtml(j.file || '—')}</td>
+            <td class="mono">${escHtml(j.orderId || '—')}</td>
+            <td class="st ${stSafe}">${escHtml(stLabel)}</td>
+            <td>${escHtml(att)}</td>
+            <td class="mono">${escHtml(j.channel || '—')}</td>
+            <td class="mono">${nr === '—' ? '—' : escHtml(nr)}</td>
+            <td>${err}</td>
+            <td class="mono">${escHtml(upd)}</td>
+            <td>${actions}</td>
+          </tr>`;
+        }).join('');
+      }
+    }
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function applyTheme(isDark) {
+    document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+  }
+
+  function syncThemeControls(isDark) {
+    const darkCb = document.getElementById('settings-darkmode-check');
+    if (darkCb && document.activeElement !== darkCb) {
+      darkCb.checked = !!isDark;
+    }
+    const rDark = document.getElementById('theme-quick-dark');
+    const rLight = document.getElementById('theme-quick-light');
+    const optDark = document.getElementById('theme-opt-dark');
+    const optLight = document.getElementById('theme-opt-light');
+    if (rDark) rDark.checked = !!isDark;
+    if (rLight) rLight.checked = !isDark;
+    if (optDark) optDark.classList.toggle('active', !!isDark);
+    if (optLight) optLight.classList.toggle('active', !isDark);
+  }
+
+  async function persistTheme(isDark) {
+    const prevDark = document.documentElement.getAttribute('data-theme') !== 'light';
+    applyTheme(isDark);
+    syncThemeControls(isDark);
+    const res = await window.api.setDarkMode(isDark);
+    if (!res || !res.ok) {
+      applyTheme(prevDark);
+      syncThemeControls(prevDark);
+      alert((res && res.error) || 'Could not save theme setting.');
+      return false;
+    }
+    return true;
+  }
+
+  document.getElementById('settings-branch-save').addEventListener('click', async () => {
+    const errEl = document.getElementById('settings-branch-err');
+    errEl.textContent = '';
+    const v = document.getElementById('settings-branch').value.trim();
+    const res = await window.api.setBranchId(v);
+    if (!res.ok) errEl.textContent = res.error || 'Could not update branch.';
+  });
+
+  document.getElementById('settings-rabbit-save').addEventListener('click', async () => {
+    const errEl = document.getElementById('settings-rabbit-err');
+    errEl.textContent = '';
+    const host = document.getElementById('settings-rabbit-host').value.trim();
+    const port = document.getElementById('settings-rabbit-port').value;
+    const username = document.getElementById('settings-rabbit-username').value.trim();
+    const exchange = document.getElementById('settings-rabbit-exchange').value.trim();
+    let passwordMode = 'keep';
+    let passwordNew = '';
+    if (rabbitPwClearPending) {
+      passwordMode = 'clear';
+    } else if (document.getElementById('settings-rabbit-pw-change').checked) {
+      passwordNew = document.getElementById('settings-rabbit-pw-new').value;
+      passwordMode = 'set';
+    }
+    const res = await window.api.setRabbitSettings({
+      host,
+      port: Number(port),
+      username,
+      exchange,
+      passwordMode,
+      passwordNew
+    });
+    rabbitPwClearPending = false;
+    if (!res.ok) {
+      errEl.textContent = res.error || 'Could not save RabbitMQ settings.';
+      return;
+    }
+    document.getElementById('settings-rabbit-pw-change').checked = false;
+    document.getElementById('settings-rabbit-pw-new').value = '';
+    document.getElementById('settings-rabbit-pw-new').disabled = true;
+  });
+
+  document.getElementById('settings-rabbit-pw-change').addEventListener('change', (e) => {
+    const inp = document.getElementById('settings-rabbit-pw-new');
+    inp.disabled = !e.target.checked;
+    if (!e.target.checked) inp.value = '';
+  });
+
+  document.getElementById('settings-rabbit-pw-clear').addEventListener('click', () => {
+    rabbitPwClearPending = true;
+    document.getElementById('settings-rabbit-pw-change').checked = false;
+    document.getElementById('settings-rabbit-pw-new').value = '';
+    document.getElementById('settings-rabbit-pw-new').disabled = true;
+    document.getElementById('settings-rabbit-err').textContent =
+      'Password will be cleared when you click “Save RabbitMQ & reconnect”.';
+  });
+
+  document.getElementById('settings-startup-check').addEventListener('change', async (e) => {
+    const on = e.target.checked;
+    await window.api.setStartupSettings({ launchOnLogin: on, restartOnCrash: on });
+  });
+
+  document.getElementById('settings-darkmode-check').addEventListener('change', async (e) => {
+    await persistTheme(e.target.checked);
+  });
+
+  document.getElementById('theme-quick-dark').addEventListener('change', async (e) => {
+    if (!e.target.checked) return;
+    await persistTheme(true);
+  });
+  document.getElementById('theme-quick-light').addEventListener('change', async (e) => {
+    if (!e.target.checked) return;
+    await persistTheme(false);
+  });
+
+  document.getElementById('settings-restart-agent').addEventListener('click', handleRestart);
+  document.getElementById('settings-view-logs').addEventListener('click', openLogsModal);
+
+  document.getElementById('jobs-tbody').addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const id = btn.getAttribute('data-id');
+    const action = btn.getAttribute('data-action');
+    if (!id) return;
+    btn.disabled = true;
+    try {
+      let res;
+      if (action === 'retry') res = await window.api.retryPrintJob(id);
+      else if (action === 'resend') res = await window.api.resendPrintJob(id);
+      if (res && !res.ok && res.error) {
+        alert(res.error);
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  window.api.getState().then(applyState);
+  window.api.onStateUpdate(applyState);
+</script>
+</body>
+</html>

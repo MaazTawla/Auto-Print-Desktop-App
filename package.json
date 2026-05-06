@@ -1,0 +1,49 @@
+{
+  "name": "tawla-print-agent",
+  "version": "1.5.1",
+  "description": "Tawla Local Print Agent",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "generate:ico": "node scripts/generate-win-icon.js",
+    "dist": "node scripts/generate-win-icon.js && electron-builder --win --x64"
+  },
+  "build": {
+    "appId": "com.tawla.print-agent",
+    "productName": "Tawla Print Agent",
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true,
+      "include": "build/installer.nsh"
+    },
+    "files": [
+      "index.html",
+      "src/**/*",
+      "assets/**/*",
+      "package.json",
+      "!dist/**/*",
+      "!node_modules/.cache/**/*"
+    ],
+    "asar": false
+  },
+  "dependencies": {
+    "amqplib": "^1.0.5",
+    "axios": "^1.6.0",
+    "pdf-to-printer": "^5.0.1"
+  },
+  "devDependencies": {
+    "electron": "^29.0.0",
+    "electron-builder": "^24.9.1",
+    "sharp": "^0.34.5",
+    "to-ico": "^1.1.5"
+  },
+  "author": "Tawla"
+}
