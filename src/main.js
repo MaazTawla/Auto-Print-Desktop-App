@@ -16,7 +16,7 @@ const MAX_ATTEMPTS = 4;
 
 let jobsStore = null;
 const pendingRetries = new Map();
-const INCOMING_RETENTION_MS = 24 * 60 * 60 * 1000; // 24h
+const PRINT_DATA_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7d
 
 function getJobsStore() {
   if (!jobsStore) jobsStore = createPrintJobsStore(app.getPath("userData"));
@@ -178,36 +178,99 @@ function manualQueuePrint(jobId, mode) {
   return { ok: true };
 }
 
-function cleanupOldIncomingFiles() {
+function cleanupOldPrintData() {
   const store = getJobsStore();
   store.ensureDirs();
-  const cutoff = Date.now() - INCOMING_RETENTION_MS;
-  let deleted = 0;
+  const cutoff = Date.now() - PRINT_DATA_RETENTION_MS;
+  let removedJobs = 0;
+  let deletedIncoming = 0;
+  let deletedDlq = 0;
+  let deletedOrphanIncoming = 0;
+  let deletedOrphanDlq = 0;
+
+  const safeUnlink = (filePath) => {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    try {
+      fs.unlinkSync(filePath);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const parseRowTimeMs = (row) => {
+    const t1 = Date.parse(row.updatedAt || "");
+    if (Number.isFinite(t1)) return t1;
+    const t2 = Date.parse(row.createdAt || "");
+    if (Number.isFinite(t2)) return t2;
+    return null;
+  };
+
+  const pruneDirOlderThan = (dirPath) => {
+    let removed = 0;
+    try {
+      const names = fs.readdirSync(dirPath);
+      for (const name of names) {
+        const filePath = path.join(dirPath, name);
+        let st;
+        try {
+          st = fs.statSync(filePath);
+        } catch (_) {
+          continue;
+        }
+        if (!st.isFile()) continue;
+        const lastTouch = Math.max(Number(st.mtimeMs) || 0, Number(st.birthtimeMs) || 0);
+        if (lastTouch < cutoff && safeUnlink(filePath)) removed += 1;
+      }
+    } catch (_) {}
+    return removed;
+  };
+
   try {
-    const names = fs.readdirSync(store.incoming);
-    for (const name of names) {
-      const filePath = path.join(store.incoming, name);
-      let st;
-      try {
-        st = fs.statSync(filePath);
-      } catch (_) {
+    const rows = store.readManifest();
+    const keptRows = [];
+    for (const row of rows) {
+      const rowTime = parseRowTimeMs(row);
+      if (rowTime == null || rowTime >= cutoff) {
+        keptRows.push(row);
         continue;
       }
-      if (!st.isFile()) continue;
-      const lastTouch = Math.max(Number(st.mtimeMs) || 0, Number(st.birthtimeMs) || 0);
-      if (lastTouch < cutoff) {
-        try {
-          fs.unlinkSync(filePath);
-          deleted += 1;
-        } catch (_) {}
+      removedJobs += 1;
+      clearRetryTimer(row.id);
+      if (safeUnlink(row.localPath)) deletedIncoming += 1;
+
+      const dlqCandidates = [];
+      if (row.dlqPath) dlqCandidates.push(row.dlqPath);
+      if (row.id && row.file) dlqCandidates.push(path.join(store.dlq, `${row.id}_${row.file}`));
+      let dlqDeletedForRow = false;
+      for (const p of dlqCandidates) {
+        if (safeUnlink(p)) {
+          dlqDeletedForRow = true;
+          break;
+        }
       }
+      if (dlqDeletedForRow) deletedDlq += 1;
+    }
+    if (keptRows.length !== rows.length) {
+      fs.writeFileSync(store.manifestPath, JSON.stringify(keptRows, null, 2), "utf8");
     }
   } catch (err) {
-    log(`Incoming cleanup failed: ${err.message}`, "⚠️");
+    log(`Print data cleanup failed: ${err.message}`, "⚠️");
     return;
   }
-  if (deleted > 0) {
-    log(`Incoming cleanup: deleted ${deleted} file(s) older than 24h.`, "🧹");
+
+  deletedOrphanIncoming = pruneDirOlderThan(store.incoming);
+  deletedOrphanDlq = pruneDirOlderThan(store.dlq);
+
+  const totalIncoming = deletedIncoming + deletedOrphanIncoming;
+  const totalDlq = deletedDlq + deletedOrphanDlq;
+  if (removedJobs > 0 || totalIncoming > 0 || totalDlq > 0) {
+    syncJobsToState();
+    pushState();
+    log(
+      `Print data cleanup: removed ${removedJobs} job(s), ${totalIncoming} incoming file(s), ${totalDlq} dlq file(s) older than 7d.`,
+      "🧹"
+    );
   }
 }
 
@@ -524,7 +587,7 @@ let rabbitConsumerTag = null;
 let rabbitReconnectTimer = null;
 let rabbitHealthTimer = null;
 let scheduledRestartInterval = null;
-let incomingCleanupInterval = null;
+let printDataCleanupInterval = null;
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 const LOG_DIR = path.join(app.getPath("userData"), "logs");
@@ -1248,9 +1311,9 @@ if (!gotSingleInstanceLock) {
     log(`Branch ID: ${state.branchId} — listening on ${state.channel}`, "📌");
     await startRabbit();
     await pollPrinters();
-    cleanupOldIncomingFiles();
-    if (incomingCleanupInterval) clearInterval(incomingCleanupInterval);
-    incomingCleanupInterval = setInterval(cleanupOldIncomingFiles, 60 * 60 * 1000);
+    cleanupOldPrintData();
+    if (printDataCleanupInterval) clearInterval(printDataCleanupInterval);
+    printDataCleanupInterval = setInterval(cleanupOldPrintData, 60 * 60 * 1000);
 
     // Refresh printer list every 30s
     setInterval(pollPrinters, 30000);
@@ -1267,7 +1330,7 @@ if (!gotSingleInstanceLock) {
     pendingRetries.forEach((t) => clearTimeout(t));
     pendingRetries.clear();
     if (scheduledRestartInterval) clearInterval(scheduledRestartInterval);
-    if (incomingCleanupInterval) clearInterval(incomingCleanupInterval);
+    if (printDataCleanupInterval) clearInterval(printDataCleanupInterval);
     await stopRabbit();
   });
 }
