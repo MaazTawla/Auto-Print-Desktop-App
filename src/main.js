@@ -414,8 +414,45 @@ async function runPrintAttempt(jobId) {
 
 // ─── Register custom app:// protocol ──────────────────────────────────────────
 protocol.registerSchemesAsPrivileged([
-  { scheme: "app", privileges: { secure: true, standard: true, supportFetchAPI: true } }
+  { scheme: "app", privileges: { secure: true, standard: true, supportFetchAPI: true } },
+  { scheme: "jobpdf", privileges: { secure: true, standard: true, supportFetchAPI: true, stream: true } },
 ]);
+
+/** Resolve absolute path to a job PDF under print-jobs/incoming or print-jobs/dlq only. */
+function resolveJobPdfAbsolutePath(jobId) {
+  const id = String(jobId ?? "").trim();
+  if (!/^[a-fA-F0-9]{16}$/.test(id)) return null;
+  const store = getJobsStore();
+  const job = store.findById(id);
+  if (!job) return null;
+
+  const incomingRoot = path.resolve(store.incoming) + path.sep;
+  const dlqRoot = path.resolve(store.dlq) + path.sep;
+
+  const tryPath = (p) => {
+    if (!p || typeof p !== "string") return null;
+    let abs;
+    try {
+      abs = path.resolve(p.trim());
+    } catch (_) {
+      return null;
+    }
+    if (!abs.toLowerCase().endsWith(".pdf")) return null;
+    if (!fs.existsSync(abs)) return null;
+    if (!(abs.startsWith(incomingRoot) || abs.startsWith(dlqRoot))) return null;
+    return abs;
+  };
+
+  let hit = tryPath(job.localPath);
+  if (hit) return hit;
+  hit = tryPath(job.dlqPath);
+  if (hit) return hit;
+  if (job.id && job.file) {
+    hit = tryPath(path.join(store.dlq, `${job.id}_${job.file}`));
+    if (hit) return hit;
+  }
+  return null;
+}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 // Config file: %APPDATA%\tawla-print-agent\config.json
@@ -789,6 +826,14 @@ function getPublicState() {
 ipcMain.handle("get-state", () => getPublicState());
 ipcMain.handle("open-logs-dir", () => shell.openPath(LOG_DIR));
 ipcMain.handle("open-print-jobs-dir", () => shell.openPath(getJobsStore().root));
+ipcMain.handle("open-job-pdf-external", async (_e, rawId) => {
+  const id = String(rawId ?? "").trim();
+  const abs = resolveJobPdfAbsolutePath(id);
+  if (!abs) return { ok: false, error: "No PDF on disk for this job (or path is not allowed)." };
+  const err = await shell.openPath(abs);
+  if (err) return { ok: false, error: err };
+  return { ok: true };
+});
 ipcMain.on("window-minimize", () => { if (mainWindow) mainWindow.minimize(); });
 ipcMain.on("window-close", () => { if (mainWindow) mainWindow.hide(); });
 ipcMain.handle("restart-system", async () => {
@@ -1360,6 +1405,20 @@ if (!gotSingleInstanceLock) {
       }
       return net.fetch(pathToFileURL(filePath).href);
     });
+
+    protocol.handle("jobpdf", async (request) => {
+      try {
+        const u = new URL(request.url);
+        const rawPath = u.pathname.startsWith("/") ? u.pathname.slice(1) : u.pathname;
+        const jobId = decodeURIComponent(rawPath.split("/")[0] || "").trim();
+        const abs = resolveJobPdfAbsolutePath(jobId);
+        if (!abs) return new Response("Not found", { status: 404 });
+        return net.fetch(pathToFileURL(abs).href);
+      } catch (err) {
+        return new Response(err.message || String(err), { status: 500 });
+      }
+    });
+
     createTray();
     createWindow();
 

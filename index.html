@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Tawla Print Agent</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; frame-src 'self' app: jobpdf: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -685,6 +685,56 @@
       border-radius: 8px;
     }
     .modal-close:hover { color: var(--text); background: var(--border); }
+    .modal-box.modal-wide {
+      max-width: min(920px, 96vw);
+      max-height: 92vh;
+    }
+    .modal-box.modal-wide .modal-body {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
+    }
+    .job-pdf-frame-wrap {
+      flex: 1;
+      min-height: 360px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--surface-hi);
+    }
+    .job-pdf-frame-wrap iframe {
+      width: 100%;
+      height: min(72vh, 640px);
+      border: none;
+      display: block;
+    }
+    .job-file-link {
+      background: none;
+      border: none;
+      padding: 0;
+      margin: 0;
+      font: inherit;
+      color: var(--accent);
+      cursor: pointer;
+      text-decoration: underline;
+      text-align: left;
+      max-width: 100%;
+    }
+    .job-file-link:hover { color: var(--text); }
+    .job-pdf-fallback {
+      padding: 16px;
+      border-radius: 10px;
+      border: 1px dashed var(--border-hi);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .job-pdf-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
 
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -991,6 +1041,27 @@
   </div>
 </div>
 
+<!-- Job PDF preview modal -->
+<div id="job-pdf-modal" class="modal-overlay" aria-hidden="true">
+  <div class="modal-box modal-wide" role="dialog" aria-labelledby="job-pdf-modal-title">
+    <div class="modal-head">
+      <h3 id="job-pdf-modal-title" class="mono" style="font-size:13px;word-break:break-all;">PDF preview</h3>
+      <button type="button" class="modal-close" onclick="closeJobPdfModal()" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="job-pdf-frame-wrap" id="job-pdf-frame-wrap">
+        <iframe id="job-pdf-iframe" title="PDF preview"></iframe>
+      </div>
+      <div id="job-pdf-fallback" class="job-pdf-fallback" style="display:none;"></div>
+      <div class="job-pdf-actions">
+        <button type="button" class="btn-small" id="job-pdf-open-external">Open in default app</button>
+        <button type="button" class="btn-primary" id="job-pdf-resend" style="display:none;">Resend print</button>
+        <button type="button" class="btn-primary" id="job-pdf-retry" style="display:none;">Retry print</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Logs modal -->
 <div id="logs-modal" class="modal-overlay" aria-hidden="true">
   <div class="modal-box" role="dialog" aria-labelledby="logs-modal-title">
@@ -1012,6 +1083,7 @@
   let isRestarting = false;
   let rabbitPwClearPending = false;
   let latestState = null;
+  let pdfModalJobId = null;
 
   function switchTab(name) {
     currentTab = name;
@@ -1063,6 +1135,75 @@
     el.setAttribute('aria-hidden', 'true');
   }
 
+  function jobRowHasPdfAsset(j) {
+    if (!j) return false;
+    const lp = String(j.localPath || '').toLowerCase();
+    const dp = String(j.dlqPath || '').toLowerCase();
+    const fn = String(j.file || '').toLowerCase();
+    return lp.endsWith('.pdf') || dp.endsWith('.pdf') || fn.endsWith('.pdf');
+  }
+
+  function syncJobPdfModalActions(j) {
+    const resend = document.getElementById('job-pdf-resend');
+    const retry = document.getElementById('job-pdf-retry');
+    if (!resend || !retry) return;
+    const st = j.status || '';
+    resend.style.display = st === 'completed' ? '' : 'none';
+    retry.style.display = ['dlq', 'retry-scheduled', 'failed-setup', 'printing'].includes(st) ? '' : 'none';
+  }
+
+  function openJobPdfModal(jobId) {
+    const id = String(jobId || '').trim();
+    if (!id) return;
+    const list = (latestState && latestState.printJobsList) ? latestState.printJobsList : [];
+    const j = list.find((x) => x.id === id);
+    if (!j) return;
+
+    pdfModalJobId = id;
+    const title = document.getElementById('job-pdf-modal-title');
+    if (title) title.textContent = j.file || 'PDF preview';
+
+    const iframe = document.getElementById('job-pdf-iframe');
+    const wrap = document.getElementById('job-pdf-frame-wrap');
+    const fb = document.getElementById('job-pdf-fallback');
+    const canEmbed = jobRowHasPdfAsset(j);
+
+    if (iframe && wrap && fb) {
+      if (canEmbed) {
+        wrap.style.display = '';
+        fb.style.display = 'none';
+        fb.textContent = '';
+        iframe.src = 'jobpdf://preview/' + encodeURIComponent(id);
+      } else {
+        iframe.src = 'about:blank';
+        wrap.style.display = 'none';
+        fb.style.display = '';
+        fb.textContent = 'No PDF file is available for this job (for example setup failed before a file was saved). You can still use actions below if offered.';
+      }
+    }
+
+    syncJobPdfModalActions(j);
+
+    const el = document.getElementById('job-pdf-modal');
+    if (!el) return;
+    el.classList.add('open');
+    el.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeJobPdfModal() {
+    const iframe = document.getElementById('job-pdf-iframe');
+    if (iframe) iframe.src = 'about:blank';
+    const wrap = document.getElementById('job-pdf-frame-wrap');
+    const fb = document.getElementById('job-pdf-fallback');
+    if (wrap) wrap.style.display = '';
+    if (fb) fb.style.display = 'none';
+    pdfModalJobId = null;
+    const el = document.getElementById('job-pdf-modal');
+    if (!el) return;
+    el.classList.remove('open');
+    el.setAttribute('aria-hidden', 'true');
+  }
+
   document.getElementById('topo-printer-node').addEventListener('click', () => openPrinterModal());
   document.getElementById('topo-printer-node').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPrinterModal(); }
@@ -1073,6 +1214,29 @@
   });
   document.getElementById('logs-modal').addEventListener('click', (e) => {
     if (e.target.id === 'logs-modal') closeLogsModal();
+  });
+  document.getElementById('job-pdf-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'job-pdf-modal') closeJobPdfModal();
+  });
+
+  document.getElementById('job-pdf-open-external').addEventListener('click', async () => {
+    if (!pdfModalJobId) return;
+    const res = await window.api.openJobPdfExternal(pdfModalJobId);
+    if (res && !res.ok && res.error) alert(res.error);
+  });
+
+  document.getElementById('job-pdf-resend').addEventListener('click', async () => {
+    if (!pdfModalJobId) return;
+    const res = await window.api.resendPrintJob(pdfModalJobId);
+    if (res && !res.ok && res.error) alert(res.error);
+    else closeJobPdfModal();
+  });
+
+  document.getElementById('job-pdf-retry').addEventListener('click', async () => {
+    if (!pdfModalJobId) return;
+    const res = await window.api.retryPrintJob(pdfModalJobId);
+    if (res && !res.ok && res.error) alert(res.error);
+    else closeJobPdfModal();
   });
 
   async function handleModalTestPrint() {
@@ -1319,6 +1483,13 @@
       renderLogsModal(s);
     }
 
+    const pdfModal = document.getElementById('job-pdf-modal');
+    if (pdfModal && pdfModal.classList.contains('open') && pdfModalJobId) {
+      const j = (s.printJobsList || []).find((x) => x.id === pdfModalJobId);
+      if (j) syncJobPdfModalActions(j);
+      else closeJobPdfModal();
+    }
+
     const jobsBody = document.getElementById('jobs-tbody');
     if (jobsBody) {
       const list = s.printJobsList || [];
@@ -1350,9 +1521,13 @@
               })
             : '—';
           const actions = jobActionsHtml(j);
+          const fid = j.id ? String(j.id) : '';
+          const fileCell = fid
+            ? `<td class="mono"><button type="button" class="job-file-link" data-job-preview="${fid.replace(/"/g, '&quot;')}">${escHtml(j.file || '—')}</button></td>`
+            : `<td class="mono">${escHtml(j.file || '—')}</td>`;
           return `
           <tr>
-            <td class="mono">${escHtml(j.file || '—')}</td>
+            ${fileCell}
             <td class="mono">${escHtml(j.orderId || '—')}</td>
             <td class="st ${stSafe}">${escHtml(stLabel)}</td>
             <td>${escHtml(att)}</td>
@@ -1493,6 +1668,12 @@
   document.getElementById('settings-view-logs').addEventListener('click', openLogsModal);
 
   document.getElementById('jobs-tbody').addEventListener('click', async (e) => {
+    const previewBtn = e.target.closest('[data-job-preview]');
+    if (previewBtn) {
+      const id = previewBtn.getAttribute('data-job-preview');
+      if (id) openJobPdfModal(id);
+      return;
+    }
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     const id = btn.getAttribute('data-id');

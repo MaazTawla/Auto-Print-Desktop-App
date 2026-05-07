@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("api", {
   getState: () => ipcRenderer.invoke("get-state"),
   openLogsDir: () => ipcRenderer.invoke("open-logs-dir"),
   openPrintJobsDir: () => ipcRenderer.invoke("open-print-jobs-dir"),
+  openJobPdfExternal: (jobId) => ipcRenderer.invoke("open-job-pdf-external", jobId),
   restartSystem: () => ipcRenderer.invoke("restart-system"),
   setBranchId: (id) => ipcRenderer.invoke("set-branch-id", id),
   setDefaultPrinter: (name) => ipcRenderer.invoke("set-default-printer", name),
