@@ -18,5 +18,6 @@ contextBridge.exposeInMainWorld("api", {
   testPrint: () => ipcRenderer.invoke("test-print"),
   onStateUpdate: (cb) => ipcRenderer.on("state-update", (_event, state) => cb(state)),
   minimize: () => ipcRenderer.send("window-minimize"),
+  toggleMaximize: () => ipcRenderer.send("window-toggle-maximize"),
   close: () => ipcRenderer.send("window-close"),
 });

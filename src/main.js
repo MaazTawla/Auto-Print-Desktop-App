@@ -1122,6 +1122,11 @@ ipcMain.handle("open-job-pdf-external", async (_e, rawId) => {
   return { ok: true };
 });
 ipcMain.on("window-minimize", () => { if (mainWindow) mainWindow.minimize(); });
+ipcMain.on("window-toggle-maximize", () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMaximized()) mainWindow.unmaximize();
+  else mainWindow.maximize();
+});
 ipcMain.on("window-close", () => { if (mainWindow) mainWindow.hide(); });
 ipcMain.handle("restart-system", async () => {
   log("Manual restart requested by user.", "🔁");
