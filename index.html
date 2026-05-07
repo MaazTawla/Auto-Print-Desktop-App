@@ -985,6 +985,76 @@
       align-items: center;
     }
 
+    /* ── Toast notifications ──────────────────────────── */
+    .toast-wrap {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 500;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+      max-width: min(420px, 92vw);
+    }
+    .toast {
+      pointer-events: auto;
+      border-radius: 10px;
+      border: 1px solid #d7deeb;
+      background: #fff;
+      color: #2c184b;
+      padding: 10px 12px;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.12);
+      font-family: "Poppins", "Segoe UI", system-ui, sans-serif;
+      font-size: 13px;
+      line-height: 18px;
+      opacity: 0;
+      transform: translateY(6px);
+      animation: toastIn .16s ease forwards;
+    }
+    .toast.success {
+      border-color: rgba(16, 185, 129, 0.35);
+      background: #ecfdf5;
+      color: #047857;
+    }
+    .toast.error {
+      border-color: rgba(239, 68, 68, 0.35);
+      background: #fef2f2;
+      color: #b91c1c;
+    }
+    .toast.info {
+      border-color: rgba(124, 58, 237, 0.35);
+      background: #f5f3ff;
+      color: #6d28d9;
+    }
+    @keyframes toastIn {
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes toastOut {
+      to { opacity: 0; transform: translateY(8px); }
+    }
+    :root[data-theme="dark"] .toast {
+      background: #151f33;
+      border-color: #2c3a56;
+      color: #d9e6ff;
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+    }
+    :root[data-theme="dark"] .toast.success {
+      background: rgba(16, 185, 129, 0.16);
+      border-color: rgba(16, 185, 129, 0.38);
+      color: #7cf3c4;
+    }
+    :root[data-theme="dark"] .toast.error {
+      background: rgba(239, 68, 68, 0.16);
+      border-color: rgba(239, 68, 68, 0.38);
+      color: #ffb4b4;
+    }
+    :root[data-theme="dark"] .toast.info {
+      background: rgba(124, 58, 237, 0.18);
+      border-color: rgba(124, 58, 237, 0.38);
+      color: #d8c6ff;
+    }
+
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 6px; }
@@ -2111,6 +2181,8 @@
   </div>
 </div>
 
+<div id="toast-wrap" class="toast-wrap" aria-live="polite" aria-atomic="true"></div>
+
 <!-- Printer modal -->
 <div id="printer-modal" class="modal-overlay" aria-hidden="true">
   <div class="modal-box" role="dialog" aria-labelledby="printer-modal-title">
@@ -2173,10 +2245,30 @@
   let latestState = null;
   let pdfModalJobId = null;
   let jobsQueueFilter = 'all';
+  const toastTimeouts = new Set();
   try {
     const savedFilter = sessionStorage.getItem('jobsQueueFilter');
     if (savedFilter) jobsQueueFilter = savedFilter;
   } catch (_) {}
+
+  function showToast(message, type = 'success', ttlMs = 2600) {
+    const wrap = document.getElementById('toast-wrap');
+    if (!wrap || !message) return;
+    const el = document.createElement('div');
+    el.className = `toast ${type}`;
+    el.textContent = String(message);
+    wrap.appendChild(el);
+    const t1 = setTimeout(() => {
+      el.style.animation = 'toastOut .16s ease forwards';
+      const t2 = setTimeout(() => {
+        el.remove();
+        toastTimeouts.delete(t2);
+      }, 180);
+      toastTimeouts.add(t2);
+      toastTimeouts.delete(t1);
+    }, Math.max(900, Number(ttlMs) || 2600));
+    toastTimeouts.add(t1);
+  }
 
   function formatBytesUi(n) {
     if (n == null || !Number.isFinite(Number(n))) return '—';
@@ -2500,6 +2592,7 @@
   async function handleRestart() {
     if (isRestarting) return;
     isRestarting = true;
+    showToast('Restarting agent…', 'info', 2200);
     const icon = document.getElementById('restart-icon');
     if (icon) {
       icon.textContent = '⏳';
@@ -2579,10 +2672,16 @@
         </div>`;
     }).join('');
     wrap.querySelectorAll('.printer-pick-row').forEach((row) => {
-      row.addEventListener('click', () => {
+      row.addEventListener('click', async () => {
         const enc = row.getAttribute('data-printer');
         if (!enc) return;
-        window.api.setDefaultPrinter(decodeURIComponent(enc));
+        const printerName = decodeURIComponent(enc);
+        const res = await window.api.setDefaultPrinter(printerName);
+        if (!res || !res.ok) {
+          showToast((res && res.error) || 'Could not set default printer.', 'error', 3400);
+          return;
+        }
+        showToast(`Default printer updated to "${printerName}".`);
         if (options && options.closeModal) closePrinterModal();
       });
     });
@@ -2810,9 +2909,10 @@
     if (!res || !res.ok) {
       applyTheme(prevDark);
       syncThemeControls(prevDark);
-      alert((res && res.error) || 'Could not save theme setting.');
+      showToast((res && res.error) || 'Could not save theme setting.', 'error', 3400);
       return false;
     }
+    showToast(`Theme updated to ${isDark ? 'Dark' : 'Light'}.`);
     return true;
   }
 
@@ -2821,7 +2921,13 @@
     errEl.textContent = '';
     const v = document.getElementById('settings-branch').value.trim();
     const res = await window.api.setBranchId(v);
-    if (!res.ok) errEl.textContent = res.error || 'Could not update branch.';
+    if (!res.ok) {
+      const msg = res.error || 'Could not update branch.';
+      errEl.textContent = msg;
+      showToast(msg, 'error', 3400);
+      return;
+    }
+    showToast('Branch updated successfully.');
   });
 
   document.getElementById('settings-rabbit-save').addEventListener('click', async () => {
@@ -2849,12 +2955,15 @@
     });
     rabbitPwClearPending = false;
     if (!res.ok) {
-      errEl.textContent = res.error || 'Could not save RabbitMQ settings.';
+      const msg = res.error || 'Could not save RabbitMQ settings.';
+      errEl.textContent = msg;
+      showToast(msg, 'error', 3400);
       return;
     }
     document.getElementById('settings-rabbit-pw-change').checked = false;
     document.getElementById('settings-rabbit-pw-new').value = '';
     document.getElementById('settings-rabbit-pw-new').disabled = true;
+    showToast('RabbitMQ settings saved and reconnect requested.');
   });
 
   document.getElementById('settings-rabbit-pw-change').addEventListener('change', (e) => {
@@ -2874,7 +2983,13 @@
 
   document.getElementById('settings-startup-check').addEventListener('change', async (e) => {
     const on = e.target.checked;
-    await window.api.setStartupSettings({ launchOnLogin: on, restartOnCrash: on });
+    const res = await window.api.setStartupSettings({ launchOnLogin: on, restartOnCrash: on });
+    if (!res || !res.ok) {
+      showToast((res && res.error) || 'Could not save startup settings.', 'error', 3400);
+      e.target.checked = !on;
+      return;
+    }
+    showToast(`Startup ${on ? 'enabled' : 'disabled'}.`);
   });
 
   document.getElementById('settings-darkmode-check').addEventListener('change', async (e) => {
@@ -2886,8 +3001,10 @@
     const paperSize = document.getElementById('settings-print-paper').value.trim();
     const res = await window.api.setPrintLayout({ scale, paperSize });
     if (!res || !res.ok) {
-      alert((res && res.error) || 'Could not save print layout.');
+      showToast((res && res.error) || 'Could not save print layout.', 'error', 3400);
+      return;
     }
+    showToast('Print layout settings saved.');
   });
 
   document.getElementById('settings-retention-save').addEventListener('click', async () => {
@@ -2897,8 +3014,12 @@
     const jobDays = Number(document.getElementById('settings-job-retention-days').value);
     const res = await window.api.setRetentionSettings({ logDays, jobDays });
     if (!res || !res.ok) {
-      errEl.textContent = (res && res.error) || 'Could not save retention.';
+      const msg = (res && res.error) || 'Could not save retention.';
+      errEl.textContent = msg;
+      showToast(msg, 'error', 3400);
+      return;
     }
+    showToast('Retention settings updated.');
   });
 
   document.getElementById('theme-quick-dark').addEventListener('change', async (e) => {
