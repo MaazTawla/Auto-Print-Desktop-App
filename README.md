@@ -58,6 +58,7 @@ This builds the Windows NSIS installer in `dist/`.
 - **Poison message protection**: invalid or missing local file payloads are rejected without requeue (prevents infinite replay loop).
 - **Print retries**: per job, 3 retry delays (`5s`, `30s`, `60s`) after initial attempt, then job moves to DLQ.
 - **Scheduled self-restart**: app restarts its runtime loop every 1.5 hours.
+- **PDF scaling**: Windows printing uses `pdf-to-printer` (SumatraPDF). Configure **Settings → PDF scaling & paper** for `fit` / `shrink` / `noscale` and an optional `paperSize` string when the server PDF page size does not match the receipt printer’s logical page. Full Windows driver “preferences” are not read programmatically; matching paper names come from the driver when exposed via `getPrinters()`.
 
 ---
 
@@ -69,6 +70,7 @@ This builds the Windows NSIS installer in `dist/`.
   - Branch ID
   - RabbitMQ host/port/user/password/exchange
   - Default printer
+  - PDF scaling & optional paper size (saved in `config.json` as `print_scale`, `print_paper_size`)
   - Startup + crash-restart behavior
   - Appearance (light/dark)
   - Maintenance: restart agent, open logs folder, open print-jobs folder, and in-app **View logs** modal.

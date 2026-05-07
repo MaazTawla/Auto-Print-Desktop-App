@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld("api", {
   setDefaultPrinter: (name) => ipcRenderer.invoke("set-default-printer", name),
   setStartupSettings: (opts) => ipcRenderer.invoke("set-startup-settings", opts),
   setDarkMode: (enabled) => ipcRenderer.invoke("set-dark-mode", enabled),
+  setPrintLayout: (opts) => ipcRenderer.invoke("set-print-layout", opts),
   setRabbitSettings: (opts) => ipcRenderer.invoke("set-rabbit-settings", opts),
   retryPrintJob: (id) => ipcRenderer.invoke("retry-print-job", id),
   resendPrintJob: (id) => ipcRenderer.invoke("resend-print-job", id),

@@ -901,6 +901,32 @@
         </details>
 
         <details class="settings-section">
+          <summary>PDF scaling &amp; paper</summary>
+          <div class="settings-body">
+            <div class="settings-body-inner">
+            <p class="field-hint">
+              Order PDFs are printed via SumatraPDF (<code>pdf-to-printer</code>). Use <strong>Fit to page</strong> when the server sends a fixed page size and you want it scaled to the printer’s logical page. Optional paper size must match a name the driver accepts — suggestions appear for the current default printer when Windows reports them.
+            </p>
+            <div class="field">
+              <label for="settings-print-scale">Scale</label>
+              <select id="settings-print-scale" style="max-width:320px;">
+                <option value="fit">Fit to page</option>
+                <option value="shrink">Shrink oversized only</option>
+                <option value="noscale">Original size (no scale)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="settings-print-paper">Paper size (optional)</label>
+              <input type="text" id="settings-print-paper" list="settings-print-paper-datalist" placeholder="Leave empty for printer default" autocomplete="off" style="max-width:360px;" />
+              <datalist id="settings-print-paper-datalist"></datalist>
+              <div class="field-hint">Examples: <span class="mono">A4</span>, <span class="mono">Letter</span>, <span class="mono">80mm</span> — depends on the driver.</div>
+            </div>
+            <button type="button" class="btn-primary" id="settings-print-layout-save">Save scaling &amp; paper</button>
+            </div>
+          </div>
+        </details>
+
+        <details class="settings-section">
           <summary>Startup</summary>
           <div class="settings-body">
             <div class="settings-body-inner">
@@ -1257,6 +1283,28 @@
       modalBtn.disabled = !canTest;
       modalBtn.title = canTest ? 'Sends a test receipt PDF.' : 'Select a default printer first.';
     }
+
+    const scaleSel = document.getElementById('settings-print-scale');
+    if (scaleSel && document.activeElement !== scaleSel) {
+      const v = s.printScale || 'fit';
+      scaleSel.value = ['fit', 'shrink', 'noscale'].includes(v) ? v : 'fit';
+    }
+    const paperInp = document.getElementById('settings-print-paper');
+    if (paperInp && document.activeElement !== paperInp) {
+      paperInp.value = s.printPaperSize != null ? String(s.printPaperSize) : '';
+    }
+    const dl = document.getElementById('settings-print-paper-datalist');
+    if (dl) {
+      dl.innerHTML = '';
+      const def = s.defaultPrinter;
+      const p = (s.printers || []).find((x) => x.name === def);
+      const sizes = p && Array.isArray(p.paperSizes) ? p.paperSizes : [];
+      for (const z of sizes) {
+        const opt = document.createElement('option');
+        opt.value = String(z);
+        dl.appendChild(opt);
+      }
+    }
   }
 
   function applyState(s) {
@@ -1421,6 +1469,15 @@
 
   document.getElementById('settings-darkmode-check').addEventListener('change', async (e) => {
     await persistTheme(e.target.checked);
+  });
+
+  document.getElementById('settings-print-layout-save').addEventListener('click', async () => {
+    const scale = document.getElementById('settings-print-scale').value;
+    const paperSize = document.getElementById('settings-print-paper').value.trim();
+    const res = await window.api.setPrintLayout({ scale, paperSize });
+    if (!res || !res.ok) {
+      alert((res && res.error) || 'Could not save print layout.');
+    }
   });
 
   document.getElementById('theme-quick-dark').addEventListener('change', async (e) => {

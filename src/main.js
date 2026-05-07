@@ -14,6 +14,14 @@ const RETRY_DELAYS_MS = [5000, 30000, 60000];
 /** Total attempts: initial + 3 retries after failures. */
 const MAX_ATTEMPTS = 4;
 
+/** SumatraPDF / pdf-to-printer scaling: fit page, shrink oversized only, or original size. */
+function normalizePrintScale(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (s === "noscale" || s === "none" || s === "original") return "noscale";
+  if (s === "shrink") return "shrink";
+  return "fit";
+}
+
 let jobsStore = null;
 const pendingRetries = new Map();
 const PRINT_DATA_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7d
@@ -352,7 +360,7 @@ async function runPrintAttempt(jobId) {
   try {
     const { print } = require("pdf-to-printer");
     const printStartedAt = Date.now();
-    await print(job.localPath, { printer: printerName });
+    await print(job.localPath, buildPdfToPrinterOptions(printerName));
 
     let outcome = "untracked";
     if (process.platform === "win32") {
@@ -460,6 +468,8 @@ function loadConfig() {
     const launchOnLogin = cfg.launch_on_login === undefined ? true : !!cfg.launch_on_login;
     const restartOnCrash = cfg.restart_on_crash === undefined ? true : !!cfg.restart_on_crash;
     const darkMode = cfg.dark_mode === undefined ? false : !!cfg.dark_mode;
+    const printScale = normalizePrintScale(cfg.print_scale);
+    const printPaperSize = cfg.print_paper_size != null ? String(cfg.print_paper_size).trim() : "";
     return {
       branchId,
       channel: `branch.${branchId}`,
@@ -468,6 +478,8 @@ function loadConfig() {
       launchOnLogin,
       restartOnCrash,
       darkMode,
+      printScale,
+      printPaperSize,
     };
   } catch (_) {
     return {
@@ -478,6 +490,8 @@ function loadConfig() {
       launchOnLogin: true,
       restartOnCrash: true,
       darkMode: false,
+      printScale: "fit",
+      printPaperSize: "",
     };
   }
 }
@@ -495,6 +509,9 @@ function saveUserConfig(partial) {
   const next = { ...cur, ...partial };
   if ("default_printer" in partial && (partial.default_printer === null || partial.default_printer === "")) {
     delete next.default_printer;
+  }
+  if ("print_paper_size" in partial && (partial.print_paper_size === null || String(partial.print_paper_size).trim() === "")) {
+    delete next.print_paper_size;
   }
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf8");
@@ -559,6 +576,8 @@ const {
   launchOnLogin: initialLaunchOnLogin,
   restartOnCrash: initialRestartOnCrash,
   darkMode: initialDarkMode,
+  printScale: initialPrintScale,
+  printPaperSize: initialPrintPaperSize,
 } = loadConfig();
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -576,7 +595,21 @@ let state = {
   launchOnLogin: initialLaunchOnLogin,
   restartOnCrash: initialRestartOnCrash,
   darkMode: initialDarkMode,
+  printScale: initialPrintScale,
+  printPaperSize: initialPrintPaperSize,
 };
+
+function buildPdfToPrinterOptions(printerName, extra = {}) {
+  const opts = {
+    printer: printerName,
+    silent: true,
+    scale: state.printScale || "fit",
+    ...extra,
+  };
+  const ps = (state.printPaperSize || "").trim();
+  if (ps) opts.paperSize = ps;
+  return opts;
+}
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 let tray = null;
@@ -809,6 +842,24 @@ ipcMain.handle("set-dark-mode", async (_e, enabled) => {
   return { ok: true, darkMode: dark };
 });
 
+ipcMain.handle("set-print-layout", async (_e, opts) => {
+  const scale = normalizePrintScale(opts?.scale);
+  const paperRaw = opts?.paperSize != null ? String(opts.paperSize) : "";
+  const paper = paperRaw.trim();
+  state.printScale = scale;
+  state.printPaperSize = paper;
+  const patch = { print_scale: scale };
+  if (paper) patch.print_paper_size = paper;
+  else patch.print_paper_size = "";
+  saveUserConfig(patch);
+  log(
+    `Print layout saved: scale=${scale}` + (paper ? `, paperSize="${paper}"` : ", paperSize=driver default"),
+    "🖨️"
+  );
+  pushState();
+  return { ok: true, printScale: scale, printPaperSize: paper };
+});
+
 ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
   const host = opts?.host != null ? String(opts.host).trim() : "";
   const portRaw = opts?.port;
@@ -874,12 +925,7 @@ ipcMain.handle("test-print", async () => {
     const { print } = require("pdf-to-printer");
     const printStartedAt = Date.now();
     log(`Test print (80mm layout) starting on "${printerName}"…`, "🖨️");
-    await print(tmpPath, {
-      printer: printerName,
-      silent: true,
-      scale: "fit",
-      monochrome: true,
-    });
+    await print(tmpPath, buildPdfToPrinterOptions(printerName, { monochrome: true }));
     let outcome = "untracked";
     outcome = await watchWindowsPrintJob({
       printerName,
@@ -934,6 +980,7 @@ async function pollPrinters() {
     state.printers = list.map((p) => ({
       name: p.name,
       status: p.status || "Ready",
+      paperSizes: Array.isArray(p.paperSizes) ? p.paperSizes : [],
     }));
   } catch (err) {
     log("Printer poll failed: " + err.message, "⚠️");
@@ -1262,9 +1309,18 @@ if (!gotSingleInstanceLock) {
     const nextLogin = cfg.launch_on_login === undefined ? state.launchOnLogin : !!cfg.launch_on_login;
     const nextCrash = cfg.restart_on_crash === undefined ? state.restartOnCrash : !!cfg.restart_on_crash;
     const nextDark = cfg.dark_mode === undefined ? state.darkMode : !!cfg.dark_mode;
+    const nextScale = cfg.print_scale === undefined ? state.printScale : normalizePrintScale(cfg.print_scale);
+    const nextPaper =
+      cfg.print_paper_size === undefined
+        ? state.printPaperSize
+        : cfg.print_paper_size != null
+          ? String(cfg.print_paper_size).trim()
+          : "";
     state.launchOnLogin = nextLogin;
     state.restartOnCrash = nextCrash;
     state.darkMode = nextDark;
+    state.printScale = nextScale;
+    state.printPaperSize = nextPaper;
     applyStartupIntegration();
     const nextBranch = String(cfg.branch_id ?? "").trim();
     if (nextBranch && nextBranch !== state.branchId) {
