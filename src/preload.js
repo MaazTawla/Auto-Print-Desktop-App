@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("api", {
   getState: () => ipcRenderer.invoke("get-state"),
+  refreshPrinters: () => ipcRenderer.invoke("refresh-printers"),
   openLogsDir: () => ipcRenderer.invoke("open-logs-dir"),
   openPrintJobsDir: () => ipcRenderer.invoke("open-print-jobs-dir"),
   openJobPdfExternal: (jobId) => ipcRenderer.invoke("open-job-pdf-external", jobId),

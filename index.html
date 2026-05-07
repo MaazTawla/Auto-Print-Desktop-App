@@ -2472,7 +2472,14 @@
     });
   }
 
-  function openPrinterModal() {
+  async function openPrinterModal() {
+    try {
+      if (window.api && typeof window.api.refreshPrinters === 'function') {
+        await window.api.refreshPrinters();
+      }
+    } catch (_) {
+      // Keep modal usable even if refresh fails.
+    }
     const el = document.getElementById('printer-modal');
     el.classList.add('open');
     el.setAttribute('aria-hidden', 'false');

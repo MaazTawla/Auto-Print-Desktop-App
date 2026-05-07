@@ -1111,6 +1111,10 @@ function getPublicState() {
 
 // ─── IPC: renderer requests ───────────────────────────────────────────────────
 ipcMain.handle("get-state", () => getPublicState());
+ipcMain.handle("refresh-printers", async () => {
+  await pollPrinters();
+  return { ok: true, printers: state.printers };
+});
 ipcMain.handle("open-logs-dir", () => shell.openPath(LOG_DIR));
 ipcMain.handle("open-print-jobs-dir", () => shell.openPath(getJobsStore().root));
 ipcMain.handle("open-job-pdf-external", async (_e, rawId) => {
@@ -1345,18 +1349,74 @@ function updateTrayTooltip() {
 }
 
 // ─── Printer polling ──────────────────────────────────────────────────────────
+function normalizePrinterRows(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const p of Array.isArray(rows) ? rows : []) {
+    const name = p && p.name != null ? String(p.name).trim() : "";
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      name,
+      status: p.status || "Ready",
+      paperSizes: Array.isArray(p.paperSizes) ? p.paperSizes : [],
+    });
+  }
+  return out;
+}
+
 async function pollPrinters() {
+  let next = [];
+  let electronErr = null;
+  let pdfErr = null;
+
+  // Prefer Electron's native list from the window session if available.
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      const list = await mainWindow.webContents.getPrintersAsync();
+      next = normalizePrinterRows(list);
+    }
+  } catch (err) {
+    electronErr = err;
+  }
+
+  // Fallback/merge from pdf-to-printer (also includes paperSizes details).
   try {
     const { getPrinters } = require("pdf-to-printer");
     const list = await getPrinters();
-    state.printers = list.map((p) => ({
-      name: p.name,
-      status: p.status || "Ready",
-      paperSizes: Array.isArray(p.paperSizes) ? p.paperSizes : [],
-    }));
+    const fallback = normalizePrinterRows(list);
+    if (!next.length) {
+      next = fallback;
+    } else {
+      const existing = new Set(next.map((p) => p.name.toLowerCase()));
+      for (const p of fallback) {
+        const key = p.name.toLowerCase();
+        if (!existing.has(key)) {
+          next.push(p);
+          existing.add(key);
+        }
+      }
+    }
   } catch (err) {
-    log("Printer poll failed: " + err.message, "⚠️");
+    pdfErr = err;
   }
+
+  if (!next.length && (electronErr || pdfErr)) {
+    const parts = [];
+    if (electronErr) parts.push("electron: " + (electronErr.message || String(electronErr)));
+    if (pdfErr) parts.push("pdf-to-printer: " + (pdfErr.message || String(pdfErr)));
+    log("Printer poll failed: " + parts.join(" | "), "⚠️");
+  } else {
+    state.printers = next;
+    if (state.defaultPrinter && !state.printers.some((p) => p.name === state.defaultPrinter)) {
+      state.defaultPrinter = null;
+      saveUserConfig({ default_printer: null });
+      log("Saved default printer is no longer available and was cleared.", "🖨️");
+    }
+  }
+
   pushState();
 }
 
@@ -1810,6 +1870,10 @@ if (!gotSingleInstanceLock) {
     log(`Branch ID: ${state.branchId} — listening on ${state.channel}`, "📌");
     await startRabbit();
     await pollPrinters();
+    // Some USB/network printers appear a moment after app start/login.
+    setTimeout(() => {
+      pollPrinters().catch(() => {});
+    }, 6000);
     cleanupOldPrintData();
     if (printDataCleanupInterval) clearInterval(printDataCleanupInterval);
     printDataCleanupInterval = setInterval(cleanupOldPrintData, 60 * 60 * 1000);
@@ -1821,8 +1885,10 @@ if (!gotSingleInstanceLock) {
       refreshDiskSpaceStatus({}).catch(() => {});
     }, 5 * 60 * 1000);
 
-    // Refresh printer list every 30s
-    setInterval(pollPrinters, 30000);
+    // Refresh printer list regularly so hot-plugged devices appear quickly.
+    setInterval(() => {
+      pollPrinters().catch(() => {});
+    }, 10000);
 
     // Scheduled 1.5h restart
     scheduledRestartInterval = setInterval(() => {
