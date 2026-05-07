@@ -1157,6 +1157,10 @@
       width: 116px;
       height: 32px;
       object-fit: contain;
+      transition: filter .15s ease;
+    }
+    :root[data-theme="dark"] .brand-logo {
+      filter: brightness(0) saturate(100%) invert(92%) sepia(9%) saturate(478%) hue-rotate(184deg) brightness(106%) contrast(96%);
     }
     .brand-divider {
       width: 1px;
@@ -1241,6 +1245,9 @@
     }
     .wbtn:hover { background: var(--shell-bg); color: var(--shell-text); border-color: #d4dbe8; }
     .wbtn img { width: 16px; height: 16px; }
+    :root[data-theme="dark"] .wbtn img {
+      filter: brightness(0) saturate(100%) invert(90%) sepia(10%) saturate(482%) hue-rotate(182deg) brightness(104%) contrast(97%);
+    }
     .wbtn.close:hover { background: #fdebec; border-color: #e09aa2; color: #b72f3f; }
     :root[data-theme="dark"] .wbtn.close:hover { background: #3b1f29; border-color: #8f4b56; color: #ffb7c0; }
 
