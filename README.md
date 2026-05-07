@@ -1,100 +1,90 @@
 # Tawla Print Agent
 
-Windows system-tray Electron app that consumes print orders from RabbitMQ and prints PDFs to a selected local printer.
+Windows desktop app that runs in the **system tray**, connects to **Tawla’s print queue** over the network, and sends incoming **PDF receipts** to your chosen printer automatically.
 
 ---
 
-## Project Structure
+## Download & install (for venues / IT)
+
+### Where to get it
+
+1. On GitHub, open this repository and go to **Releases**, or use the **direct link** your vendor sent you (it ends with `/releases`).
+2. Under **Assets**, download the latest **Windows installer** — the file name looks like **`Tawla Print Agent Setup x.y.z.exe`** (not the source code zip).
+3. Run the installer and complete the steps. Installation may require **administrator approval** (machine-wide install).
+4. When setup finishes, the app can start automatically; otherwise open **Tawla Print Agent** from the **Start menu**.
+
+After install, look for the **tray icon** (near the clock). **Double‑click** it or use **Open Dashboard** from the menu to open the settings window.
+
+### Before you install — checklist
+
+| Requirement | Notes |
+|-------------|--------|
+| **Windows PC** | Printing is supported on **Windows** only (64‑bit). |
+| **Printer installed** | Install your receipt printer in Windows and confirm a test page prints. |
+| **Internet / network** | The PC must reach your **RabbitMQ** server (host/port/firewall as provided by Tawla). |
+| **Credentials** | Your onboarding should include **Branch ID** and **RabbitMQ** settings (host, port, username, password, exchange). If an installer or IT script already set the branch ID, you may only need to confirm printer and connection in the app. |
+
+### First-time setup in the app
+
+1. **Settings → Branch ID** — must match your venue (from Tawla).  
+2. **Settings → RabbitMQ** — enter host, port, username, password, and exchange if not already configured.  
+3. **Settings → Default printer** — pick the receipt printer.  
+4. Optional: **PDF scaling & paper** — if output is clipped or the wrong size, adjust scale / paper name with guidance from support.  
+5. **Maintenance** — log and job retention defaults are usually fine; increase **job file** retention only if you need longer history on disk.
+
+When RabbitMQ shows **connected**, new orders should appear under **Queue** and print according to your workflow.
+
+### Everyday use
+
+- The agent keeps running in the **tray** after you close the window (close hides to tray; use **Quit** from the tray menu to exit fully).
+- Use **Queue** to see status, open a PDF preview (job name), **Retry** failed jobs, or **Resend** completed ones when needed.
+- If the PC sleeps or the network drops, the app **reconnects** automatically; after **wake from sleep** or **unlocking** the screen it refreshes connection and printers.
+
+### Disk space & notifications
+
+If Windows disk space runs low, you may get a **notification** and see a message in the dashboard. The app can remove **old logs** and **old completed queue files** according to your retention settings. **Free disk space** if you see warnings — critical lack of space can prevent saving new PDFs.
+
+### Problems?
+
+- Confirm **default printer** is correct and the printer is **Ready** in Windows.  
+- Confirm **RabbitMQ** fields match what Tawla provided and firewalls allow the port.  
+- Use tray → **Restart Agent**, then contact support with the **log** text (**Maintenance → View logs**) if issues continue.
+
+---
+
+## Technical overview (operators & support)
+
+- **Transport**: RabbitMQ — exchange `orders.print`, routing key `branch.<branch_id>`, queue `printer.Branch.<branch_id>`.
+- **Reconnect**: Automatic on broker/network issues, consumer cancellation, and failed health checks.
+- **Sleep / lock**: Debounced refresh after **resume** or **screen unlock** so RabbitMQ and printer lists recover.
+- **Retries**: Up to several attempts per job with backoff; persistent failures go to **dead letter** in the UI.
+- **Poison messages**: Bad/missing PDF payloads are not requeued infinitely.
+- **Storage** (under `%APPDATA%\tawla-print-agent\`): `config.json`, `logs\`, `print-jobs\` (incoming, dlq, `jobs.json`). Separate retention for **logs** vs **job files** (defaults **7** / **1** days).
+
+---
+
+## For developers
+
+### Project layout
 
 ```
 Auto Printing/
-├── index.html                 # Dashboard UI
+├── index.html
 ├── src/
-│   ├── main.js                # Electron main process (RabbitMQ, printing, tray, IPC)
-│   ├── preload.js             # Secure renderer ↔ main bridge
-│   ├── print-job-tracker.js   # Windows spooler job tracking
-│   └── print-jobs-store.js    # Persistent jobs manifest + incoming/dlq folders
+│   ├── main.js
+│   ├── preload.js
+│   ├── print-job-tracker.js
+│   └── print-jobs-store.js
 ├── assets/
-│   ├── icon.png
-│   └── icon.ico
 └── package.json
 ```
 
----
-
-## Setup
+### Dev & build
 
 ```bash
 npm install
+npm start          # development
+npm run dist       # Windows NSIS installer → dist/
 ```
 
----
-
-## Run (Dev)
-
-```bash
-npm start
-```
-
-The app starts in tray mode and can be opened from the tray icon.
-
----
-
-## Build Installer
-
-```bash
-npm run dist
-```
-
-This builds the Windows NSIS installer in `dist/`.
-
----
-
-## Runtime Behavior
-
-- **RabbitMQ transport**: listens on exchange `orders.print` with routing key `branch.<branch_id>`, queue `printer.Branch.<branch_id>`.
-- **Auto reconnect**: reconnects after connection/channel errors, broker disconnects, broker consumer cancellation, and periodic health-check failures.
-- **Sleep / lock**: on **resume from sleep** or **screen unlock** (manual lock, idle lock, or returning after sleep), the app runs a debounced refresh (`restartSystem`) so RabbitMQ and printer state recover without sitting in a broken state. Screen lock alone does not stop the tray agent; connection usually stays up until suspend or network loss.
-- **Disk space**: periodic checks (every ~5 minutes) with **low** / **critical** thresholds; **Windows toast** (tray) + **in-app banner** when space is low. On **critical** or **ENOSPC**, the app removes log / job data **older than your retention setting**, runs the normal print-job cleanup, and may **trim oldest completed / DLQ / failed / retry-scheduled** rows from `jobs.json` and delete their files. Incoming PDF save also runs a space check first.
-- **Log files**: under `logs/`, **date-named** `YYYY-MM-DD.log` files; retention is **Settings → Maintenance → Delete logs older than (days)** (default **7**, range **1–365**). Clean-up runs on an hourly timer, every ~5 minutes with disk checks, on save, and during disk pressure.
-- **Print-job files**: retention is **Delete queue / job files older than (days)** (default **1** day, range **1–365**). Same cleanup schedule as logs.
-- **Queue UI**: filter jobs by **status** (all, queued, printing, retry scheduled, completed, dead letter, failed setup).
-- **Broker heartbeat**: uses AMQP heartbeat to detect dead connections faster.
-- **Poison message protection**: invalid or missing local file payloads are rejected without requeue (prevents infinite replay loop).
-- **Print retries**: per job, 3 retry delays (`5s`, `30s`, `60s`) after initial attempt, then job moves to DLQ.
-- **Scheduled self-restart**: app restarts its runtime loop every 1.5 hours.
-- **PDF scaling**: Windows printing uses `pdf-to-printer` (SumatraPDF). Configure **Settings → PDF scaling & paper** for `fit` / `shrink` / `noscale` and an optional `paperSize` string when the server PDF page size does not match the receipt printer’s logical page. Full Windows driver “preferences” are not read programmatically; matching paper names come from the driver when exposed via `getPrinters()`.
-
----
-
-## Dashboard / Settings Highlights
-
-- **Home**: connection state, routing key, last order, last printed job, jobs count.
-- **Queue**: print jobs list with status, attempts, next retry, errors, and actions.
-- **Settings**:
-  - Branch ID
-  - RabbitMQ host/port/user/password/exchange
-  - Default printer
-  - PDF scaling & optional paper size (saved in `config.json` as `print_scale`, `print_paper_size`)
-  - Startup + crash-restart behavior
-  - Appearance (light/dark)
-  - Maintenance: separate retention for **logs** vs **queue/job files** (defaults **7** / **1** days), restart agent, open folders, in-app **View logs**.
-
----
-
-## Storage Paths
-
-Under `%APPDATA%/tawla-print-agent/`:
-
-- `config.json` (includes `log_retention_days`, `job_retention_days`; legacy `retention_days` is read for logs only until you save new settings)
-- `logs/` (daily log files; retention cleanup applies)
-- `print-jobs/incoming/`
-- `print-jobs/dlq/`
-- `print-jobs/jobs.json`
-
----
-
-## Notes
-
-- Printing and spooler tracking are Windows-oriented (`pdf-to-printer` + PowerShell `Get-PrintJob`).
-- If spooler tracking is unavailable, print submission is still considered sent and logged accordingly.
+Printing and spooler tracking target **Windows** (`pdf-to-printer` + PowerShell).
