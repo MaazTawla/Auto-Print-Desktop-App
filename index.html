@@ -3054,9 +3054,12 @@
     showToast(`Startup ${on ? 'enabled' : 'disabled'}.`);
   });
 
-  document.getElementById('settings-darkmode-check').addEventListener('change', async (e) => {
-    await persistTheme(e.target.checked);
-  });
+  const settingsDarkModeCheck = document.getElementById('settings-darkmode-check');
+  if (settingsDarkModeCheck) {
+    settingsDarkModeCheck.addEventListener('change', async (e) => {
+      await persistTheme(e.target.checked);
+    });
+  }
 
   document.getElementById('settings-print-layout-save').addEventListener('click', async () => {
     const scale = document.getElementById('settings-print-scale').value;
