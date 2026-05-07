@@ -1,4 +1,17 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, protocol, net } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  Tray,
+  Menu,
+  nativeImage,
+  ipcMain,
+  shell,
+  protocol,
+  net,
+  powerMonitor,
+  Notification,
+} = require("electron");
+const checkDiskSpace = require("check-disk-space").default;
 const path = require("path");
 const { pathToFileURL } = require("url");
 const fs = require("fs");
@@ -22,9 +35,19 @@ function normalizePrintScale(raw) {
   return "fit";
 }
 
+/** Retention in days (1–365). `fallback` used when `raw` is missing/invalid. */
+function clampRetentionDays(raw, fallback) {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(365, Math.max(1, n));
+}
+
 let jobsStore = null;
 const pendingRetries = new Map();
-const PRINT_DATA_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7d
+/** Warn when free space below this or below DISK_WARN_PERCENT_FREE. */
+const DISK_WARN_BYTES = 500 * 1024 * 1024;
+const DISK_CRITICAL_BYTES = 150 * 1024 * 1024;
+const DISK_WARN_PERCENT_FREE = 5;
 
 function getJobsStore() {
   if (!jobsStore) jobsStore = createPrintJobsStore(app.getPath("userData"));
@@ -54,18 +77,43 @@ function derivePdfBasename(filePath, isUrl) {
 }
 
 async function saveIncomingPdf(store, jobId, filePath, isUrl) {
+  await ensureSpaceForIncomingPdf();
   const rawBase = derivePdfBasename(filePath, isUrl);
   const safeBase = rawBase.replace(/[^a-zA-Z0-9._-]/g, "_") || "order.pdf";
   const dest = path.join(store.incoming, `${jobId}_${safeBase}`);
-  if (isUrl) {
-    const res = await axios.get(filePath, { responseType: "arraybuffer", timeout: 120000 });
-    fs.writeFileSync(dest, Buffer.from(res.data));
-  } else {
-    const resolved = path.resolve(filePath);
-    if (!fs.existsSync(resolved)) throw new Error("Local PDF not found: " + resolved);
-    fs.copyFileSync(resolved, dest);
+  try {
+    if (isUrl) {
+      const res = await axios.get(filePath, { responseType: "arraybuffer", timeout: 120000 });
+      fs.writeFileSync(dest, Buffer.from(res.data));
+    } else {
+      const resolved = path.resolve(filePath);
+      if (!fs.existsSync(resolved)) throw new Error("Local PDF not found: " + resolved);
+      fs.copyFileSync(resolved, dest);
+    }
+  } catch (err) {
+    if (isNoSpaceError(err)) {
+      await emergencyDiskCleanup();
+      await refreshDiskSpaceStatus({ silent: true });
+      if (state.diskSpace.status === "critical") {
+        throw new Error("Disk full — could not save PDF. Freed old logs/jobs; free more space and retry.");
+      }
+      if (isUrl) {
+        const res = await axios.get(filePath, { responseType: "arraybuffer", timeout: 120000 });
+        fs.writeFileSync(dest, Buffer.from(res.data));
+      } else {
+        const resolved = path.resolve(filePath);
+        fs.copyFileSync(resolved, dest);
+      }
+    } else {
+      throw err;
+    }
   }
   return dest;
+}
+
+function isNoSpaceError(err) {
+  const c = err && (err.code || err.errno);
+  return c === "ENOSPC" || c === -28;
 }
 
 function clearRetryTimer(jobId) {
@@ -189,7 +237,7 @@ function manualQueuePrint(jobId, mode) {
 function cleanupOldPrintData() {
   const store = getJobsStore();
   store.ensureDirs();
-  const cutoff = Date.now() - PRINT_DATA_RETENTION_MS;
+  const cutoff = Date.now() - getJobRetentionMs();
   let removedJobs = 0;
   let deletedIncoming = 0;
   let deletedDlq = 0;
@@ -276,9 +324,204 @@ function cleanupOldPrintData() {
     syncJobsToState();
     pushState();
     log(
-      `Print data cleanup: removed ${removedJobs} job(s), ${totalIncoming} incoming file(s), ${totalDlq} dlq file(s) older than 7d.`,
+      `Print data cleanup: removed ${removedJobs} job(s), ${totalIncoming} incoming file(s), ${totalDlq} dlq file(s) older than ${getEffectiveJobRetentionDays()} day(s).`,
       "🧹"
     );
+  }
+}
+
+// ─── Disk space & log file retention ───────────────────────────────────────────
+let diskSpaceCheckTimer = null;
+let lastDiskNotifyLevel = null;
+let lastDiskNotifyAt = 0;
+
+function getDiskSpaceTargetPath() {
+  const ud = app.getPath("userData");
+  if (process.platform === "win32") {
+    const m = /^([a-zA-Z]):/.exec(ud);
+    if (m) return `${m[1]}:`;
+  }
+  return ud;
+}
+
+function formatBytes(n) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/** Delete rolling log files older than retention (by date in filename YYYY-MM-DD.log). */
+function cleanupOldLogFiles() {
+  let deleted = 0;
+  const cutoff = Date.now() - getLogRetentionMs();
+  try {
+    if (!fs.existsSync(LOG_DIR)) return 0;
+    const names = fs.readdirSync(LOG_DIR);
+    for (const file of names) {
+      if (!/^\d{4}-\d{2}-\d{2}\.log$/i.test(file)) continue;
+      const day = file.replace(/\.log$/i, "");
+      const t = Date.parse(day + "T12:00:00.000Z");
+      if (!Number.isFinite(t) || t >= cutoff) continue;
+      try {
+        fs.unlinkSync(path.join(LOG_DIR, file));
+        deleted += 1;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return deleted;
+}
+
+function maybeNotifyDiskSpace(status, detail) {
+  if (status === "ok") {
+    lastDiskNotifyLevel = null;
+    return;
+  }
+  const now = Date.now();
+  const worsened =
+    status === "critical" && lastDiskNotifyLevel === "low";
+  if (
+    !worsened &&
+    status === lastDiskNotifyLevel &&
+    now - lastDiskNotifyAt < 30 * 60 * 1000
+  ) {
+    return;
+  }
+  if (!Notification.isSupported()) {
+    lastDiskNotifyLevel = status;
+    lastDiskNotifyAt = now;
+    return;
+  }
+  const freeLabel = detail?.freeBytes != null ? formatBytes(detail.freeBytes) : "low";
+  const title =
+    status === "critical"
+      ? "Tawla Print Agent — Disk almost full"
+      : "Tawla Print Agent — Low disk space";
+  const body =
+    status === "critical"
+      ? `Critical storage (${freeLabel} free). Old logs and completed jobs may be removed automatically. Free disk space to avoid losing orders.`
+      : `Low disk space (${freeLabel} free). Consider freeing space soon.`;
+  try {
+    const n = new Notification({ title, body });
+    n.show();
+  } catch (_) {}
+  lastDiskNotifyLevel = status;
+  lastDiskNotifyAt = now;
+}
+
+async function refreshDiskSpaceStatus(opts = {}) {
+  const silent = !!opts.silent;
+  try {
+    const diskPath = getDiskSpaceTargetPath();
+    const info = await checkDiskSpace(diskPath);
+    const free = Number(info.free) || 0;
+    const size = Number(info.size) || 0;
+    const pct = size > 0 ? (free / size) * 100 : 100;
+    let status = "ok";
+    if (free < DISK_CRITICAL_BYTES || pct < 1.5) status = "critical";
+    else if (free < DISK_WARN_BYTES || pct < DISK_WARN_PERCENT_FREE) status = "low";
+
+    state.diskSpace = {
+      status,
+      freeBytes: free,
+      totalBytes: size,
+      freePercent: Math.round(pct * 10) / 10,
+      checkedAt: new Date().toISOString(),
+      diskPath,
+    };
+    if (!silent) {
+      maybeNotifyDiskSpace(status, state.diskSpace);
+    }
+    pushState();
+
+    if (status === "critical" && !opts.skipEmergencyCleanup) {
+      await emergencyDiskCleanup();
+      await refreshDiskSpaceStatus({ silent: true, skipEmergencyCleanup: true });
+    }
+    return state.diskSpace;
+  } catch (err) {
+    state.diskSpace = {
+      status: "unknown",
+      freeBytes: null,
+      totalBytes: null,
+      freePercent: null,
+      checkedAt: new Date().toISOString(),
+      error: err.message || String(err),
+    };
+    pushState();
+    return state.diskSpace;
+  }
+}
+
+async function emergencyDiskCleanup() {
+  const logRemoved = cleanupOldLogFiles();
+  cleanupOldPrintData();
+  const trimmed = emergencyTrimJobsForDisk(60);
+  if (logRemoved > 0 || trimmed > 0) {
+    log(
+      `Emergency disk cleanup: removed ${logRemoved} log file(s), trimmed ${trimmed} job record(s).`,
+      "🧹"
+    );
+  }
+}
+
+/** Remove oldest completed/dlq/failed/retry rows from manifest and unlink files (does not touch in-queue/printing). */
+function emergencyTrimJobsForDisk(maxRemove) {
+  const store = getJobsStore();
+  const rows = store.readManifest();
+  const removable = (st) =>
+    ["completed", "dlq", "failed-setup", "retry-scheduled"].includes(st || "");
+
+  const safeUnlink = (filePath) => {
+    if (!filePath || typeof filePath !== "string") return false;
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  };
+
+  const candidates = rows
+    .filter((r) => removable(r.status))
+    .map((r) => ({
+      r,
+      t: Date.parse(r.updatedAt || "") || Date.parse(r.createdAt || "") || 0,
+    }))
+    .sort((a, b) => a.t - b.t);
+
+  let removed = 0;
+  const removeIds = new Set();
+  for (const { r } of candidates) {
+    if (removed >= maxRemove) break;
+    removeIds.add(r.id);
+    clearRetryTimer(r.id);
+    safeUnlink(r.localPath);
+    const dlqCandidates = [];
+    if (r.dlqPath) dlqCandidates.push(r.dlqPath);
+    if (r.id && r.file) dlqCandidates.push(path.join(store.dlq, `${r.id}_${r.file}`));
+    for (const p of dlqCandidates) {
+      if (safeUnlink(p)) break;
+    }
+    removed += 1;
+  }
+  if (removeIds.size === 0) return 0;
+  const kept = rows.filter((row) => !removeIds.has(row.id));
+  try {
+    fs.writeFileSync(store.manifestPath, JSON.stringify(kept, null, 2), "utf8");
+  } catch (_) {}
+  syncJobsToState();
+  pushState();
+  return removeIds.size;
+}
+
+async function ensureSpaceForIncomingPdf() {
+  await refreshDiskSpaceStatus({ silent: true, skipEmergencyCleanup: true });
+  if (state.diskSpace.status === "critical") {
+    await emergencyDiskCleanup();
+    await refreshDiskSpaceStatus({ silent: true, skipEmergencyCleanup: true });
   }
 }
 
@@ -507,6 +750,15 @@ function loadConfig() {
     const darkMode = cfg.dark_mode === undefined ? false : !!cfg.dark_mode;
     const printScale = normalizePrintScale(cfg.print_scale);
     const printPaperSize = cfg.print_paper_size != null ? String(cfg.print_paper_size).trim() : "";
+    const legacy = cfg.retention_days;
+    const logRetentionDays =
+      cfg.log_retention_days !== undefined
+        ? clampRetentionDays(cfg.log_retention_days, 7)
+        : legacy !== undefined
+          ? clampRetentionDays(legacy, 7)
+          : 7;
+    const jobRetentionDays =
+      cfg.job_retention_days !== undefined ? clampRetentionDays(cfg.job_retention_days, 1) : 1;
     return {
       branchId,
       channel: `branch.${branchId}`,
@@ -517,6 +769,8 @@ function loadConfig() {
       darkMode,
       printScale,
       printPaperSize,
+      logRetentionDays,
+      jobRetentionDays,
     };
   } catch (_) {
     return {
@@ -529,6 +783,8 @@ function loadConfig() {
       darkMode: false,
       printScale: "fit",
       printPaperSize: "",
+      logRetentionDays: 7,
+      jobRetentionDays: 1,
     };
   }
 }
@@ -615,6 +871,8 @@ const {
   darkMode: initialDarkMode,
   printScale: initialPrintScale,
   printPaperSize: initialPrintPaperSize,
+  logRetentionDays: initialLogRetentionDays,
+  jobRetentionDays: initialJobRetentionDays,
 } = loadConfig();
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -634,7 +892,32 @@ let state = {
   darkMode: initialDarkMode,
   printScale: initialPrintScale,
   printPaperSize: initialPrintPaperSize,
+  logRetentionDays: initialLogRetentionDays,
+  jobRetentionDays: initialJobRetentionDays,
+  diskSpace: {
+    status: "ok",
+    freeBytes: null,
+    totalBytes: null,
+    freePercent: null,
+    checkedAt: null,
+  },
 };
+
+function getEffectiveLogRetentionDays() {
+  return clampRetentionDays(state.logRetentionDays, 7);
+}
+
+function getEffectiveJobRetentionDays() {
+  return clampRetentionDays(state.jobRetentionDays, 1);
+}
+
+function getLogRetentionMs() {
+  return getEffectiveLogRetentionDays() * 24 * 60 * 60 * 1000;
+}
+
+function getJobRetentionMs() {
+  return getEffectiveJobRetentionDays() * 24 * 60 * 60 * 1000;
+}
 
 function buildPdfToPrinterOptions(printerName, extra = {}) {
   const opts = {
@@ -663,15 +946,7 @@ let printDataCleanupInterval = null;
 const LOG_DIR = path.join(app.getPath("userData"), "logs");
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
-// Clean logs older than 7 days
-try {
-  fs.readdirSync(LOG_DIR).forEach((file) => {
-    const d = new Date(file.replace(".log", ""));
-    if ((Date.now() - d.getTime()) / 86400000 > 7) {
-      fs.unlinkSync(path.join(LOG_DIR, file));
-    }
-  });
-} catch (_) {}
+cleanupOldLogFiles();
 
 function log(msg, icon = "ℹ️") {
   const time = new Date().toLocaleTimeString("en-GB");
@@ -684,7 +959,19 @@ function log(msg, icon = "ℹ️") {
   try {
     const logFile = path.join(LOG_DIR, `${new Date().toISOString().split("T")[0]}.log`);
     fs.appendFileSync(logFile, line + "\n", "utf8");
-  } catch (_) {}
+  } catch (err) {
+    if (isNoSpaceError(err)) {
+      try {
+        cleanupOldLogFiles();
+        emergencyTrimJobsForDisk(40);
+        fs.appendFileSync(
+          path.join(LOG_DIR, `${new Date().toISOString().split("T")[0]}.log`),
+          line + "\n",
+          "utf8"
+        );
+      } catch (_) {}
+    }
+  }
 
   pushState();
 }
@@ -903,6 +1190,41 @@ ipcMain.handle("set-print-layout", async (_e, opts) => {
   );
   pushState();
   return { ok: true, printScale: scale, printPaperSize: paper };
+});
+
+ipcMain.handle("set-retention-settings", async (_e, opts) => {
+  const logParsed = Number(opts?.logDays);
+  const jobParsed = Number(opts?.jobDays);
+  if (!Number.isFinite(logParsed) || logParsed < 1 || logParsed > 365) {
+    return { ok: false, error: "Log retention must be a whole number between 1 and 365." };
+  }
+  if (!Number.isFinite(jobParsed) || jobParsed < 1 || jobParsed > 365) {
+    return { ok: false, error: "Job retention must be a whole number between 1 and 365." };
+  }
+  state.logRetentionDays = clampRetentionDays(logParsed, 7);
+  state.jobRetentionDays = clampRetentionDays(jobParsed, 1);
+  const cur = readUserConfig();
+  const next = {
+    ...cur,
+    log_retention_days: state.logRetentionDays,
+    job_retention_days: state.jobRetentionDays,
+  };
+  delete next.retention_days;
+  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf8");
+  log(
+    `Retention saved: logs older than ${state.logRetentionDays} day(s), job files older than ${state.jobRetentionDays} day(s).`,
+    "⚙️"
+  );
+  cleanupOldPrintData();
+  cleanupOldLogFiles();
+  syncJobsToState();
+  pushState();
+  return {
+    ok: true,
+    logRetentionDays: state.logRetentionDays,
+    jobRetentionDays: state.jobRetentionDays,
+  };
 });
 
 ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
@@ -1255,6 +1577,47 @@ async function restartSystem() {
   await pollPrinters();
 }
 
+/** Debounce resume vs unlock so we do not double-refresh when both fire close together (e.g. wake + unlock). */
+const POWER_SESSION_REFRESH_DEBOUNCE_MS = 8000;
+let lastPowerSessionRefreshAt = 0;
+let powerSessionGuardsInstalled = false;
+
+function setupPowerSessionGuards() {
+  if (powerSessionGuardsInstalled) return;
+  powerSessionGuardsInstalled = true;
+
+  const refreshAfterIdleReturn = (reason) => {
+    if (app.isQuiting) return;
+    const now = Date.now();
+    if (now - lastPowerSessionRefreshAt < POWER_SESSION_REFRESH_DEBOUNCE_MS) return;
+    lastPowerSessionRefreshAt = now;
+    log(`Session/power event (${reason}) — refreshing RabbitMQ and printers.`, "🔌");
+    restartSystem().catch((err) => {
+      log("Refresh after session event failed: " + (err.message || String(err)), "⚠️");
+    });
+  };
+
+  powerMonitor.on("resume", () => {
+    refreshAfterIdleReturn("resume from sleep/hibernate");
+  });
+
+  powerMonitor.on("unlock-screen", () => {
+    refreshAfterIdleReturn("screen unlocked");
+  });
+
+  powerMonitor.on("suspend", () => {
+    if (!app.isQuiting) {
+      log("System suspending — broker connection may drop until resume.", "💤");
+    }
+  });
+
+  powerMonitor.on("lock-screen", () => {
+    if (!app.isQuiting) {
+      log("Screen locked — agent keeps running; will refresh after unlock if needed.", "🔒");
+    }
+  });
+}
+
 // ─── Tray ─────────────────────────────────────────────────────────────────────
 function createTray() {
   // Fallback: create a simple 16x16 colored icon programmatically
@@ -1366,6 +1729,17 @@ if (!gotSingleInstanceLock) {
     state.darkMode = nextDark;
     state.printScale = nextScale;
     state.printPaperSize = nextPaper;
+    const legacyRt = cfg.retention_days;
+    state.logRetentionDays =
+      cfg.log_retention_days !== undefined
+        ? clampRetentionDays(cfg.log_retention_days, 7)
+        : legacyRt !== undefined
+          ? clampRetentionDays(legacyRt, 7)
+          : state.logRetentionDays;
+    state.jobRetentionDays =
+      cfg.job_retention_days !== undefined
+        ? clampRetentionDays(cfg.job_retention_days, 1)
+        : state.jobRetentionDays;
     applyStartupIntegration();
     const nextBranch = String(cfg.branch_id ?? "").trim();
     if (nextBranch && nextBranch !== state.branchId) {
@@ -1379,9 +1753,14 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    if (process.platform === "win32") {
+      app.setAppUserModelId("com.tawla.print-agent");
+    }
+
     syncJobsToState();
     applyStartupIntegration();
     setupCrashRestartGuards();
+    setupPowerSessionGuards();
 
     // Serve app files via app:// protocol — avoids file:// restrictions in Electron 29
     // index.html lives next to package.json (project root / resources/app when packaged)
@@ -1430,6 +1809,13 @@ if (!gotSingleInstanceLock) {
     if (printDataCleanupInterval) clearInterval(printDataCleanupInterval);
     printDataCleanupInterval = setInterval(cleanupOldPrintData, 60 * 60 * 1000);
 
+    await refreshDiskSpaceStatus({});
+    if (diskSpaceCheckTimer) clearInterval(diskSpaceCheckTimer);
+    diskSpaceCheckTimer = setInterval(() => {
+      cleanupOldLogFiles();
+      refreshDiskSpaceStatus({}).catch(() => {});
+    }, 5 * 60 * 1000);
+
     // Refresh printer list every 30s
     setInterval(pollPrinters, 30000);
 
@@ -1446,6 +1832,7 @@ if (!gotSingleInstanceLock) {
     pendingRetries.clear();
     if (scheduledRestartInterval) clearInterval(scheduledRestartInterval);
     if (printDataCleanupInterval) clearInterval(printDataCleanupInterval);
+    if (diskSpaceCheckTimer) clearInterval(diskSpaceCheckTimer);
     await stopRabbit();
   });
 }

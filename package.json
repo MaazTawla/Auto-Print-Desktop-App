@@ -37,6 +37,7 @@
   "dependencies": {
     "amqplib": "^1.0.5",
     "axios": "^1.6.0",
+    "check-disk-space": "^3.4.0",
     "pdf-to-printer": "^5.0.1"
   },
   "devDependencies": {

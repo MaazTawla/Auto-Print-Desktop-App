@@ -747,6 +747,52 @@
     .detail-card, .topo-node { animation: fadeUp 0.35s ease both; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .spinning { display: inline-block; animation: spin 0.8s linear infinite; }
+
+    /* ── Disk warning banner ─────────────────────────── */
+    .disk-warning-banner {
+      padding: 10px 18px;
+      font-size: 12px;
+      line-height: 1.45;
+      border-bottom: 1px solid var(--border);
+      font-family: var(--display);
+      display: none;
+    }
+    .disk-warning-banner.show { display: block; }
+    .disk-warning-banner.low {
+      background: var(--yellow-dim);
+      color: var(--yellow);
+      border-color: var(--yellow);
+    }
+    .disk-warning-banner.critical {
+      background: var(--red-dim);
+      color: var(--red);
+      border-color: var(--red);
+    }
+    .queue-toolbar-right {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .queue-filter-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .queue-filter-row select {
+      padding: 6px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border-hi);
+      background: var(--surface-hi);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      cursor: pointer;
+      max-width: 200px;
+    }
   </style>
 </head>
 <body>
@@ -775,6 +821,7 @@
 </div>
 
 <div id="app">
+  <div id="disk-warning-banner" class="disk-warning-banner" role="status" hidden></div>
   <div id="tabs-bar">
     <div class="tab active" data-tab="home" onclick="switchTab('home')">Home</div>
     <div class="tab" data-tab="queue" onclick="switchTab('queue')">Queue</div>
@@ -856,7 +903,21 @@
           Failures retry up to 3 times (5s → 30s → 1min), then move to <span class="mono">print-jobs/dlq</span>.
           Use <strong>Retry</strong> after failures or <strong>Resend</strong> to print again.
         </div>
-        <button type="button" class="btn-small" onclick="window.api.openPrintJobsDir()">Open folder</button>
+        <div class="queue-toolbar-right">
+          <div class="queue-filter-row">
+            <label for="jobs-status-filter">Show</label>
+            <select id="jobs-status-filter" title="Filter jobs by status">
+              <option value="all">All statuses</option>
+              <option value="in-queue">Queued</option>
+              <option value="printing">Printing</option>
+              <option value="retry-scheduled">Retry scheduled</option>
+              <option value="completed">Completed</option>
+              <option value="dlq">Dead letter</option>
+              <option value="failed-setup">Failed (setup)</option>
+            </select>
+          </div>
+          <button type="button" class="btn-small" onclick="window.api.openPrintJobsDir()">Open folder</button>
+        </div>
       </div>
       <div class="jobs-wrap">
         <table class="jobs-table">
@@ -1005,6 +1066,18 @@
           <div class="settings-body">
             <div class="settings-body-inner">
             <p class="field-hint" id="settings-logs-hint">Logs: —</p>
+            <div class="field" style="margin-top:14px;">
+              <label for="settings-log-retention-days">Delete logs older than (days)</label>
+              <input type="number" id="settings-log-retention-days" min="1" max="365" step="1" placeholder="7" autocomplete="off" style="max-width:120px;" />
+              <div class="field-hint">Applies to rolling files under <span class="mono">logs/YYYY-MM-DD.log</span>.</div>
+            </div>
+            <div class="field">
+              <label for="settings-job-retention-days">Delete queue / job files older than (days)</label>
+              <input type="number" id="settings-job-retention-days" min="1" max="365" step="1" placeholder="1" autocomplete="off" style="max-width:120px;" />
+              <div class="field-hint">Applies to <span class="mono">print-jobs/</span> (incoming, dlq, <span class="mono">jobs.json</span> rows).</div>
+              <div class="err-text" id="settings-retention-err"></div>
+              <button type="button" class="btn-primary" id="settings-retention-save" style="margin-top:10px;">Save retention</button>
+            </div>
             <div class="inline-actions">
               <button type="button" class="btn-small" id="settings-view-logs">View logs</button>
               <button type="button" class="btn-small" onclick="window.api.openLogsDir()">Open log folder</button>
@@ -1084,6 +1157,109 @@
   let rabbitPwClearPending = false;
   let latestState = null;
   let pdfModalJobId = null;
+  let jobsQueueFilter = 'all';
+  try {
+    const savedFilter = sessionStorage.getItem('jobsQueueFilter');
+    if (savedFilter) jobsQueueFilter = savedFilter;
+  } catch (_) {}
+
+  function formatBytesUi(n) {
+    if (n == null || !Number.isFinite(Number(n))) return '—';
+    const x = Number(n);
+    if (x < 1024) return Math.round(x) + ' B';
+    if (x < 1048576) return (x / 1024).toFixed(1) + ' KB';
+    if (x < 1073741824) return (x / 1048576).toFixed(1) + ' MB';
+    return (x / 1073741824).toFixed(2) + ' GB';
+  }
+
+  function updateDiskBanner(s) {
+    const el = document.getElementById('disk-warning-banner');
+    if (!el) return;
+    const d = s.diskSpace || {};
+    el.classList.remove('show', 'low', 'critical');
+    el.hidden = true;
+    el.textContent = '';
+    if (d.status === 'low') {
+      el.hidden = false;
+      el.classList.add('show', 'low');
+      el.textContent =
+        'Low disk space: ' +
+        formatBytesUi(d.freeBytes) +
+        ' free' +
+        (d.freePercent != null ? ' (~' + d.freePercent + '% free).' : '. ') +
+        'Log files older than your retention setting are removed automatically. When nearly full, old completed jobs may be trimmed.';
+    } else if (d.status === 'critical') {
+      el.hidden = false;
+      el.classList.add('show', 'critical');
+      el.textContent =
+        'Critical: disk almost full (' +
+        formatBytesUi(d.freeBytes) +
+        ' free). Old logs and job records may be removed automatically. Free space to avoid losing new orders.';
+    } else if (d.status === 'unknown' && d.error) {
+      el.hidden = false;
+      el.classList.add('show', 'low');
+      el.textContent = 'Could not check disk space: ' + String(d.error);
+    }
+  }
+
+  function renderJobsTable(s) {
+    const jobsBody = document.getElementById('jobs-tbody');
+    if (!jobsBody) return;
+    const list = s.printJobsList || [];
+    const filtered =
+      jobsQueueFilter === 'all'
+        ? list
+        : list.filter((j) => (j.status || '') === jobsQueueFilter);
+    if (filtered.length === 0) {
+      jobsBody.innerHTML =
+        '<tr><td colspan="9" class="jobs-empty">' +
+        (list.length === 0 ? 'No print jobs yet.' : 'No jobs match this filter.') +
+        '</td></tr>';
+      return;
+    }
+    jobsBody.innerHTML = filtered.map((j) => {
+      const st = j.status || '';
+      const stSafe = String(st).replace(/[^\w-]/g, '') || 'unknown';
+      const stLabel = jobStatusLabel(st);
+      const att =
+        j.attemptNumber != null && j.attemptNumber > 0 ? `${j.attemptNumber} / 4` : '—';
+      let nr = '—';
+      if (j.nextRetryAt) {
+        nr = new Date(j.nextRetryAt).toLocaleString('en-GB', {
+          day: 'numeric',
+          month: 'short',
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+      }
+      const err = j.lastError ? escHtml(String(j.lastError)) : '—';
+      const upd = j.updatedAt
+        ? new Date(j.updatedAt).toLocaleString('en-GB', {
+            day: 'numeric',
+            month: 'short',
+            hour: '2-digit',
+            minute: '2-digit',
+          })
+        : '—';
+      const actions = jobActionsHtml(j);
+      const fid = j.id ? String(j.id) : '';
+      const fileCell = fid
+        ? `<td class="mono"><button type="button" class="job-file-link" data-job-preview="${fid.replace(/"/g, '&quot;')}">${escHtml(j.file || '—')}</button></td>`
+        : `<td class="mono">${escHtml(j.file || '—')}</td>`;
+      return `
+          <tr>
+            ${fileCell}
+            <td class="mono">${escHtml(j.orderId || '—')}</td>
+            <td class="st ${stSafe}">${escHtml(stLabel)}</td>
+            <td>${escHtml(att)}</td>
+            <td class="mono">${escHtml(j.channel || '—')}</td>
+            <td class="mono">${nr === '—' ? '—' : escHtml(nr)}</td>
+            <td>${err}</td>
+            <td class="mono">${escHtml(upd)}</td>
+            <td>${actions}</td>
+          </tr>`;
+    }).join('');
+  }
 
   function switchTab(name) {
     currentTab = name;
@@ -1469,6 +1645,21 @@
         dl.appendChild(opt);
       }
     }
+
+    const logRetInp = document.getElementById('settings-log-retention-days');
+    if (logRetInp && document.activeElement !== logRetInp) {
+      const ld = s.logRetentionDays != null ? Number(s.logRetentionDays) : 7;
+      logRetInp.value = Number.isFinite(ld)
+        ? String(Math.min(365, Math.max(1, Math.floor(ld))))
+        : '7';
+    }
+    const jobRetInp = document.getElementById('settings-job-retention-days');
+    if (jobRetInp && document.activeElement !== jobRetInp) {
+      const jd = s.jobRetentionDays != null ? Number(s.jobRetentionDays) : 1;
+      jobRetInp.value = Number.isFinite(jd)
+        ? String(Math.min(365, Math.max(1, Math.floor(jd))))
+        : '1';
+    }
   }
 
   function applyState(s) {
@@ -1478,6 +1669,12 @@
     syncThemeControls(dark);
     applyTopology(s);
     applySettingsForm(s);
+    updateDiskBanner(s);
+    const filterSel = document.getElementById('jobs-status-filter');
+    if (filterSel && document.activeElement !== filterSel) {
+      filterSel.value = jobsQueueFilter;
+    }
+    renderJobsTable(s);
     const logsModal = document.getElementById('logs-modal');
     if (logsModal && logsModal.classList.contains('open')) {
       renderLogsModal(s);
@@ -1490,56 +1687,6 @@
       else closeJobPdfModal();
     }
 
-    const jobsBody = document.getElementById('jobs-tbody');
-    if (jobsBody) {
-      const list = s.printJobsList || [];
-      if (list.length === 0) {
-        jobsBody.innerHTML = '<tr><td colspan="9" class="jobs-empty">No print jobs yet.</td></tr>';
-      } else {
-        jobsBody.innerHTML = list.map((j) => {
-          const st = j.status || '';
-          const stSafe = String(st).replace(/[^\w-]/g, '') || 'unknown';
-          const stLabel = jobStatusLabel(st);
-          const att =
-            j.attemptNumber != null && j.attemptNumber > 0 ? `${j.attemptNumber} / 4` : '—';
-          let nr = '—';
-          if (j.nextRetryAt) {
-            nr = new Date(j.nextRetryAt).toLocaleString('en-GB', {
-              day: 'numeric',
-              month: 'short',
-              hour: '2-digit',
-              minute: '2-digit',
-            });
-          }
-          const err = j.lastError ? escHtml(String(j.lastError)) : '—';
-          const upd = j.updatedAt
-            ? new Date(j.updatedAt).toLocaleString('en-GB', {
-                day: 'numeric',
-                month: 'short',
-                hour: '2-digit',
-                minute: '2-digit',
-              })
-            : '—';
-          const actions = jobActionsHtml(j);
-          const fid = j.id ? String(j.id) : '';
-          const fileCell = fid
-            ? `<td class="mono"><button type="button" class="job-file-link" data-job-preview="${fid.replace(/"/g, '&quot;')}">${escHtml(j.file || '—')}</button></td>`
-            : `<td class="mono">${escHtml(j.file || '—')}</td>`;
-          return `
-          <tr>
-            ${fileCell}
-            <td class="mono">${escHtml(j.orderId || '—')}</td>
-            <td class="st ${stSafe}">${escHtml(stLabel)}</td>
-            <td>${escHtml(att)}</td>
-            <td class="mono">${escHtml(j.channel || '—')}</td>
-            <td class="mono">${nr === '—' ? '—' : escHtml(nr)}</td>
-            <td>${err}</td>
-            <td class="mono">${escHtml(upd)}</td>
-            <td>${actions}</td>
-          </tr>`;
-        }).join('');
-      }
-    }
   }
 
   function escHtml(str) {
@@ -1655,6 +1802,17 @@
     }
   });
 
+  document.getElementById('settings-retention-save').addEventListener('click', async () => {
+    const errEl = document.getElementById('settings-retention-err');
+    errEl.textContent = '';
+    const logDays = Number(document.getElementById('settings-log-retention-days').value);
+    const jobDays = Number(document.getElementById('settings-job-retention-days').value);
+    const res = await window.api.setRetentionSettings({ logDays, jobDays });
+    if (!res || !res.ok) {
+      errEl.textContent = (res && res.error) || 'Could not save retention.';
+    }
+  });
+
   document.getElementById('theme-quick-dark').addEventListener('change', async (e) => {
     if (!e.target.checked) return;
     await persistTheme(true);
@@ -1666,6 +1824,14 @@
 
   document.getElementById('settings-restart-agent').addEventListener('click', handleRestart);
   document.getElementById('settings-view-logs').addEventListener('click', openLogsModal);
+
+  document.getElementById('jobs-status-filter').addEventListener('change', (e) => {
+    jobsQueueFilter = e.target.value || 'all';
+    try {
+      sessionStorage.setItem('jobsQueueFilter', jobsQueueFilter);
+    } catch (_) {}
+    if (latestState) renderJobsTable(latestState);
+  });
 
   document.getElementById('jobs-tbody').addEventListener('click', async (e) => {
     const previewBtn = e.target.closest('[data-job-preview]');
