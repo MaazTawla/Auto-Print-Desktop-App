@@ -1027,6 +1027,17 @@
       background: #f5f3ff;
       color: #6d28d9;
     }
+    .btn-spinner {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid currentColor;
+      border-top-color: transparent;
+      display: inline-block;
+      margin-right: 8px;
+      vertical-align: -2px;
+      animation: spin .7s linear infinite;
+    }
     @keyframes toastIn {
       to { opacity: 1; transform: translateY(0); }
     }
@@ -1375,10 +1386,6 @@
       background: var(--shell-accent);
       border: 2px solid rgba(16, 185, 129, 0.3);
       box-sizing: border-box;
-      background-image: url("app://./assets/icons/check.svg");
-      background-repeat: no-repeat;
-      background-position: center;
-      background-size: 16px 16px;
     }
     .topo-link::before {
       content: "";
@@ -2050,7 +2057,9 @@
               </div>
             </div>
             <div class="err-text" id="settings-rabbit-err"></div>
-            <button type="button" class="btn-primary" id="settings-rabbit-save">Save RabbitMQ &amp; reconnect</button>
+            <button type="button" class="btn-primary" id="settings-rabbit-save">
+              <span class="btn-label">Save RabbitMQ &amp; reconnect</span>
+            </button>
             </div>
           </div>
         </details>
@@ -2245,6 +2254,7 @@
   let latestState = null;
   let pdfModalJobId = null;
   let jobsQueueFilter = 'all';
+  let rabbitSaveInFlight = false;
   const toastTimeouts = new Set();
   try {
     const savedFilter = sessionStorage.getItem('jobsQueueFilter');
@@ -2268,6 +2278,25 @@
       toastTimeouts.delete(t1);
     }, Math.max(900, Number(ttlMs) || 2600));
     toastTimeouts.add(t1);
+  }
+
+  function setRabbitSaveLoading(isLoading) {
+    const btn = document.getElementById('settings-rabbit-save');
+    if (!btn) return;
+    btn.disabled = !!isLoading;
+    const label = btn.querySelector('.btn-label');
+    if (isLoading) {
+      btn.setAttribute('aria-busy', 'true');
+      if (label) {
+        label.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span>Saving and reconnecting…';
+      } else {
+        btn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span>Saving and reconnecting…';
+      }
+    } else {
+      btn.removeAttribute('aria-busy');
+      if (label) label.textContent = 'Save RabbitMQ & reconnect';
+      else btn.textContent = 'Save RabbitMQ & reconnect';
+    }
   }
 
   function formatBytesUi(n) {
@@ -2931,6 +2960,9 @@
   });
 
   document.getElementById('settings-rabbit-save').addEventListener('click', async () => {
+    if (rabbitSaveInFlight) return;
+    rabbitSaveInFlight = true;
+    setRabbitSaveLoading(true);
     const errEl = document.getElementById('settings-rabbit-err');
     errEl.textContent = '';
     const host = document.getElementById('settings-rabbit-host').value.trim();
@@ -2945,25 +2977,34 @@
       passwordNew = document.getElementById('settings-rabbit-pw-new').value;
       passwordMode = 'set';
     }
-    const res = await window.api.setRabbitSettings({
-      host,
-      port: Number(port),
-      username,
-      exchange,
-      passwordMode,
-      passwordNew
-    });
-    rabbitPwClearPending = false;
-    if (!res.ok) {
-      const msg = res.error || 'Could not save RabbitMQ settings.';
+    try {
+      const res = await window.api.setRabbitSettings({
+        host,
+        port: Number(port),
+        username,
+        exchange,
+        passwordMode,
+        passwordNew
+      });
+      rabbitPwClearPending = false;
+      if (!res.ok) {
+        const msg = res.error || 'Could not save RabbitMQ settings.';
+        errEl.textContent = msg;
+        showToast(msg, 'error', 3400);
+        return;
+      }
+      document.getElementById('settings-rabbit-pw-change').checked = false;
+      document.getElementById('settings-rabbit-pw-new').value = '';
+      document.getElementById('settings-rabbit-pw-new').disabled = true;
+      showToast('RabbitMQ settings saved and reconnect requested.');
+    } catch (e) {
+      const msg = (e && e.message) ? e.message : 'Could not save RabbitMQ settings.';
       errEl.textContent = msg;
       showToast(msg, 'error', 3400);
-      return;
+    } finally {
+      rabbitSaveInFlight = false;
+      setRabbitSaveLoading(false);
     }
-    document.getElementById('settings-rabbit-pw-change').checked = false;
-    document.getElementById('settings-rabbit-pw-new').value = '';
-    document.getElementById('settings-rabbit-pw-new').disabled = true;
-    showToast('RabbitMQ settings saved and reconnect requested.');
   });
 
   document.getElementById('settings-rabbit-pw-change').addEventListener('change', (e) => {
