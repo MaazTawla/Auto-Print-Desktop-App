@@ -880,7 +880,7 @@ let state = {
   rabbitmq: "connecting",   // connecting | connected | error
   lastOrder: null,          // { timestamp, channel }
   lastPrintJob: null,       // { file, channel, at }
-  printers: [],             // [{ name, status }]
+  printers: [],             // [{ name, status, paperSizes?, deviceId? }]
   logs: [],                 // [{ time, icon, msg }]
   printJobs: 0,
   printJobsList: [],        // persisted job rows (mirrors jobs.json)
@@ -926,8 +926,12 @@ function buildPdfToPrinterOptions(printerName, extra = {}) {
     scale: state.printScale || "fit",
     ...extra,
   };
-  const ps = (state.printPaperSize || "").trim();
+  const ps =
+    Object.prototype.hasOwnProperty.call(extra, "paperSize") && extra.paperSize != null
+      ? String(extra.paperSize).trim()
+      : (state.printPaperSize || "").trim();
   if (ps) opts.paperSize = ps;
+  else delete opts.paperSize;
   return opts;
 }
 
@@ -1287,6 +1291,68 @@ ipcMain.handle("resend-print-job", async (_e, rawId) => {
   return manualQueuePrint(id, "resend");
 });
 
+function getBundledPreviewPdfPath() {
+  const webRoot = app.isPackaged
+    ? path.join(process.resourcesPath, "app")
+    : path.join(__dirname, "..");
+  return path.join(webRoot, "preview.pdf");
+}
+
+ipcMain.handle("get-windows-print-meta", async () => {
+  if (process.platform !== "win32") {
+    return { ok: true, platformDefault: null, note: "non-windows" };
+  }
+  try {
+    const { getDefaultPrinter } = require("pdf-to-printer");
+    const p = await getDefaultPrinter();
+    return { ok: true, platformDefault: p };
+  } catch (err) {
+    return { ok: false, platformDefault: null, error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle("print-preview-sample", async (_e, formOpts) => {
+  if (process.platform !== "win32") {
+    return { ok: false, error: "Printing the sample requires Windows (pdf-to-printer)." };
+  }
+  const printerName = state.defaultPrinter;
+  if (!printerName) {
+    return { ok: false, error: "Choose a default printer in Settings (or Home) first." };
+  }
+  const previewPath = getBundledPreviewPdfPath();
+  if (!fs.existsSync(previewPath)) {
+    return { ok: false, error: "preview.pdf is missing from the app folder." };
+  }
+  try {
+    const { print } = require("pdf-to-printer");
+    const printStartedAt = Date.now();
+    log(`Sample order preview PDF printing on "${printerName}"…`, "🖨️");
+    await print(previewPath, printOpts);
+    let outcome = "untracked";
+    outcome = await watchWindowsPrintJob({
+      printerName,
+      tmpPath: previewPath,
+      printStartedAt,
+      log,
+    });
+    if (outcome === "finished" || outcome === "untracked") {
+      state.printJobs++;
+      state.lastPrintJob = {
+        file: "Sample order (preview.pdf)",
+        channel: null,
+        at: new Date().toISOString(),
+      };
+      pushState();
+    }
+    if (outcome === "error") {
+      return { ok: false, error: "Windows print queue reported an error for the sample job." };
+    }
+    return { ok: true, outcome };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+
 ipcMain.handle("test-print", async () => {
   if (process.platform !== "win32") {
     return { ok: false, error: "Test print is only supported on Windows (pdf-to-printer)." };
@@ -1358,10 +1424,15 @@ function normalizePrinterRows(rows) {
     const key = name.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
+    const deviceId =
+      p.deviceId != null && String(p.deviceId).trim() !== ""
+        ? String(p.deviceId).trim()
+        : "";
     out.push({
       name,
       status: p.status || "Ready",
       paperSizes: Array.isArray(p.paperSizes) ? p.paperSizes : [],
+      deviceId,
     });
   }
   return out;
@@ -1382,14 +1453,27 @@ async function pollPrinters() {
     electronErr = err;
   }
 
-  // Fallback/merge from pdf-to-printer (also includes paperSizes details).
+  // Fallback/merge from pdf-to-printer (paperSizes + Win32 DeviceID / port string).
   try {
     const { getPrinters } = require("pdf-to-printer");
     const list = await getPrinters();
     const fallback = normalizePrinterRows(list);
+    const pdfByName = new Map(fallback.map((p) => [p.name.toLowerCase(), p]));
     if (!next.length) {
       next = fallback;
     } else {
+      for (const p of next) {
+        const pdf = pdfByName.get(p.name.toLowerCase());
+        if (!pdf) continue;
+        if (pdf.deviceId) p.deviceId = pdf.deviceId;
+        if (
+          pdf.paperSizes &&
+          pdf.paperSizes.length &&
+          (!p.paperSizes || !p.paperSizes.length)
+        ) {
+          p.paperSizes = pdf.paperSizes;
+        }
+      }
       const existing = new Set(next.map((p) => p.name.toLowerCase()));
       for (const p of fallback) {
         const key = p.name.toLowerCase();

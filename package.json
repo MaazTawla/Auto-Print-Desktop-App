@@ -1,6 +1,6 @@
 {
   "name": "tawla-print-agent",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Tawla Local Print Agent",
   "main": "src/main.js",
   "scripts": {
@@ -26,6 +26,7 @@
     },
     "files": [
       "index.html",
+      "preview.pdf",
       "src/**/*",
       "assets/**/*",
       "package.json",
@@ -39,7 +40,8 @@
     "amqplib": "^1.0.5",
     "axios": "^1.6.0",
     "check-disk-space": "^3.4.0",
-    "pdf-to-printer": "^5.0.1"
+    "pdf-to-printer": "^5.0.1",
+    "pdfjs-dist": "^4.10.38"
   },
   "devDependencies": {
     "electron": "^29.0.0",

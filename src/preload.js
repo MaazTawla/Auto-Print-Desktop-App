@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld("api", {
   retryPrintJob: (id) => ipcRenderer.invoke("retry-print-job", id),
   resendPrintJob: (id) => ipcRenderer.invoke("resend-print-job", id),
   testPrint: () => ipcRenderer.invoke("test-print"),
+  getWindowsPrintMeta: () => ipcRenderer.invoke("get-windows-print-meta"),
+  printPreviewSample: (formOpts) => ipcRenderer.invoke("print-preview-sample", formOpts),
   onStateUpdate: (cb) => ipcRenderer.on("state-update", (_event, state) => cb(state)),
   minimize: () => ipcRenderer.send("window-minimize"),
   toggleMaximize: () => ipcRenderer.send("window-toggle-maximize"),
