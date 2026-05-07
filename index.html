@@ -1615,8 +1615,17 @@
       display: block;
       border-top: 1px solid #f1f5f9;
       padding: 0;
-      transition: none;
-      grid-template-rows: none;
+      overflow: hidden;
+      max-height: 0;
+      opacity: 0;
+      transform: translateY(-4px);
+      transition: max-height .32s ease, opacity .22s ease, transform .22s ease;
+      will-change: max-height, opacity, transform;
+    }
+    details.settings-section[open] .settings-body {
+      max-height: 1000px;
+      opacity: 1;
+      transform: translateY(0);
     }
     details.settings-section .settings-body-inner { padding: 14px 18px 16px; }
     .settings-full { grid-column: span 2; }
