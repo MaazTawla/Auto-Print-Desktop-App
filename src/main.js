@@ -814,10 +814,10 @@ const RABBITMQ_ORDERS_PRINT_EXCHANGE = process.env.RABBITMQ_ORDERS_PRINT_EXCHANG
 
 const RABBITMQ_DEFAULTS = {
   protocol: "amqp",
-  host: "13.48.78.35",
-  port: 5672,
-  username: "tawla",
-  password: "TawlaRabitMQ0101",
+  host: "0.0.0.0",
+  port: 1234,
+  username: "user",
+  password: "password",
   exchange: RABBITMQ_ORDERS_PRINT_EXCHANGE,
 };
 const RABBITMQ_HEARTBEAT_SECONDS = 15;
