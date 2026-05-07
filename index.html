@@ -1154,8 +1154,8 @@
       animation: none;
     }
     .brand-logo {
-      width: 104px;
-      height: 28px;
+      width: 116px;
+      height: 32px;
       object-fit: contain;
     }
     .brand-divider {
@@ -1505,7 +1505,7 @@
     }
     @media (max-width: 1020px) {
       #titlebar { padding: 0 16px; height: 66px; }
-      .brand-logo { width: 88px; height: 24px; }
+      .brand-logo { width: 96px; height: 26px; }
       .brand-agent-label { font-size: 16px; }
       .brand-status, .brand-pill { display: none; }
       #tabs-bar { padding: 8px 16px 0; }
@@ -1820,15 +1820,33 @@
   <div id="disk-warning-banner" class="disk-warning-banner" role="status" hidden></div>
   <div id="tabs-bar">
     <div class="tab active" data-tab="home" onclick="switchTab('home')">
-      <img src="app://./assets/icons/home.svg" alt="" aria-hidden="true" />
+      <img
+        src="app://./assets/icons/home-active.svg"
+        data-default-src="app://./assets/icons/home.svg"
+        data-active-src="app://./assets/icons/home-active.svg"
+        alt=""
+        aria-hidden="true"
+      />
       <span>Home</span>
     </div>
     <div class="tab" data-tab="queue" onclick="switchTab('queue')">
-      <img src="app://./assets/icons/queue.svg" alt="" aria-hidden="true" />
+      <img
+        src="app://./assets/icons/queue.svg"
+        data-default-src="app://./assets/icons/queue.svg"
+        data-active-src="app://./assets/icons/queue-active.svg"
+        alt=""
+        aria-hidden="true"
+      />
       <span>Queue</span>
     </div>
     <div class="tab" data-tab="settings" onclick="switchTab('settings')">
-      <img src="app://./assets/icons/settings.svg" alt="" aria-hidden="true" />
+      <img
+        src="app://./assets/icons/settings.svg"
+        data-default-src="app://./assets/icons/settings.svg"
+        data-active-src="app://./assets/icons/settings-active.svg"
+        alt=""
+        aria-hidden="true"
+      />
       <span>Settings</span>
     </div>
   </div>
@@ -2101,24 +2119,6 @@
         <details class="settings-section">
           <summary>
             <span class="settings-summary-left">
-              <span class="settings-summary-icon"><img src="app://./assets/icons/appearance.svg" alt="" aria-hidden="true" /></span>
-              <span>Appearance</span>
-            </span>
-            <img class="settings-summary-chevron" src="app://./assets/icons/chevron-down.svg" alt="" aria-hidden="true" />
-          </summary>
-          <div class="settings-body">
-            <div class="settings-body-inner">
-            <label class="field-hint" style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
-              <input type="checkbox" id="settings-darkmode-check" style="margin-top:3px;" />
-              <span>Enable dark mode</span>
-            </label>
-            </div>
-          </div>
-        </details>
-
-        <details class="settings-section">
-          <summary>
-            <span class="settings-summary-left">
               <span class="settings-summary-icon"><img src="app://./assets/icons/maintenance.svg" alt="" aria-hidden="true" /></span>
               <span>Maintenance</span>
             </span>
@@ -2152,10 +2152,10 @@
           </div>
         </details>
 
-        <details class="settings-section settings-full">
+        <details class="settings-section">
           <summary>
             <span class="settings-summary-left">
-              <span class="settings-summary-icon"><img src="app://./assets/icons/settings.svg" alt="" aria-hidden="true" /></span>
+              <span class="settings-summary-icon"><img src="app://./assets/icons/pdf-settings.svg" alt="" aria-hidden="true" /></span>
               <span>PDF scaling &amp; paper</span>
             </span>
             <img class="settings-summary-chevron" src="app://./assets/icons/chevron-down.svg" alt="" aria-hidden="true" />
@@ -2444,7 +2444,12 @@
   function switchTab(name) {
     currentTab = name;
     document.querySelectorAll('#tabs-bar .tab').forEach((t) => {
-      t.classList.toggle('active', t.dataset.tab === name);
+      const isActive = t.dataset.tab === name;
+      t.classList.toggle('active', isActive);
+      const icon = t.querySelector('img[data-default-src][data-active-src]');
+      if (icon) {
+        icon.src = isActive ? icon.dataset.activeSrc : icon.dataset.defaultSrc;
+      }
     });
     document.querySelectorAll('#panels .panel').forEach((p) => {
       p.classList.toggle('active', p.dataset.panel === name);
