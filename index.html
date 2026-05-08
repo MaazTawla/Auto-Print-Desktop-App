@@ -3603,7 +3603,13 @@
     document.getElementById('home-version').textContent = s.appVersion != null ? String(s.appVersion) : '—';
   }
 
+  function isPdfPrintModalOpen() {
+    const el = document.getElementById('pdf-print-modal');
+    return !!(el && el.classList.contains('open'));
+  }
+
   function applySettingsForm(s) {
+    const pdfModalOpen = isPdfPrintModalOpen();
     const b = document.getElementById('settings-branch');
     if (b && document.activeElement !== b) b.value = s.branchId || '';
 
@@ -3647,16 +3653,16 @@
     }
 
     const scaleSel = document.getElementById('settings-print-scale');
-    if (scaleSel && document.activeElement !== scaleSel) {
+    if (scaleSel && !pdfModalOpen && document.activeElement !== scaleSel) {
       const v = s.printScale || 'fit';
       scaleSel.value = ['fit', 'shrink', 'noscale'].includes(v) ? v : 'fit';
     }
     const paperInp = document.getElementById('settings-print-paper');
-    if (paperInp && document.activeElement !== paperInp) {
+    if (paperInp && !pdfModalOpen && document.activeElement !== paperInp) {
       paperInp.value = s.printPaperSize != null ? String(s.printPaperSize) : '';
     }
     const dl = document.getElementById('settings-print-paper-datalist');
-    if (dl) {
+    if (dl && !pdfModalOpen) {
       dl.innerHTML = '';
       const def = s.defaultPrinter;
       const p = (s.printers || []).find((x) => x.name === def);
