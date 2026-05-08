@@ -635,6 +635,7 @@ async function runPrintAttempt(jobId) {
       state.lastPrintJob = {
         file: j.file,
         channel: j.channel || null,
+        orderId: j.orderId != null && String(j.orderId).trim() !== "" ? String(j.orderId).trim() : null,
         at: new Date().toISOString(),
       };
       log(`Print completed: ${j.file}`, "🖨️");
@@ -878,8 +879,8 @@ const {
 // ─── State ────────────────────────────────────────────────────────────────────
 let state = {
   rabbitmq: "connecting",   // connecting | connected | error
-  lastOrder: null,          // { timestamp, channel }
-  lastPrintJob: null,       // { file, channel, at }
+  lastOrder: null,          // { timestamp, channel, orderId? }
+  lastPrintJob: null,       // { file, channel, at, orderId? }
   printers: [],             // [{ name, status, paperSizes?, deviceId? }]
   logs: [],                 // [{ time, icon, msg }]
   printJobs: 0,
@@ -1340,6 +1341,7 @@ ipcMain.handle("print-preview-sample", async (_e, formOpts) => {
       state.lastPrintJob = {
         file: "Sample order (preview.pdf)",
         channel: null,
+        orderId: null,
         at: new Date().toISOString(),
       };
       pushState();
@@ -1383,6 +1385,7 @@ ipcMain.handle("test-print", async () => {
       state.lastPrintJob = {
         file: "Test print (80mm)",
         channel: null,
+        orderId: null,
         at: new Date().toISOString(),
       };
       pushState();
@@ -1640,6 +1643,36 @@ async function startRabbit() {
   }
 }
 
+/** Order id from broker JSON — snake_case or camelCase. */
+function extractOrderIdFromPayload(data) {
+  if (!data || typeof data !== "object") return null;
+  const raw =
+    data.order_id ??
+    data.orderId ??
+    data.OrderID ??
+    data.order_number ??
+    data.orderNumber ??
+    data.order_no ??
+    data.orderNo;
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  return s === "" ? null : s;
+}
+
+/** Prefer file_path; accept camelCase aliases used by some publishers. */
+function extractFilePathFromPayload(data) {
+  if (!data || typeof data !== "object") return "";
+  const fp =
+    data.file_path ??
+    data.filePath ??
+    data.pdf_path ??
+    data.pdfPath ??
+    data.pdf_url ??
+    data.pdfUrl ??
+    "";
+  return typeof fp === "string" ? fp.trim() : String(fp ?? "").trim();
+}
+
 async function applyBranchId(id) {
   state.branchId = id;
   state.channel = `branch.${id}`;
@@ -1652,17 +1685,18 @@ async function applyBranchId(id) {
 
 async function handleMessage(channel, message) {
   log(`New order on ${channel}`, "📩");
-  state.lastOrder = { timestamp: new Date().toISOString(), channel };
-  pushState();
 
   try {
     const data = JSON.parse(message);
-    const { file_path: filePath, order_id: orderIdRaw } = data;
-    const orderId =
-      orderIdRaw === null || orderIdRaw === undefined || String(orderIdRaw).trim() === ""
-        ? null
-        : String(orderIdRaw).trim();
+    const orderId = extractOrderIdFromPayload(data);
+    state.lastOrder = {
+      timestamp: new Date().toISOString(),
+      channel,
+      orderId,
+    };
+    pushState();
 
+    const filePath = extractFilePathFromPayload(data);
     if (!filePath) {
       log("Missing file_path in message.", "❌");
       return "reject";

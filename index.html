@@ -1888,131 +1888,6 @@
       line-height: 14px;
     }
 
-    /* Default printer summary (Figma: icon + name + port / DeviceID) */
-    .default-printer-summary-btn {
-      width: 100%;
-      display: block;
-      margin-top: 4px;
-      padding: 17px 12px 17px 17px;
-      border-radius: 16px;
-      border: 2px solid #e5e7eb;
-      background: #fff;
-      cursor: pointer;
-      font: inherit;
-      text-align: left;
-      transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
-      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
-    }
-    .default-printer-summary-btn:hover {
-      border-color: #c4b5fd;
-    }
-    .default-printer-summary-btn:focus-visible {
-      outline: 2px solid #7c3aed;
-      outline-offset: 2px;
-    }
-    .default-printer-summary-btn.has-selection {
-      border-color: #2c184b;
-      background: rgba(243, 240, 255, 0.35);
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
-    }
-    .default-printer-summary-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-    }
-    .default-printer-summary-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-shrink: 0;
-    }
-    .default-printer-summary-radio {
-      display: inline-block;
-      width: 20px;
-      height: 20px;
-      border-radius: 50%;
-      border: 2px solid #e5e7eb;
-      flex-shrink: 0;
-      position: relative;
-    }
-    .default-printer-summary-btn.has-selection .default-printer-summary-radio {
-      border-color: #2c184b;
-    }
-    .default-printer-summary-btn.has-selection .default-printer-summary-radio::after {
-      content: "";
-      position: absolute;
-      left: 50%;
-      top: 50%;
-      width: 10px;
-      height: 10px;
-      margin: -5px 0 0 -5px;
-      border-radius: 50%;
-      background: #2c184b;
-    }
-    .default-printer-summary-icon-wrap {
-      width: 32px;
-      height: 32px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-      opacity: 0.85;
-    }
-    .default-printer-summary-icon-wrap img {
-      width: 28px;
-      height: 28px;
-    }
-    .default-printer-summary-text {
-      flex: 1 1 auto;
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .default-printer-summary-name {
-      font-family: "Inter", "Segoe UI", system-ui, sans-serif;
-      font-size: 14px;
-      font-weight: 600;
-      line-height: 20px;
-      color: #111827;
-      word-break: break-word;
-    }
-    .default-printer-summary-port {
-      font-family: "Inter", "Segoe UI", system-ui, sans-serif;
-      font-size: 12px;
-      font-weight: 400;
-      line-height: 16px;
-      color: #6b7280;
-      word-break: break-word;
-    }
-    .printer-summary-badge {
-      flex-shrink: 0;
-      align-self: flex-start;
-      margin-top: 2px;
-      border-radius: 999px;
-      padding: 2px 10px;
-      font-family: "Inter", "Segoe UI", system-ui, sans-serif;
-      font-size: 11px;
-      font-weight: 600;
-      line-height: 14.67px;
-      background: #d1fae5;
-      color: #059669;
-    }
-    .printer-summary-badge.muted {
-      background: #f1f5f9;
-      color: #64748b;
-    }
-    .printer-summary-badge.warn {
-      background: rgba(245, 158, 11, 0.14);
-      color: #f59e0b;
-    }
-    .default-printer-summary-chevron {
-      width: 18px;
-      height: 18px;
-      flex-shrink: 0;
-      opacity: 0.45;
-    }
     .settings-card-footnote .settings-footnote-info {
       display: inline-flex;
       align-items: center;
@@ -2108,16 +1983,23 @@
     }
 
     .printer-pick-list { gap: 8px; max-height: 220px; margin-top: 10px; }
-    /* Modal list only: two printers per row */
-    #modal-printer-list.printer-pick-list {
+    /* Modal + Settings default printer: two tiles per row (same layout) */
+    #modal-printer-list.printer-pick-list,
+    #settings-printer-list.printer-pick-list {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
       max-height: min(52vh, 440px);
       align-content: start;
+      overflow-y: auto;
+      margin-top: 4px;
+    }
+    #settings-printer-list.printer-pick-list.settings-printer-grid {
+      max-height: min(56vh, 520px);
     }
     @media (max-width: 480px) {
-      #modal-printer-list.printer-pick-list {
+      #modal-printer-list.printer-pick-list,
+      #settings-printer-list.printer-pick-list {
         grid-template-columns: 1fr;
       }
     }
@@ -2317,41 +2199,21 @@
     }
     :root[data-theme="dark"] .printer-card-name { color: #e6eeff; }
     :root[data-theme="dark"] .printer-card-sub { color: #9cb0d1; }
-    :root[data-theme="dark"] .default-printer-summary-btn {
-      background: #10182a;
-      border-color: #2a3750;
-      box-shadow: none;
-    }
-    :root[data-theme="dark"] .default-printer-summary-btn:hover {
-      border-color: #6f56c9;
-    }
-    :root[data-theme="dark"] .default-printer-summary-btn.has-selection {
-      border-color: #a78bfa;
-      background: rgba(124, 58, 237, 0.14);
-    }
-    :root[data-theme="dark"] .default-printer-summary-name { color: #e6eeff; }
-    :root[data-theme="dark"] .default-printer-summary-port { color: #9cb0d1; }
-    :root[data-theme="dark"] .default-printer-summary-radio {
-      border-color: #475569;
-    }
-    :root[data-theme="dark"] .default-printer-summary-btn.has-selection .default-printer-summary-radio {
-      border-color: #c4b5fd;
-    }
-    :root[data-theme="dark"] .default-printer-summary-btn.has-selection .default-printer-summary-radio::after {
-      background: #c4b5fd;
-    }
     :root[data-theme="dark"] .settings-footnote-info {
       border-color: #475569;
       color: #9cb0d1;
     }
     :root[data-theme="dark"] .print-preview-label { color: #9cb0d1; }
 
+    /* Tighter padding on medium screens — keep two-column settings layout until much narrower */
     @media (max-width: 1080px) {
       #panel-settings .panel-scroll {
         padding: 22px 16px;
         align-items: stretch;
       }
       #panel-settings .panel-title { font-size: 22px; line-height: 28px; }
+    }
+    @media (max-width: 720px) {
       .settings-layout {
         flex-direction: column;
         align-items: stretch;
@@ -2729,22 +2591,7 @@
                 </div>
               </div>
               <div class="settings-card-body">
-                <button type="button" class="default-printer-summary-btn" id="settings-default-printer-summary-btn" aria-describedby="settings-default-printer-footnote">
-                  <div class="default-printer-summary-row">
-                    <div class="default-printer-summary-left">
-                      <span class="default-printer-summary-radio" aria-hidden="true"></span>
-                      <div class="default-printer-summary-icon-wrap">
-                        <img src="app://./assets/icons/printer.svg" alt="" aria-hidden="true" />
-                      </div>
-                    </div>
-                    <div class="default-printer-summary-text">
-                      <span class="default-printer-summary-name" id="settings-default-printer-name">No printer selected</span>
-                      <span class="default-printer-summary-port" id="settings-default-printer-port">Tap to choose a printer</span>
-                    </div>
-                    <span class="printer-summary-badge muted" id="settings-default-printer-badge">—</span>
-                    <img src="app://./assets/icons/chevron-right.svg" alt="" class="default-printer-summary-chevron" aria-hidden="true" />
-                  </div>
-                </button>
+                <div class="printer-pick-list settings-printer-grid" id="settings-printer-list" role="list" aria-label="Available printers"></div>
                 <p class="settings-card-footnote" id="settings-default-printer-footnote"><span class="settings-footnote-info" aria-hidden="true">i</span> This printer will be used as the default for all order PDFs.</p>
                 <div class="settings-card-actions" style="margin-top:14px;">
                   <button type="button" class="btn-outline" id="open-pdf-print-settings-btn">PDF scaling &amp; print preview…</button>
@@ -3274,8 +3121,13 @@
       const stSafe = String(st).replace(/[^\w-]/g, '') || 'unknown';
       const att =
         j.attemptNumber != null && j.attemptNumber > 0 ? `${j.attemptNumber} / 3` : '—';
-      const rawOrder = j.orderId != null ? String(j.orderId).trim() : '';
-      const orderDisplay = rawOrder ? (rawOrder.startsWith('#') ? rawOrder : '#' + rawOrder) : '—';
+      const rawOrder =
+        j.orderId != null && String(j.orderId).trim() !== ''
+          ? String(j.orderId).trim()
+          : j.order_id != null && String(j.order_id).trim() !== ''
+            ? String(j.order_id).trim()
+            : '';
+      const orderDisplay = rawOrder ? rawOrder.replace(/^#/, '') : '—';
       const err = j.lastError ? escHtml(String(j.lastError)) : '—';
       const upd = formatQueueUpdatedTime(j.updatedAt);
       const actions = jobActionsHtml(j);
@@ -3483,11 +3335,6 @@
   document.getElementById('topo-printer-node').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPrinterModal(); }
   });
-  const settingsDefaultPrinterBtn = document.getElementById('settings-default-printer-summary-btn');
-  if (settingsDefaultPrinterBtn) {
-    settingsDefaultPrinterBtn.addEventListener('click', () => openPrinterModal());
-  }
-
   document.getElementById('printer-modal').addEventListener('click', (e) => {
     if (e.target.id === 'printer-modal') closePrinterModal();
   });
@@ -3610,38 +3457,6 @@
     });
   }
 
-  function renderDefaultPrinterSummary(s) {
-    const btn = document.getElementById('settings-default-printer-summary-btn');
-    const nameEl = document.getElementById('settings-default-printer-name');
-    const portEl = document.getElementById('settings-default-printer-port');
-    const badgeEl = document.getElementById('settings-default-printer-badge');
-    if (!btn || !nameEl || !portEl || !badgeEl) return;
-
-    const list = Array.isArray(s.printers) ? s.printers : [];
-    const def = s.defaultPrinter ? String(s.defaultPrinter) : '';
-    const row = def ? list.find((p) => p && p.name === def) : null;
-
-    btn.classList.toggle('has-selection', !!def);
-
-    if (!def) {
-      nameEl.textContent = 'No printer selected';
-      portEl.textContent = 'Tap to choose a printer';
-      badgeEl.textContent = '—';
-      badgeEl.className = 'printer-summary-badge muted';
-      return;
-    }
-
-    nameEl.textContent = def;
-    const deviceId = row && row.deviceId ? String(row.deviceId).trim() : '';
-    portEl.textContent = deviceId || '—';
-
-    const st = row ? row.status : '';
-    const isOk = !st || st === 'Ready' || st === 'Idle' || st === '0';
-    const stText = isOk ? 'Ready' : String(st || 'Unknown');
-    badgeEl.textContent = stText;
-    badgeEl.className = 'printer-summary-badge' + (isOk ? '' : ' warn');
-  }
-
   function renderPrinterPick(containerId, s, options) {
     const wrap = document.getElementById(containerId);
     if (!wrap) return;
@@ -3753,8 +3568,12 @@
 
     const orderTitle = document.getElementById('home-last-order');
     const orderTime = document.getElementById('home-last-order-time');
-    if (s.lastOrder) {
-      orderTitle.textContent = s.lastOrder.channel ? String(s.lastOrder.channel) : 'Order received';
+    if (s.lastOrder && s.lastOrder.timestamp) {
+      const oid =
+        s.lastOrder.orderId != null && String(s.lastOrder.orderId).trim() !== ''
+          ? String(s.lastOrder.orderId).trim().replace(/^#/, '')
+          : '';
+      orderTitle.textContent = oid || '—';
       orderTime.textContent = formatDateTimeShort(s.lastOrder.timestamp);
     } else {
       orderTitle.textContent = '—';
@@ -3763,8 +3582,18 @@
 
     const printTitle = document.getElementById('home-last-print');
     const printTime = document.getElementById('home-last-print-time');
-    if (s.lastPrintJob && s.lastPrintJob.file) {
-      printTitle.textContent = String(s.lastPrintJob.file);
+    if (s.lastPrintJob && s.lastPrintJob.at) {
+      const pOid =
+        s.lastPrintJob.orderId != null && String(s.lastPrintJob.orderId).trim() !== ''
+          ? String(s.lastPrintJob.orderId).trim().replace(/^#/, '')
+          : '';
+      if (pOid) {
+        printTitle.textContent = 'Order #' + pOid;
+      } else if (s.lastPrintJob.file) {
+        printTitle.textContent = String(s.lastPrintJob.file);
+      } else {
+        printTitle.textContent = '—';
+      }
       printTime.textContent = formatDateTimeShort(s.lastPrintJob.at);
     } else {
       printTitle.textContent = '—';
@@ -3807,7 +3636,7 @@
     document.getElementById('settings-userdata').textContent =
       s.userDataPath != null ? String(s.userDataPath) : '—';
 
-    renderDefaultPrinterSummary(s);
+    renderPrinterPick('settings-printer-list', s, {});
     renderPrinterPick('modal-printer-list', s, { closeModal: false });
 
     const modalBtn = document.getElementById('modal-test-print');
