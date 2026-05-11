@@ -1328,7 +1328,19 @@ ipcMain.handle("print-preview-sample", async (_e, formOpts) => {
     const { print } = require("pdf-to-printer");
     const printStartedAt = Date.now();
     log(`Sample order preview PDF printing on "${printerName}"…`, "🖨️");
-    await print(previewPath, printOpts);
+    const extra = {};
+    if (formOpts && typeof formOpts.scale === "string" && formOpts.scale.trim() !== "") {
+      extra.scale = formOpts.scale.trim();
+    }
+    if (
+      formOpts &&
+      formOpts.paperSize != null &&
+      typeof formOpts.paperSize === "string" &&
+      formOpts.paperSize.trim() !== ""
+    ) {
+      extra.paperSize = formOpts.paperSize.trim();
+    }
+    await print(previewPath, buildPdfToPrinterOptions(printerName, extra));
     let outcome = "untracked";
     outcome = await watchWindowsPrintJob({
       printerName,
