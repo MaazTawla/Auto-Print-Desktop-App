@@ -2571,7 +2571,7 @@
                 </div>
                 <div class="field">
                   <label for="settings-job-retention-days">Delete queue / job files older than (days)</label>
-                  <input type="number" id="settings-job-retention-days" min="1" max="365" step="1" placeholder="1" autocomplete="off" style="max-width:120px;" />
+                  <input type="number" id="settings-job-retention-days" min="1" max="365" step="1" placeholder="7" autocomplete="off" style="max-width:120px;" />
                   <div class="field-hint"><span class="mono">print-jobs/</span> incoming, dlq, <span class="mono">jobs.json</span>.</div>
                   <div class="err-text" id="settings-retention-err"></div>
                   <button type="button" class="btn-primary" id="settings-retention-save" style="margin-top:10px;">Save retention</button>
@@ -3712,10 +3712,10 @@
     }
     const jobRetInp = document.getElementById('settings-job-retention-days');
     if (jobRetInp && document.activeElement !== jobRetInp) {
-      const jd = s.jobRetentionDays != null ? Number(s.jobRetentionDays) : 1;
+      const jd = s.jobRetentionDays != null ? Number(s.jobRetentionDays) : 7;
       jobRetInp.value = Number.isFinite(jd)
         ? String(Math.min(365, Math.max(1, Math.floor(jd))))
-        : '1';
+        : '7';
     }
   }
 

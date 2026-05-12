@@ -759,7 +759,7 @@ function loadConfig() {
           ? clampRetentionDays(legacy, 7)
           : 7;
     const jobRetentionDays =
-      cfg.job_retention_days !== undefined ? clampRetentionDays(cfg.job_retention_days, 1) : 1;
+      cfg.job_retention_days !== undefined ? clampRetentionDays(cfg.job_retention_days, 7) : 7;
     return {
       branchId,
       channel: `branch.${branchId}`,
@@ -785,7 +785,7 @@ function loadConfig() {
       printScale: "fit",
       printPaperSize: "",
       logRetentionDays: 7,
-      jobRetentionDays: 1,
+      jobRetentionDays: 7,
     };
   }
 }
@@ -1003,7 +1003,7 @@ function getEffectiveLogRetentionDays() {
 }
 
 function getEffectiveJobRetentionDays() {
-  return clampRetentionDays(state.jobRetentionDays, 1);
+  return clampRetentionDays(state.jobRetentionDays, 7);
 }
 
 function getLogRetentionMs() {
@@ -1319,7 +1319,7 @@ ipcMain.handle("set-retention-settings", async (_e, opts) => {
     return { ok: false, error: "Job retention must be a whole number between 1 and 365." };
   }
   state.logRetentionDays = clampRetentionDays(logParsed, 7);
-  state.jobRetentionDays = clampRetentionDays(jobParsed, 1);
+  state.jobRetentionDays = clampRetentionDays(jobParsed, 7);
   const cur = readUserConfig();
   const next = {
     ...cur,
@@ -2055,7 +2055,7 @@ if (!gotSingleInstanceLock) {
           : state.logRetentionDays;
     state.jobRetentionDays =
       cfg.job_retention_days !== undefined
-        ? clampRetentionDays(cfg.job_retention_days, 1)
+        ? clampRetentionDays(cfg.job_retention_days, 7)
         : state.jobRetentionDays;
     applyStartupIntegration();
     const nextBranch = String(cfg.branch_id ?? "").trim();
