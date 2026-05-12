@@ -4,9 +4,9 @@
   "description": "Tawla Local Print Agent",
   "main": "src/main.js",
   "scripts": {
-    "start": "electron .",
+    "start": "node scripts/ensure-rabbit-defaults.js && electron .",
     "generate:ico": "node scripts/generate-win-icon.js",
-    "dist": "node scripts/generate-win-icon.js && electron-builder --win --x64"
+    "dist": "node scripts/ensure-rabbit-defaults.js && node scripts/generate-win-icon.js && electron-builder --win --x64"
   },
   "build": {
     "appId": "com.tawla.print-agent",
@@ -22,11 +22,13 @@
       "createDesktopShortcut": false,
       "createStartMenuShortcut": true,
       "runAfterFinish": true,
+      "deleteAppDataOnUninstall": true,
       "include": "build/installer.nsh"
     },
     "files": [
       "index.html",
       "preview.pdf",
+      "rabbit.defaults.json",
       "src/**/*",
       "assets/**/*",
       "package.json",

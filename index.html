@@ -2465,7 +2465,7 @@
 
         <div class="settings-layout">
           <div class="settings-col">
-            <section class="settings-card" aria-labelledby="settings-card-branch-title">
+            <section class="settings-card" id="settings-section-branch" aria-labelledby="settings-card-branch-title">
               <div class="settings-card-head">
                 <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/branch.svg" alt="" /></div>
                 <div class="settings-card-head-text">
@@ -2487,7 +2487,7 @@
               </div>
             </section>
 
-            <section class="settings-card" aria-labelledby="settings-card-rabbit-title">
+            <section class="settings-card" id="settings-section-rabbit" aria-labelledby="settings-card-rabbit-title">
               <div class="settings-card-head">
                 <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/rabbit.svg" alt="" /></div>
                 <div class="settings-card-head-text">
@@ -3509,12 +3509,14 @@
   }
 
   function applyTopology(s) {
-    const host = s.rabbitHost != null ? String(s.rabbitHost) : '—';
-    const port = s.rabbitPort != null ? String(s.rabbitPort) : '—';
-    document.getElementById('topo-rabbit-addr').textContent = host + ':' + port;
+    const host = s.rabbitHost != null && String(s.rabbitHost).trim() !== '' ? String(s.rabbitHost) : '';
+    const port = s.rabbitPort != null ? String(s.rabbitPort) : '';
+    document.getElementById('topo-rabbit-addr').textContent =
+      host ? host + ':' + (port || '') : '—';
     const headerPill = document.getElementById('header-connection-pill');
     if (headerPill) {
       if (s.rabbitmq === 'connected') headerPill.textContent = 'Connected';
+      else if (s.rabbitmq === 'idle') headerPill.textContent = 'Off';
       else if (s.rabbitmq === 'error') headerPill.textContent = 'Disconnected';
       else headerPill.textContent = 'Connecting';
     }
@@ -3534,6 +3536,11 @@
       l1Lbl.textContent = 'Down';
       if (serverStatus) serverStatus.innerHTML = '<span class="topo-status-dot" style="background:#ef4444"></span><span style="color:#ef4444">Disconnected</span>';
       if (agentStatus) agentStatus.innerHTML = '<span class="topo-status-dot" style="background:#ef4444"></span><span style="color:#ef4444">Disconnected</span>';
+    } else if (s.rabbitmq === 'idle') {
+      l1.classList.add('warn');
+      l1Lbl.textContent = 'Off';
+      if (serverStatus) serverStatus.innerHTML = '<span class="topo-status-dot" style="background:#94a3b8"></span><span style="color:#94a3b8">Not configured</span>';
+      if (agentStatus) agentStatus.innerHTML = '<span class="topo-status-dot" style="background:#94a3b8"></span><span style="color:#94a3b8">Not configured</span>';
     } else {
       l1.classList.add('warn');
       l1Lbl.textContent = '…';
@@ -3556,8 +3563,11 @@
     if (s.rabbitmq === 'connected') {
       ct.textContent = 'Connected · ' + (s.channel || '');
       ct.classList.add('ok');
+    } else if (s.rabbitmq === 'idle') {
+      ct.textContent = 'Broker not configured — set host in Settings.';
+      ct.classList.add('warn');
     } else if (s.rabbitmq === 'error') {
-      ct.textContent = 'Disconnected — reconnecting…';
+      ct.textContent = 'Disconnected — retrying with backoff…';
       ct.classList.add('err');
     } else {
       ct.textContent = 'Connecting…';
@@ -3610,8 +3620,14 @@
 
   function applySettingsForm(s) {
     const pdfModalOpen = isPdfPrintModalOpen();
+    const active = document.activeElement;
+    const branchSec = document.getElementById('settings-section-branch');
+    const rabbitSec = document.getElementById('settings-section-rabbit');
+    const branchEditing = !!(branchSec && active && branchSec.contains(active));
+    const rabbitEditing = !!(rabbitSec && active && rabbitSec.contains(active));
+
     const b = document.getElementById('settings-branch');
-    if (b && document.activeElement !== b) b.value = s.branchId || '';
+    if (b && !branchEditing) b.value = s.branchId || '';
 
     document.getElementById('settings-channel-hint').textContent = s.channel || 'branch.…';
 
@@ -3619,10 +3635,12 @@
     const rp = document.getElementById('settings-rabbit-port');
     const ru = document.getElementById('settings-rabbit-username');
     const re = document.getElementById('settings-rabbit-exchange');
-    if (rh && document.activeElement !== rh) rh.value = s.rabbitHost != null ? String(s.rabbitHost) : '';
-    if (rp && document.activeElement !== rp) rp.value = s.rabbitPort != null ? String(s.rabbitPort) : '';
-    if (ru && document.activeElement !== ru) ru.value = s.rabbitUsername != null ? String(s.rabbitUsername) : '';
-    if (re && document.activeElement !== re) re.value = s.rabbitExchange != null ? String(s.rabbitExchange) : '';
+    if (!rabbitEditing) {
+      if (rh) rh.value = s.rabbitHost != null ? String(s.rabbitHost) : '';
+      if (rp) rp.value = s.rabbitPort != null ? String(s.rabbitPort) : '';
+      if (ru) ru.value = s.rabbitUsername != null ? String(s.rabbitUsername) : '';
+      if (re) re.value = s.rabbitExchange != null ? String(s.rabbitExchange) : '';
+    }
 
     const pwHint = document.getElementById('settings-rabbit-pw-hint');
     if (pwHint) {

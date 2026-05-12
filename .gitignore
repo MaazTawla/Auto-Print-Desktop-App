@@ -1,3 +1,6 @@
 /node_modules
 /build
 /dist
+
+# Broker defaults for auto-connect (copy from rabbit.defaults.example.json)
+/rabbit.defaults.json

@@ -813,23 +813,116 @@ function saveUserConfig(partial) {
 
 const RABBITMQ_ORDERS_PRINT_EXCHANGE = process.env.RABBITMQ_ORDERS_PRINT_EXCHANGE || "orders.print";
 
-const RABBITMQ_DEFAULTS = {
-  protocol: "amqp",
-  host: "0.0.0.0",
-  port: 1234,
-  username: "user",
-  password: "password",
-  exchange: RABBITMQ_ORDERS_PRINT_EXCHANGE,
+/** Optional hard-coded fallbacks in a private fork (keep empty in shared repos). */
+const BUILTIN_RABBIT_DEFAULTS = {
+  host: "",
+  port: null,
+  username: "",
+  password: "",
+  exchange: "",
 };
+
+function envTrim(key) {
+  const v = process.env[key];
+  return v != null && String(v).trim() !== "" ? String(v).trim() : "";
+}
+
+function firstNonEmptyStr(...candidates) {
+  for (const c of candidates) {
+    if (c == null) continue;
+    const s = String(c).trim();
+    if (s !== "") return s;
+  }
+  return "";
+}
+
+function parseRabbitPort(raw) {
+  if (raw == null || String(raw).trim() === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0 || n >= 65536) return null;
+  return Math.floor(n);
+}
+
+let rabbitDefaultsFileData = undefined;
+
+function readRabbitDefaultsFromFile() {
+  if (rabbitDefaultsFileData !== undefined) return rabbitDefaultsFileData;
+  const candidates = [];
+  try {
+    candidates.push(path.join(app.getAppPath(), "rabbit.defaults.json"));
+  } catch (_) {}
+  candidates.push(path.join(__dirname, "..", "rabbit.defaults.json"));
+  for (const p of candidates) {
+    if (!fs.existsSync(p)) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+      rabbitDefaultsFileData = raw && typeof raw === "object" ? raw : {};
+      return rabbitDefaultsFileData;
+    } catch (err) {
+      console.error("Invalid rabbit.defaults.json at " + p + ": " + (err.message || String(err)));
+    }
+  }
+  rabbitDefaultsFileData = null;
+  return rabbitDefaultsFileData;
+}
+
+/**
+ * Values used when config.json has no rabbit_* (or password key absent).
+ * Priority per field: env RABBITMQ_DEFAULT_* → rabbit.defaults.json → BUILTIN_*.
+ * Saved Settings in config.json always override.
+ */
+function getMergedRabbitDefaultLayer() {
+  const file = readRabbitDefaultsFromFile() || {};
+  const envPort = parseRabbitPort(envTrim("RABBITMQ_DEFAULT_PORT"));
+  const filePort = parseRabbitPort(file.port);
+  const builtinPort = parseRabbitPort(BUILTIN_RABBIT_DEFAULTS.port);
+  const port = envPort ?? filePort ?? builtinPort ?? 5672;
+  const exchangeRaw = firstNonEmptyStr(
+    envTrim("RABBITMQ_DEFAULT_EXCHANGE"),
+    file.exchange,
+    BUILTIN_RABBIT_DEFAULTS.exchange != null ? String(BUILTIN_RABBIT_DEFAULTS.exchange) : ""
+  );
+  return {
+    protocol: "amqp",
+    host: firstNonEmptyStr(envTrim("RABBITMQ_DEFAULT_HOST"), file.host, BUILTIN_RABBIT_DEFAULTS.host),
+    port,
+    username: firstNonEmptyStr(envTrim("RABBITMQ_DEFAULT_USERNAME"), file.username, BUILTIN_RABBIT_DEFAULTS.username),
+    password: firstNonEmptyStr(envTrim("RABBITMQ_DEFAULT_PASSWORD"), file.password, BUILTIN_RABBIT_DEFAULTS.password),
+    exchange: exchangeRaw || RABBITMQ_ORDERS_PRINT_EXCHANGE,
+  };
+}
+
 const RABBITMQ_HEARTBEAT_SECONDS = 15;
+
+function getRabbitEffectiveHost() {
+  const cfg = readUserConfig();
+  if (cfg.rabbit_host != null && String(cfg.rabbit_host).trim() !== "") {
+    return String(cfg.rabbit_host).trim();
+  }
+  return getMergedRabbitDefaultLayer().host || "";
+}
+
+function isRabbitBrokerConfigured() {
+  return getRabbitEffectiveHost() !== "";
+}
 
 function buildRabbitOptions() {
   const cfg = readUserConfig();
-  const host =
-    cfg.rabbit_host != null && String(cfg.rabbit_host).trim() !== ""
-      ? String(cfg.rabbit_host).trim()
-      : RABBITMQ_DEFAULTS.host;
-  let port = RABBITMQ_DEFAULTS.port;
+  const layer = getMergedRabbitDefaultLayer();
+  const host = getRabbitEffectiveHost();
+  if (!host) {
+    return {
+      configured: false,
+      protocol: layer.protocol,
+      host: "",
+      port: layer.port,
+      username: "",
+      password: "",
+      exchange: layer.exchange,
+      url: "",
+    };
+  }
+  let port = layer.port;
   if (cfg.rabbit_port != null && String(cfg.rabbit_port).trim() !== "") {
     const n = Number(cfg.rabbit_port);
     if (Number.isFinite(n) && n > 0 && n < 65536) port = Math.floor(n);
@@ -837,22 +930,23 @@ function buildRabbitOptions() {
   const username =
     cfg.rabbit_username != null && String(cfg.rabbit_username).trim() !== ""
       ? String(cfg.rabbit_username).trim()
-      : RABBITMQ_DEFAULTS.username;
-  let password = RABBITMQ_DEFAULTS.password;
+      : layer.username;
+  let password = layer.password;
   if (Object.prototype.hasOwnProperty.call(cfg, "rabbit_password")) {
     password = cfg.rabbit_password == null ? "" : String(cfg.rabbit_password);
   }
   const exchange =
     cfg.rabbit_exchange != null && String(cfg.rabbit_exchange).trim() !== ""
       ? String(cfg.rabbit_exchange).trim()
-      : RABBITMQ_DEFAULTS.exchange;
+      : layer.exchange;
   const encodedUser = encodeURIComponent(username);
   const encodedPass = encodeURIComponent(password);
   const url =
-    `${RABBITMQ_DEFAULTS.protocol}://${encodedUser}:${encodedPass}@${host}:${port}/` +
+    `${layer.protocol}://${encodedUser}:${encodedPass}@${host}:${port}/` +
     `?heartbeat=${RABBITMQ_HEARTBEAT_SECONDS}`;
   return {
-    ...RABBITMQ_DEFAULTS,
+    configured: true,
+    protocol: layer.protocol,
     host,
     port,
     username,
@@ -878,7 +972,7 @@ const {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let state = {
-  rabbitmq: "connecting",   // connecting | connected | error
+  rabbitmq: isRabbitBrokerConfigured() ? "connecting" : "idle", // idle | connecting | connected | error
   lastOrder: null,          // { timestamp, channel, orderId? }
   lastPrintJob: null,       // { file, channel, at, orderId? }
   printers: [],             // [{ name, status, paperSizes?, deviceId? }]
@@ -944,6 +1038,11 @@ let rabbitChannel = null;
 let rabbitConsumerTag = null;
 let rabbitReconnectTimer = null;
 let rabbitHealthTimer = null;
+let rabbitReconnectAttempt = 0;
+
+function resetRabbitReconnectBackoff() {
+  rabbitReconnectAttempt = 0;
+}
 let scheduledRestartInterval = null;
 let printDataCleanupInterval = null;
 
@@ -1100,13 +1199,16 @@ function setupCrashRestartGuards() {
 // ─── Public state for UI (must match get-state and state-update payloads) ─────
 function getPublicState() {
   const rabbitOpts = buildRabbitOptions();
+  const rabbitAuthConfigured =
+    rabbitOpts.configured &&
+    Boolean(rabbitOpts.password && String(rabbitOpts.password).length > 0);
   return {
     ...state,
     rabbitHost: rabbitOpts.host,
     rabbitPort: rabbitOpts.port,
     rabbitUsername: rabbitOpts.username,
     rabbitExchange: rabbitOpts.exchange,
-    rabbitAuthConfigured: Boolean(rabbitOpts.password && String(rabbitOpts.password).length > 0),
+    rabbitAuthConfigured,
     appVersion: app.getVersion(),
     userDataPath: app.getPath("userData"),
     platform: process.platform,
@@ -1139,6 +1241,7 @@ ipcMain.on("window-toggle-maximize", () => {
 ipcMain.on("window-close", () => { if (mainWindow) mainWindow.hide(); });
 ipcMain.handle("restart-system", async () => {
   log("Manual restart requested by user.", "🔁");
+  resetRabbitReconnectBackoff();
   await restartSystem();
 });
 
@@ -1275,6 +1378,7 @@ ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
 
   saveUserConfig(patch);
   log(`RabbitMQ settings saved (${host}:${port}) — reconnecting…`, "⚙️");
+  resetRabbitReconnectBackoff();
   await startRabbit();
   pushState();
   return { ok: true };
@@ -1424,7 +1528,9 @@ function pushState() {
 
 function updateTrayTooltip() {
   if (!tray) return;
-  const r = state.rabbitmq === "connected" ? "🟢 RabbitMQ" : "🔴 RabbitMQ";
+  let r = "🔴 RabbitMQ";
+  if (state.rabbitmq === "connected") r = "🟢 RabbitMQ";
+  else if (state.rabbitmq === "idle") r = "⚪ Broker not configured";
   const j = `${state.printJobs} jobs finished (spooler)`;
   tray.setToolTip(`Tawla Print Agent\n${r} · ${j}`);
 }
@@ -1529,12 +1635,17 @@ function getRoutingForBranch(id) {
 
 function scheduleRabbitReconnect() {
   if (app.isQuiting || rabbitReconnectTimer) return;
+  if (!isRabbitBrokerConfigured()) return;
   state.rabbitmq = "error";
   pushState();
+  const base = 3000;
+  const cap = 120000;
+  const delay = Math.min(cap, base * Math.pow(2, rabbitReconnectAttempt));
+  rabbitReconnectAttempt = Math.min(rabbitReconnectAttempt + 1, 8);
   rabbitReconnectTimer = setTimeout(() => {
     rabbitReconnectTimer = null;
     startRabbit().catch((err) => log("RabbitMQ reconnect failed: " + (err.message || String(err)), "❌"));
-  }, 3000);
+  }, delay);
 }
 
 function ensureRabbitHealthCheck() {
@@ -1583,10 +1694,19 @@ async function stopRabbit() {
 
 async function startRabbit() {
   await stopRabbit();
+  const rabbitOpts = buildRabbitOptions();
+  if (!rabbitOpts.configured) {
+    state.rabbitmq = "idle";
+    const { routingKey } = getRoutingForBranch(state.branchId);
+    state.channel = routingKey;
+    pushState();
+    log("RabbitMQ broker host not configured — set connection in Settings when ready.", "ℹ️");
+    return;
+  }
+
   state.rabbitmq = "connecting";
   pushState();
 
-  const rabbitOpts = buildRabbitOptions();
   const { routingKey, queueName } = getRoutingForBranch(state.branchId);
   state.channel = routingKey;
 
@@ -1643,6 +1763,7 @@ async function startRabbit() {
     rabbitConsumerTag = consumed.consumerTag;
 
     state.rabbitmq = "connected";
+    resetRabbitReconnectBackoff();
     ensureRabbitHealthCheck();
     log("RabbitMQ connected.", "✅");
     log(`Consuming queue ${queueName} via ${rabbitOpts.exchange} (${routingKey}).`, "📡");
@@ -1691,6 +1812,7 @@ async function applyBranchId(id) {
   saveUserConfig({ branch_id: id });
   log(`Branch ID set to ${id} — listening on ${state.channel}`, "📌");
   pushState();
+  resetRabbitReconnectBackoff();
   await startRabbit();
   await pollPrinters();
 }
@@ -1995,6 +2117,7 @@ if (!gotSingleInstanceLock) {
 
     createTray();
     createWindow();
+    showWindow();
 
     log("Tawla Print Agent started.", "🚀");
     log(`Branch ID: ${state.branchId} — listening on ${state.channel}`, "📌");

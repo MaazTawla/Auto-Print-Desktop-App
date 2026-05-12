@@ -1,0 +1,8 @@
+{
+  "_readme": "Copy to rabbit.defaults.json (or let npm start / dist create it) and set host/username/password so new installs connect without typing Settings first. Environment variables RABBITMQ_DEFAULT_* override this file. User changes in the app are saved to config.json and override both.",
+  "host": "",
+  "port": 5672,
+  "username": "",
+  "password": "",
+  "exchange": ""
+}
