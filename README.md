@@ -38,7 +38,7 @@ When RabbitMQ shows **connected**, new orders should appear under **Queue** and 
 
 - The agent keeps running in the **tray** after you close the window (close hides to tray; use **Quit** from the tray menu to exit fully).
 - Use **Queue** to see status, open a PDF preview (job name), **Retry** failed jobs, or **Resend** completed ones when needed.
-- If the PC sleeps or the network drops, the app **reconnects** automatically; after **wake from sleep** or **unlocking** the screen it refreshes connection and printers.
+- If the PC sleeps or the network drops, the app **reconnects** automatically as soon as the link (and broker) are reachable again; after **wake from sleep** or **unlocking** the screen it refreshes connection and printers.
 
 ### Disk space & notifications
 
@@ -55,7 +55,7 @@ If Windows disk space runs low, you may get a **notification** and see a message
 ## Technical overview (operators & support)
 
 - **Transport**: RabbitMQ — exchange `orders.print`, routing key `branch.<branch_id>`, queue `printer.Branch.<branch_id>`.
-- **Reconnect**: Automatic on broker/network issues, consumer cancellation, and failed health checks.
+- **Reconnect**: Automatic on broker/network issues, consumer cancellation, and failed health checks. While disconnected, the agent polls OS online state and probes the broker host so it reconnects **as soon as the network (or broker) is reachable again**, instead of waiting out a long backoff. Backoff starts at ~1s (cap 15s online / 30s offline). Health checks run every 5s; connect timeout is 10s.
 - **Sleep / lock**: Debounced refresh after **resume** or **screen unlock** so RabbitMQ and printer lists recover.
 - **Retries**: Up to several attempts per job with backoff; persistent failures go to **dead letter** in the UI.
 - **Poison messages**: Bad/missing PDF payloads are not requeued infinitely.

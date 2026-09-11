@@ -1,8 +1,14 @@
 {
-  "_readme": "Copy to rabbit.defaults.json (or let npm start / dist create it) and set host/username/password so new installs connect without typing Settings first. Environment variables RABBITMQ_DEFAULT_* override this file. User changes in the app are saved to config.json and override both.",
-  "host": "",
+  "_readme": "Copy to rabbit.defaults.json (or let npm start / dist create it). Host/username/password stay empty for first install; set them in Settings or fill this file for private forks. Exchange/routing match Tawla auto_print.",
+  "host": null,
   "port": 5672,
-  "username": "",
-  "password": "",
-  "exchange": ""
+  "username": null,
+  "password": null,
+  "vhost": "/",
+  "exchange": "auto_print",
+  "routingKey": "orders.{branch_id}",
+  "declareExchange": false,
+  "exchangeDurable": true,
+  "connectionTimeoutSec": 3,
+  "readWriteTimeoutSec": 3
 }

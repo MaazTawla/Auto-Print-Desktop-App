@@ -1039,6 +1039,20 @@ let rabbitConsumerTag = null;
 let rabbitReconnectTimer = null;
 let rabbitHealthTimer = null;
 let rabbitReconnectAttempt = 0;
+let networkMonitorTimer = null;
+let networkMonitorInstalled = false;
+let lastKnownOnline = null;
+let lastForceReconnectAt = 0;
+
+/** Reconnect pacing: keep delays short so venues recover quickly after Wi‑Fi blips. */
+const RABBIT_RECONNECT_BASE_MS = 1000;
+const RABBIT_RECONNECT_CAP_ONLINE_MS = 15000;
+const RABBIT_RECONNECT_CAP_OFFLINE_MS = 30000;
+const RABBIT_CONNECT_TIMEOUT_MS = 10000;
+const RABBIT_HEALTH_INTERVAL_MS = 5000;
+const NETWORK_POLL_MS = 1500;
+const FORCE_RECONNECT_DEBOUNCE_MS = 2000;
+const BROKER_PROBE_TIMEOUT_MS = 2500;
 
 function resetRabbitReconnectBackoff() {
   rabbitReconnectAttempt = 0;
@@ -1633,19 +1647,123 @@ function getRoutingForBranch(id) {
   };
 }
 
+function isNetworkLikelyOnline() {
+  try {
+    return net.isOnline();
+  } catch (_) {
+    return true;
+  }
+}
+
+/** Quick TCP probe to broker host:port — true only when the port accepts a connection. */
+function probeRabbitHostReachable() {
+  const opts = buildRabbitOptions();
+  if (!opts.configured || !opts.host) return Promise.resolve(false);
+  const nodeNet = require("net");
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch (_) {}
+      resolve(ok);
+    };
+    const socket = nodeNet.connect(
+      { host: opts.host, port: opts.port },
+      () => done(true)
+    );
+    socket.setTimeout(BROKER_PROBE_TIMEOUT_MS);
+    socket.on("timeout", () => done(false));
+    socket.on("error", () => done(false));
+  });
+}
+
+/**
+ * Cancel any pending backoff and reconnect immediately.
+ * Used when OS network returns or the broker becomes reachable again —
+ * so we do not wait out a long exponential delay after a brief outage.
+ */
+function forceRabbitReconnect(reason) {
+  if (app.isQuiting || !isRabbitBrokerConfigured()) return;
+  if (state.rabbitmq === "connected" || state.rabbitmq === "connecting") return;
+  const now = Date.now();
+  if (now - lastForceReconnectAt < FORCE_RECONNECT_DEBOUNCE_MS) return;
+  lastForceReconnectAt = now;
+  if (rabbitReconnectTimer) {
+    clearTimeout(rabbitReconnectTimer);
+    rabbitReconnectTimer = null;
+  }
+  resetRabbitReconnectBackoff();
+  log(`Reconnecting to RabbitMQ immediately (${reason}).`, "🔌");
+  startRabbit().catch((err) =>
+    log("RabbitMQ reconnect failed: " + (err.message || String(err)), "❌")
+  );
+}
+
 function scheduleRabbitReconnect() {
   if (app.isQuiting || rabbitReconnectTimer) return;
   if (!isRabbitBrokerConfigured()) return;
   state.rabbitmq = "error";
   pushState();
-  const base = 3000;
-  const cap = 120000;
+  const online = isNetworkLikelyOnline();
+  const base = RABBIT_RECONNECT_BASE_MS;
+  const cap = online ? RABBIT_RECONNECT_CAP_ONLINE_MS : RABBIT_RECONNECT_CAP_OFFLINE_MS;
   const delay = Math.min(cap, base * Math.pow(2, rabbitReconnectAttempt));
   rabbitReconnectAttempt = Math.min(rabbitReconnectAttempt + 1, 8);
+  log(
+    `RabbitMQ reconnect in ${Math.round(delay / 1000)}s (attempt ${rabbitReconnectAttempt}, network ${online ? "up" : "down"}).`,
+    "⏳"
+  );
   rabbitReconnectTimer = setTimeout(() => {
     rabbitReconnectTimer = null;
-    startRabbit().catch((err) => log("RabbitMQ reconnect failed: " + (err.message || String(err)), "❌"));
+    startRabbit().catch((err) =>
+      log("RabbitMQ reconnect failed: " + (err.message || String(err)), "❌")
+    );
   }, delay);
+}
+
+/**
+ * While disconnected, watch for network regain and broker reachability so we
+ * reconnect as soon as possible instead of waiting for the next backoff tick.
+ */
+function setupNetworkOnlineMonitor() {
+  if (networkMonitorInstalled) return;
+  networkMonitorInstalled = true;
+  lastKnownOnline = isNetworkLikelyOnline();
+
+  networkMonitorTimer = setInterval(async () => {
+    if (app.isQuiting || !isRabbitBrokerConfigured()) return;
+
+    const online = isNetworkLikelyOnline();
+    const wasOnline = lastKnownOnline;
+    lastKnownOnline = online;
+
+    if (!wasOnline && online) {
+      forceRabbitReconnect("network restored");
+      return;
+    }
+
+    if (!online) return;
+    if (state.rabbitmq !== "error") return;
+
+    // Network is up but broker still disconnected — probe and cut short any long backoff.
+    try {
+      const reachable = await probeRabbitHostReachable();
+      if (reachable && state.rabbitmq === "error" && !app.isQuiting) {
+        forceRabbitReconnect("broker reachable again");
+      }
+    } catch (_) {}
+  }, NETWORK_POLL_MS);
+}
+
+function clearNetworkOnlineMonitor() {
+  if (networkMonitorTimer) {
+    clearInterval(networkMonitorTimer);
+    networkMonitorTimer = null;
+  }
+  networkMonitorInstalled = false;
 }
 
 function ensureRabbitHealthCheck() {
@@ -1661,7 +1779,7 @@ function ensureRabbitHealthCheck() {
       log("RabbitMQ health check failed: " + (err.message || String(err)), "⚠️");
       scheduleRabbitReconnect();
     }
-  }, 10000);
+  }, RABBIT_HEALTH_INTERVAL_MS);
 }
 
 function clearRabbitHealthCheck() {
@@ -1711,7 +1829,9 @@ async function startRabbit() {
   state.channel = routingKey;
 
   try {
-    const connection = await amqp.connect(rabbitOpts.url);
+    const connection = await amqp.connect(rabbitOpts.url, {
+      timeout: RABBIT_CONNECT_TIMEOUT_MS,
+    });
     rabbitConnection = connection;
     connection.on("error", (err) => {
       if (connection !== rabbitConnection) return;
@@ -1764,6 +1884,7 @@ async function startRabbit() {
 
     state.rabbitmq = "connected";
     resetRabbitReconnectBackoff();
+    lastKnownOnline = true;
     ensureRabbitHealthCheck();
     log("RabbitMQ connected.", "✅");
     log(`Consuming queue ${queueName} via ${rabbitOpts.exchange} (${routingKey}).`, "📡");
@@ -1895,7 +2016,7 @@ async function restartSystem() {
 }
 
 /** Debounce resume vs unlock so we do not double-refresh when both fire close together (e.g. wake + unlock). */
-const POWER_SESSION_REFRESH_DEBOUNCE_MS = 8000;
+const POWER_SESSION_REFRESH_DEBOUNCE_MS = 2000;
 let lastPowerSessionRefreshAt = 0;
 let powerSessionGuardsInstalled = false;
 
@@ -1909,6 +2030,7 @@ function setupPowerSessionGuards() {
     if (now - lastPowerSessionRefreshAt < POWER_SESSION_REFRESH_DEBOUNCE_MS) return;
     lastPowerSessionRefreshAt = now;
     log(`Session/power event (${reason}) — refreshing RabbitMQ and printers.`, "🔌");
+    resetRabbitReconnectBackoff();
     restartSystem().catch((err) => {
       log("Refresh after session event failed: " + (err.message || String(err)), "⚠️");
     });
@@ -2078,6 +2200,7 @@ if (!gotSingleInstanceLock) {
     applyStartupIntegration();
     setupCrashRestartGuards();
     setupPowerSessionGuards();
+    setupNetworkOnlineMonitor();
 
     // Serve app files via app:// protocol — avoids file:// restrictions in Electron 29
     // index.html lives next to package.json (project root / resources/app when packaged)
@@ -2157,6 +2280,7 @@ if (!gotSingleInstanceLock) {
     if (scheduledRestartInterval) clearInterval(scheduledRestartInterval);
     if (printDataCleanupInterval) clearInterval(printDataCleanupInterval);
     if (diskSpaceCheckTimer) clearInterval(diskSpaceCheckTimer);
+    clearNetworkOnlineMonitor();
     await stopRabbit();
   });
 }
