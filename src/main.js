@@ -111,6 +111,55 @@ async function saveIncomingPdf(store, jobId, filePath, isUrl) {
   return dest;
 }
 
+/**
+ * Decode pdf_base64 (raw or data-URI) and write to incoming/.
+ * Validates that the payload looks like a PDF (%PDF header).
+ */
+async function saveIncomingPdfFromBase64(store, jobId, base64Raw, preferredName) {
+  await ensureSpaceForIncomingPdf();
+  let b64 = String(base64Raw ?? "").trim();
+  if (!b64) throw new Error("Empty pdf_base64");
+
+  const dataUri = /^data:application\/pdf;base64,/i.exec(b64);
+  if (dataUri) b64 = b64.slice(dataUri[0].length);
+  // Strip whitespace/newlines some publishers insert
+  b64 = b64.replace(/\s+/g, "");
+
+  let buf;
+  try {
+    buf = Buffer.from(b64, "base64");
+  } catch (err) {
+    throw new Error("Invalid pdf_base64 encoding: " + (err.message || String(err)));
+  }
+  if (!buf.length) throw new Error("Decoded pdf_base64 is empty");
+  // PDF files start with %PDF
+  const header = buf.slice(0, 4).toString("latin1");
+  if (header !== "%PDF") {
+    throw new Error("Decoded pdf_base64 is not a PDF (missing %PDF header)");
+  }
+
+  const rawBase = preferredName || `order-${Date.now()}.pdf`;
+  const safeBase = String(rawBase).replace(/[^a-zA-Z0-9._-]/g, "_") || "order.pdf";
+  const withExt = /\.pdf$/i.test(safeBase) ? safeBase : `${safeBase}.pdf`;
+  const dest = path.join(store.incoming, `${jobId}_${withExt}`);
+
+  try {
+    fs.writeFileSync(dest, buf);
+  } catch (err) {
+    if (isNoSpaceError(err)) {
+      await emergencyDiskCleanup();
+      await refreshDiskSpaceStatus({ silent: true });
+      if (state.diskSpace.status === "critical") {
+        throw new Error("Disk full — could not save PDF. Freed old logs/jobs; free more space and retry.");
+      }
+      fs.writeFileSync(dest, buf);
+    } else {
+      throw err;
+    }
+  }
+  return dest;
+}
+
 function isNoSpaceError(err) {
   const c = err && (err.code || err.errno);
   return c === "ENOSPC" || c === -28;
@@ -1927,6 +1976,22 @@ function extractFilePathFromPayload(data) {
   return typeof fp === "string" ? fp.trim() : String(fp ?? "").trim();
 }
 
+/** Inline PDF from broker — prefer over downloading file_path when present. */
+function extractPdfBase64FromPayload(data) {
+  if (!data || typeof data !== "object") return "";
+  const raw =
+    data.pdf_base64 ??
+    data.pdfBase64 ??
+    data.file_base64 ??
+    data.fileBase64 ??
+    data.base64_pdf ??
+    data.base64Pdf ??
+    "";
+  if (raw == null) return "";
+  const s = typeof raw === "string" ? raw.trim() : String(raw).trim();
+  return s;
+}
+
 async function applyBranchId(id) {
   state.branchId = id;
   state.channel = `branch.${id}`;
@@ -1951,24 +2016,45 @@ async function handleMessage(channel, message) {
     };
     pushState();
 
+    const pdfBase64 = extractPdfBase64FromPayload(data);
     const filePath = extractFilePathFromPayload(data);
-    if (!filePath) {
-      log("Missing file_path in message.", "❌");
+    if (!pdfBase64 && !filePath) {
+      log("Missing pdf_base64 and file_path in message.", "❌");
       return "reject";
     }
 
     const jobId = crypto.randomBytes(8).toString("hex");
     const store = getJobsStore();
     const isUrl = filePath.startsWith("http://") || filePath.startsWith("https://");
+    const preferredName = filePath
+      ? derivePdfBasename(filePath, isUrl)
+      : `order-${Date.now()}.pdf`;
 
     let localPath;
+    let saveSource = null;
     try {
-      localPath = await saveIncomingPdf(store, jobId, filePath, isUrl);
+      if (pdfBase64) {
+        try {
+          localPath = await saveIncomingPdfFromBase64(store, jobId, pdfBase64, preferredName);
+          saveSource = "pdf_base64";
+        } catch (b64Err) {
+          if (!filePath) throw b64Err;
+          log(
+            `pdf_base64 failed (${b64Err.message || String(b64Err)}) — falling back to file_path.`,
+            "⚠️"
+          );
+          localPath = await saveIncomingPdf(store, jobId, filePath, isUrl);
+          saveSource = "file_path";
+        }
+      } else {
+        localPath = await saveIncomingPdf(store, jobId, filePath, isUrl);
+        saveSource = "file_path";
+      }
     } catch (err) {
       log("Could not save PDF: " + err.message, "❌");
       store.upsert({
         id: jobId,
-        file: derivePdfBasename(filePath, isUrl),
+        file: preferredName,
         orderId,
         status: "failed-setup",
         attemptNumber: 0,
@@ -1998,7 +2084,7 @@ async function handleMessage(channel, message) {
     });
     syncJobsToState();
     pushState();
-    log(`Saved job PDF: ${baseFile}`, "📁");
+    log(`Saved job PDF via ${saveSource}: ${baseFile}`, "📁");
 
     setImmediate(() => runPrintAttempt(jobId));
     return "ack";

@@ -54,7 +54,7 @@ If Windows disk space runs low, you may get a **notification** and see a message
 
 ## Technical overview (operators & support)
 
-- **Transport**: RabbitMQ — exchange `orders.print`, routing key `branch.<branch_id>`, queue `printer.Branch.<branch_id>`.
+- **Transport**: RabbitMQ — exchange `orders.print`, routing key `branch.<branch_id>`, queue `printer.Branch.<branch_id>`. Order payloads may include inline `pdf_base64` (preferred) and/or `file_path` / URL; the agent uses base64 first and falls back to downloading `file_path` if base64 is missing or invalid.
 - **Reconnect**: Automatic on broker/network issues, consumer cancellation, and failed health checks. While disconnected, the agent polls OS online state and probes the broker host so it reconnects **as soon as the network (or broker) is reachable again**, instead of waiting out a long backoff. Backoff starts at ~1s (cap 15s online / 30s offline). Health checks run every 5s; connect timeout is 10s.
 - **Sleep / lock**: Debounced refresh after **resume** or **screen unlock** so RabbitMQ and printer lists recover.
 - **Retries**: Up to several attempts per job with backoff; persistent failures go to **dead letter** in the UI.
