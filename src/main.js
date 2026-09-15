@@ -1755,11 +1755,63 @@ async function pollPrinters() {
 function getRoutingForBranch(id) {
   const branch = String(id || "").trim();
   const routingKey = resolveRoutingKey(getRoutingKeyTemplate(), branch);
+  // Shared with the Android agent. Both apps must consume this same queue so
+  // RabbitMQ delivers each order to only one consumer (duplicate queues = duplicate prints).
   const queueName = branch ? `printer.Branch.${branch}` : "";
   return {
     routingKey,
     queueName,
   };
+}
+
+function isInequivalentArgError(err) {
+  const msg = err && err.message ? String(err.message) : String(err);
+  return /PRECONDITION_FAILED/i.test(msg) && /inequivalent/i.test(msg);
+}
+
+function wireRabbitChannel(channel) {
+  channel.on("error", (err) => {
+    if (channel !== rabbitChannel) return;
+    log("RabbitMQ channel error: " + err.message, "❌");
+    scheduleRabbitReconnect();
+  });
+  channel.on("close", () => {
+    if (channel !== rabbitChannel || app.isQuiting) return;
+    scheduleRabbitReconnect();
+  });
+}
+
+/**
+ * Declare the shared branch queue. Prefer single-active-consumer so a second
+ * agent (Android or another PC) stays on standby instead of splitting orders.
+ * Existing queues created without that argument keep competing-consumer mode.
+ */
+async function assertSharedPrintQueue(connection, channel, queueName, exchange, routingKey) {
+  try {
+    await channel.assertQueue(queueName, {
+      durable: true,
+      arguments: { "x-single-active-consumer": true },
+    });
+    await channel.bindQueue(queueName, exchange, routingKey);
+    log(
+      `Queue ${queueName} using single active consumer — a second agent on this queue stays on standby.`,
+      "ℹ️"
+    );
+    return channel;
+  } catch (err) {
+    if (!isInequivalentArgError(err)) throw err;
+    rabbitChannel = null;
+    const next = await connection.createChannel();
+    rabbitChannel = next;
+    await next.prefetch(1);
+    await next.assertQueue(queueName, { durable: true });
+    await next.bindQueue(queueName, exchange, routingKey);
+    log(
+      `Queue ${queueName} already exists — sharing it so each order is delivered to only one agent.`,
+      "ℹ️"
+    );
+    return next;
+  }
 }
 
 function isNetworkLikelyOnline() {
@@ -1980,22 +2032,20 @@ async function startRabbit() {
       scheduleRabbitReconnect();
     });
 
-    const channel = await connection.createChannel();
+    let channel = await connection.createChannel();
     rabbitChannel = channel;
-    channel.on("error", (err) => {
-      if (channel !== rabbitChannel) return;
-      log("RabbitMQ channel error: " + err.message, "❌");
-      scheduleRabbitReconnect();
-    });
-    channel.on("close", () => {
-      if (channel !== rabbitChannel || app.isQuiting) return;
-      scheduleRabbitReconnect();
-    });
 
     await channel.prefetch(1);
     await channel.assertExchange(rabbitOpts.exchange, "topic", { durable: true });
-    await channel.assertQueue(queueName, { durable: true });
-    await channel.bindQueue(queueName, rabbitOpts.exchange, routingKey);
+    channel = await assertSharedPrintQueue(
+      connection,
+      channel,
+      queueName,
+      rabbitOpts.exchange,
+      routingKey
+    );
+    rabbitChannel = channel;
+    wireRabbitChannel(channel);
 
     const consumed = await channel.consume(queueName, async (msg) => {
       if (!msg) {
@@ -2023,7 +2073,10 @@ async function startRabbit() {
     lastKnownOnline = true;
     ensureRabbitHealthCheck();
     log("RabbitMQ connected.", "✅");
-    log(`Consuming queue ${queueName} via ${rabbitOpts.exchange} (${routingKey}).`, "📡");
+    log(
+      `Consuming shared queue ${queueName} via ${rabbitOpts.exchange} (${routingKey}). Each order is delivered to only one agent.`,
+      "📡"
+    );
     pushState();
   } catch (err) {
     state.rabbitmq = "error";
