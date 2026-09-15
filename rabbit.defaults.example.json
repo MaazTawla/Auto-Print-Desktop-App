@@ -1,14 +1,9 @@
 {
-  "_readme": "Copy to rabbit.defaults.json (or let npm start / dist create it). Host/username/password stay empty for first install; set them in Settings or fill this file for private forks. Exchange/routing match Tawla auto_print.",
-  "host": null,
+  "_readme": "Copy to rabbit.defaults.json (or let npm start / dist create it). Leave host/username/password/exchange/routingKey empty for a blank first install. Fill this file only for private forks that should auto-connect. Use {branch_id} in routingKey (e.g. orders.{branch_id}). User Settings always override.",
+  "host": "",
   "port": 5672,
-  "username": null,
-  "password": null,
-  "vhost": "/",
+  "username": "",
+  "password": "",
   "exchange": "auto_print",
-  "routingKey": "orders.{branch_id}",
-  "declareExchange": false,
-  "exchangeDurable": true,
-  "connectionTimeoutSec": 3,
-  "readWriteTimeoutSec": 3
+  "routingKey": "orders.{branch_id}"
 }

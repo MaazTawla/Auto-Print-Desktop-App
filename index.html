@@ -2478,7 +2478,7 @@
                 <div class="field">
                   <label for="settings-branch">Branch ID</label>
                   <input type="text" id="settings-branch" placeholder="e.g. 147" autocomplete="off" />
-                  <div class="field-hint">Listens on routing key <span class="mono" id="settings-channel-hint">branch.…</span></div>
+                  <div class="field-hint">Resolved routing key: <span class="mono" id="settings-channel-hint">—</span></div>
                   <div class="err-text" id="settings-branch-err"></div>
                 </div>
                 <div class="settings-card-actions">
@@ -2502,7 +2502,7 @@
                 </div>
                 <div class="field">
                   <label for="settings-rabbit-port">Port</label>
-                  <input type="number" id="settings-rabbit-port" min="1" max="65535" />
+                  <input type="number" id="settings-rabbit-port" min="1" max="65535" placeholder="5672" />
                 </div>
                 <div class="field">
                   <label for="settings-rabbit-username">Username</label>
@@ -2510,7 +2510,12 @@
                 </div>
                 <div class="field">
                   <label for="settings-rabbit-exchange">Exchange</label>
-                  <input type="text" id="settings-rabbit-exchange" autocomplete="off" />
+                  <input type="text" id="settings-rabbit-exchange" placeholder="e.g. orders.print" autocomplete="off" />
+                </div>
+                <div class="field">
+                  <label for="settings-rabbit-routing-key">Routing key</label>
+                  <input type="text" id="settings-rabbit-routing-key" placeholder="e.g. orders.{branch_id}" autocomplete="off" />
+                  <div class="field-hint">Use <span class="mono">{branch_id}</span> to insert the Branch ID. Example: <span class="mono">orders.{branch_id}</span></div>
                 </div>
                 <div class="field">
                   <label>Password</label>
@@ -2741,6 +2746,8 @@
   let pdfModalJobId = null;
   let jobsQueueFilter = 'all';
   let rabbitSaveInFlight = false;
+  let branchFormDirty = false;
+  let rabbitFormDirty = false;
   const toastTimeouts = new Set();
   try {
     const savedFilter = sessionStorage.getItem('jobsQueueFilter');
@@ -3625,21 +3632,25 @@
     const rabbitSec = document.getElementById('settings-section-rabbit');
     const branchEditing = !!(branchSec && active && branchSec.contains(active));
     const rabbitEditing = !!(rabbitSec && active && rabbitSec.contains(active));
+    const skipBranchSync = branchEditing || branchFormDirty;
+    const skipRabbitSync = rabbitEditing || rabbitFormDirty;
 
     const b = document.getElementById('settings-branch');
-    if (b && !branchEditing) b.value = s.branchId || '';
+    if (b && !skipBranchSync) b.value = s.branchId || '';
 
-    document.getElementById('settings-channel-hint').textContent = s.channel || 'branch.…';
+    document.getElementById('settings-channel-hint').textContent = s.channel || '—';
 
     const rh = document.getElementById('settings-rabbit-host');
     const rp = document.getElementById('settings-rabbit-port');
     const ru = document.getElementById('settings-rabbit-username');
     const re = document.getElementById('settings-rabbit-exchange');
-    if (!rabbitEditing) {
+    const rr = document.getElementById('settings-rabbit-routing-key');
+    if (!skipRabbitSync) {
       if (rh) rh.value = s.rabbitHost != null ? String(s.rabbitHost) : '';
-      if (rp) rp.value = s.rabbitPort != null ? String(s.rabbitPort) : '';
+      if (rp) rp.value = s.rabbitPort != null && String(s.rabbitPort).trim() !== '' ? String(s.rabbitPort) : '';
       if (ru) ru.value = s.rabbitUsername != null ? String(s.rabbitUsername) : '';
       if (re) re.value = s.rabbitExchange != null ? String(s.rabbitExchange) : '';
+      if (rr) rr.value = s.rabbitRoutingKey != null ? String(s.rabbitRoutingKey) : '';
     }
 
     const pwHint = document.getElementById('settings-rabbit-pw-hint');
@@ -3795,6 +3806,17 @@
     return true;
   }
 
+  const branchSecEl = document.getElementById('settings-section-branch');
+  const rabbitSecEl = document.getElementById('settings-section-rabbit');
+  if (branchSecEl) {
+    branchSecEl.addEventListener('input', () => { branchFormDirty = true; });
+    branchSecEl.addEventListener('change', () => { branchFormDirty = true; });
+  }
+  if (rabbitSecEl) {
+    rabbitSecEl.addEventListener('input', () => { rabbitFormDirty = true; });
+    rabbitSecEl.addEventListener('change', () => { rabbitFormDirty = true; });
+  }
+
   document.getElementById('settings-branch-save').addEventListener('click', async () => {
     const errEl = document.getElementById('settings-branch-err');
     errEl.textContent = '';
@@ -3806,6 +3828,7 @@
       showToast(msg, 'error', 3400);
       return;
     }
+    branchFormDirty = false;
     showToast('Branch updated successfully.');
   });
 
@@ -3819,6 +3842,7 @@
     const port = document.getElementById('settings-rabbit-port').value;
     const username = document.getElementById('settings-rabbit-username').value.trim();
     const exchange = document.getElementById('settings-rabbit-exchange').value.trim();
+    const routingKey = document.getElementById('settings-rabbit-routing-key').value.trim();
     let passwordMode = 'keep';
     let passwordNew = '';
     if (rabbitPwClearPending) {
@@ -3833,6 +3857,7 @@
         port: Number(port),
         username,
         exchange,
+        routingKey,
         passwordMode,
         passwordNew
       });
@@ -3843,6 +3868,7 @@
         showToast(msg, 'error', 3400);
         return;
       }
+      rabbitFormDirty = false;
       document.getElementById('settings-rabbit-pw-change').checked = false;
       document.getElementById('settings-rabbit-pw-new').value = '';
       document.getElementById('settings-rabbit-pw-new').disabled = true;

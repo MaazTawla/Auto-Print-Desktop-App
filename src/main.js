@@ -793,7 +793,7 @@ function loadConfig() {
   try {
     const raw = fs.readFileSync(configPath, "utf8");
     const cfg = JSON.parse(raw);
-    const branchId = String(cfg.branch_id || "147").trim();
+    const branchId = cfg.branch_id != null ? String(cfg.branch_id).trim() : "";
     const dp = cfg.default_printer != null ? String(cfg.default_printer).trim() : "";
     const launchOnLogin = cfg.launch_on_login === undefined ? true : !!cfg.launch_on_login;
     const restartOnCrash = cfg.restart_on_crash === undefined ? true : !!cfg.restart_on_crash;
@@ -811,7 +811,7 @@ function loadConfig() {
       cfg.job_retention_days !== undefined ? clampRetentionDays(cfg.job_retention_days, 7) : 7;
     return {
       branchId,
-      channel: `branch.${branchId}`,
+      channel: "",
       configPath,
       defaultPrinter: dp || null,
       launchOnLogin,
@@ -824,8 +824,8 @@ function loadConfig() {
     };
   } catch (_) {
     return {
-      branchId: "147",
-      channel: "branch.147",
+      branchId: "",
+      channel: "",
       configPath,
       defaultPrinter: null,
       launchOnLogin: true,
@@ -860,15 +860,14 @@ function saveUserConfig(partial) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf8");
 }
 
-const RABBITMQ_ORDERS_PRINT_EXCHANGE = process.env.RABBITMQ_ORDERS_PRINT_EXCHANGE || "orders.print";
-
-/** Optional hard-coded fallbacks in a private fork (keep empty in shared repos). */
+const RABBITMQ_HEARTBEAT_SECONDS = 15;
 const BUILTIN_RABBIT_DEFAULTS = {
   host: "",
   port: null,
   username: "",
   password: "",
   exchange: "",
+  routingKey: "",
 };
 
 function envTrim(key) {
@@ -919,6 +918,7 @@ function readRabbitDefaultsFromFile() {
  * Values used when config.json has no rabbit_* (or password key absent).
  * Priority per field: env RABBITMQ_DEFAULT_* → rabbit.defaults.json → BUILTIN_*.
  * Saved Settings in config.json always override.
+ * First install ships empty host/user/password/exchange/routingKey (no silent prefills).
  */
 function getMergedRabbitDefaultLayer() {
   const file = readRabbitDefaultsFromFile() || {};
@@ -926,22 +926,25 @@ function getMergedRabbitDefaultLayer() {
   const filePort = parseRabbitPort(file.port);
   const builtinPort = parseRabbitPort(BUILTIN_RABBIT_DEFAULTS.port);
   const port = envPort ?? filePort ?? builtinPort ?? 5672;
-  const exchangeRaw = firstNonEmptyStr(
-    envTrim("RABBITMQ_DEFAULT_EXCHANGE"),
-    file.exchange,
-    BUILTIN_RABBIT_DEFAULTS.exchange != null ? String(BUILTIN_RABBIT_DEFAULTS.exchange) : ""
-  );
   return {
     protocol: "amqp",
     host: firstNonEmptyStr(envTrim("RABBITMQ_DEFAULT_HOST"), file.host, BUILTIN_RABBIT_DEFAULTS.host),
     port,
     username: firstNonEmptyStr(envTrim("RABBITMQ_DEFAULT_USERNAME"), file.username, BUILTIN_RABBIT_DEFAULTS.username),
     password: firstNonEmptyStr(envTrim("RABBITMQ_DEFAULT_PASSWORD"), file.password, BUILTIN_RABBIT_DEFAULTS.password),
-    exchange: exchangeRaw || RABBITMQ_ORDERS_PRINT_EXCHANGE,
+    exchange: firstNonEmptyStr(
+      envTrim("RABBITMQ_DEFAULT_EXCHANGE"),
+      file.exchange,
+      BUILTIN_RABBIT_DEFAULTS.exchange
+    ),
+    routingKey: firstNonEmptyStr(
+      envTrim("RABBITMQ_DEFAULT_ROUTING_KEY"),
+      file.routingKey,
+      file.routing_key,
+      BUILTIN_RABBIT_DEFAULTS.routingKey
+    ),
   };
 }
-
-const RABBITMQ_HEARTBEAT_SECONDS = 15;
 
 function getRabbitEffectiveHost() {
   const cfg = readUserConfig();
@@ -951,8 +954,36 @@ function getRabbitEffectiveHost() {
   return getMergedRabbitDefaultLayer().host || "";
 }
 
+function getRoutingKeyTemplate() {
+  const cfg = readUserConfig();
+  if (cfg.rabbit_routing_key != null && String(cfg.rabbit_routing_key).trim() !== "") {
+    return String(cfg.rabbit_routing_key).trim();
+  }
+  return getMergedRabbitDefaultLayer().routingKey || "";
+}
+
+/** Resolve template like orders.{branch_id} → orders.147. Empty template + branch → legacy branch.<id>. */
+function resolveRoutingKey(template, branchId) {
+  const id = String(branchId || "").trim();
+  const t = String(template || "").trim();
+  if (!t) return id ? `branch.${id}` : "";
+  if (!id && /\{branch[_-]?id\}|\{branch\}/i.test(t)) return "";
+  return t
+    .replace(/\{branch_id\}/gi, id)
+    .replace(/\{branchId\}/g, id)
+    .replace(/\{branch\}/gi, id);
+}
+
 function isRabbitBrokerConfigured() {
   return getRabbitEffectiveHost() !== "";
+}
+
+/** Host + branch + resolvable routing key required before consuming. */
+function isRabbitReadyToConsume() {
+  if (!isRabbitBrokerConfigured()) return false;
+  const branchId = String(state.branchId || "").trim();
+  if (!branchId) return false;
+  return resolveRoutingKey(getRoutingKeyTemplate(), branchId) !== "";
 }
 
 function buildRabbitOptions() {
@@ -964,10 +995,11 @@ function buildRabbitOptions() {
       configured: false,
       protocol: layer.protocol,
       host: "",
-      port: layer.port,
+      port: "",
       username: "",
       password: "",
-      exchange: layer.exchange,
+      exchange: "",
+      routingKey: "",
       url: "",
     };
   }
@@ -988,6 +1020,10 @@ function buildRabbitOptions() {
     cfg.rabbit_exchange != null && String(cfg.rabbit_exchange).trim() !== ""
       ? String(cfg.rabbit_exchange).trim()
       : layer.exchange;
+  const routingKeyTemplate =
+    cfg.rabbit_routing_key != null && String(cfg.rabbit_routing_key).trim() !== ""
+      ? String(cfg.rabbit_routing_key).trim()
+      : layer.routingKey;
   const encodedUser = encodeURIComponent(username);
   const encodedPass = encodeURIComponent(password);
   const url =
@@ -1001,6 +1037,7 @@ function buildRabbitOptions() {
     username,
     password,
     exchange,
+    routingKey: routingKeyTemplate,
     url,
   };
 }
@@ -1029,7 +1066,7 @@ let state = {
   printJobs: 0,
   printJobsList: [],        // persisted job rows (mirrors jobs.json)
   branchId,
-  channel: initialChannel,
+  channel: resolveRoutingKey(getRoutingKeyTemplate(), branchId) || initialChannel || "",
   defaultPrinter: initialDefaultPrinter,
   launchOnLogin: initialLaunchOnLogin,
   restartOnCrash: initialRestartOnCrash,
@@ -1265,12 +1302,17 @@ function getPublicState() {
   const rabbitAuthConfigured =
     rabbitOpts.configured &&
     Boolean(rabbitOpts.password && String(rabbitOpts.password).length > 0);
+  const routingTemplate = getRoutingKeyTemplate();
+  const resolvedChannel =
+    resolveRoutingKey(routingTemplate, state.branchId) || state.channel || "";
   return {
     ...state,
+    channel: resolvedChannel,
     rabbitHost: rabbitOpts.host,
     rabbitPort: rabbitOpts.port,
     rabbitUsername: rabbitOpts.username,
     rabbitExchange: rabbitOpts.exchange,
+    rabbitRoutingKey: routingTemplate,
     rabbitAuthConfigured,
     appVersion: app.getVersion(),
     userDataPath: app.getPath("userData"),
@@ -1310,6 +1352,16 @@ ipcMain.handle("restart-system", async () => {
 
 ipcMain.handle("set-branch-id", async (_e, rawId) => {
   const id = String(rawId ?? "").trim();
+  if (id === "") {
+    state.branchId = "";
+    state.channel = "";
+    saveUserConfig({ branch_id: "" });
+    log("Branch ID cleared — set a branch before consuming orders.", "📌");
+    pushState();
+    resetRabbitReconnectBackoff();
+    await startRabbit();
+    return { ok: true, branchId: "", channel: "" };
+  }
   if (!/^\d+$/.test(id)) {
     return { ok: false, error: "Branch ID must be a positive number." };
   }
@@ -1412,6 +1464,7 @@ ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
   const portRaw = opts?.port;
   const username = opts?.username != null ? String(opts.username).trim() : "";
   const exchange = opts?.exchange != null ? String(opts.exchange).trim() : "";
+  const routingKey = opts?.routingKey != null ? String(opts.routingKey).trim() : "";
   const passwordMode = opts?.passwordMode || "keep";
   const passwordNew = opts?.passwordNew != null ? String(opts.passwordNew) : "";
 
@@ -1428,11 +1481,20 @@ ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
   if (!exchange) {
     return { ok: false, error: "Exchange is required." };
   }
+  if (!routingKey) {
+    return { ok: false, error: "Routing key is required (e.g. orders.{branch_id} or branch.{branch_id})." };
+  }
   if (passwordMode === "set" && !String(passwordNew).trim()) {
     return { ok: false, error: "Enter a new password, or turn off “Set new password”." };
   }
 
-  const patch = { rabbit_host: host, rabbit_port: port, rabbit_username: username, rabbit_exchange: exchange };
+  const patch = {
+    rabbit_host: host,
+    rabbit_port: port,
+    rabbit_username: username,
+    rabbit_exchange: exchange,
+    rabbit_routing_key: routingKey,
+  };
   if (passwordMode === "clear") {
     patch.rabbit_password = "";
   } else if (passwordMode === "set") {
@@ -1440,6 +1502,7 @@ ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
   }
 
   saveUserConfig(patch);
+  state.channel = resolveRoutingKey(routingKey, state.branchId);
   log(`RabbitMQ settings saved (${host}:${port}) — reconnecting…`, "⚙️");
   resetRabbitReconnectBackoff();
   await startRabbit();
@@ -1690,9 +1753,12 @@ async function pollPrinters() {
 
 // ─── RabbitMQ ─────────────────────────────────────────────────────────────────
 function getRoutingForBranch(id) {
+  const branch = String(id || "").trim();
+  const routingKey = resolveRoutingKey(getRoutingKeyTemplate(), branch);
+  const queueName = branch ? `printer.Branch.${branch}` : "";
   return {
-    routingKey: `branch.${id}`,
-    queueName: `printer.Branch.${id}`,
+    routingKey,
+    queueName,
   };
 }
 
@@ -1735,7 +1801,7 @@ function probeRabbitHostReachable() {
  * so we do not wait out a long exponential delay after a brief outage.
  */
 function forceRabbitReconnect(reason) {
-  if (app.isQuiting || !isRabbitBrokerConfigured()) return;
+  if (app.isQuiting || !isRabbitReadyToConsume()) return;
   if (state.rabbitmq === "connected" || state.rabbitmq === "connecting") return;
   const now = Date.now();
   if (now - lastForceReconnectAt < FORCE_RECONNECT_DEBOUNCE_MS) return;
@@ -1753,7 +1819,7 @@ function forceRabbitReconnect(reason) {
 
 function scheduleRabbitReconnect() {
   if (app.isQuiting || rabbitReconnectTimer) return;
-  if (!isRabbitBrokerConfigured()) return;
+  if (!isRabbitReadyToConsume()) return;
   state.rabbitmq = "error";
   pushState();
   const online = isNetworkLikelyOnline();
@@ -1783,7 +1849,7 @@ function setupNetworkOnlineMonitor() {
   lastKnownOnline = isNetworkLikelyOnline();
 
   networkMonitorTimer = setInterval(async () => {
-    if (app.isQuiting || !isRabbitBrokerConfigured()) return;
+    if (app.isQuiting || !isRabbitReadyToConsume()) return;
 
     const online = isNetworkLikelyOnline();
     const wasOnline = lastKnownOnline;
@@ -1864,18 +1930,39 @@ async function startRabbit() {
   const rabbitOpts = buildRabbitOptions();
   if (!rabbitOpts.configured) {
     state.rabbitmq = "idle";
-    const { routingKey } = getRoutingForBranch(state.branchId);
-    state.channel = routingKey;
+    state.channel = resolveRoutingKey(getRoutingKeyTemplate(), state.branchId);
     pushState();
     log("RabbitMQ broker host not configured — set connection in Settings when ready.", "ℹ️");
     return;
   }
 
-  state.rabbitmq = "connecting";
-  pushState();
+  if (!String(state.branchId || "").trim()) {
+    state.rabbitmq = "idle";
+    state.channel = "";
+    pushState();
+    log("Branch ID not set — set Branch in Settings before consuming orders.", "ℹ️");
+    return;
+  }
+
+  if (!String(rabbitOpts.exchange || "").trim()) {
+    state.rabbitmq = "idle";
+    pushState();
+    log("RabbitMQ exchange not set — set Exchange in Settings.", "ℹ️");
+    return;
+  }
 
   const { routingKey, queueName } = getRoutingForBranch(state.branchId);
+  if (!routingKey || !queueName) {
+    state.rabbitmq = "idle";
+    state.channel = routingKey || "";
+    pushState();
+    log("Routing key not set — set Routing key in Settings (e.g. orders.{branch_id}).", "ℹ️");
+    return;
+  }
+
+  state.rabbitmq = "connecting";
   state.channel = routingKey;
+  pushState();
 
   try {
     const connection = await amqp.connect(rabbitOpts.url, {
@@ -1994,9 +2081,9 @@ function extractPdfBase64FromPayload(data) {
 
 async function applyBranchId(id) {
   state.branchId = id;
-  state.channel = `branch.${id}`;
+  state.channel = resolveRoutingKey(getRoutingKeyTemplate(), id);
   saveUserConfig({ branch_id: id });
-  log(`Branch ID set to ${id} — listening on ${state.channel}`, "📌");
+  log(`Branch ID set to ${id} — listening on ${state.channel || "(set routing key)"}`, "📌");
   pushState();
   resetRabbitReconnectBackoff();
   await startRabbit();
@@ -2329,7 +2416,11 @@ if (!gotSingleInstanceLock) {
     showWindow();
 
     log("Tawla Print Agent started.", "🚀");
-    log(`Branch ID: ${state.branchId} — listening on ${state.channel}`, "📌");
+    if (state.branchId) {
+      log(`Branch ID: ${state.branchId} — listening on ${state.channel || "(set routing key)"}`, "📌");
+    } else {
+      log("Branch ID not set — configure Branch and RabbitMQ in Settings.", "📌");
+    }
     await startRabbit();
     await pollPrinters();
     // Some USB/network printers appear a moment after app start/login.
