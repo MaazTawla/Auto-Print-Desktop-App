@@ -54,7 +54,7 @@ If Windows disk space runs low, you may get a **notification** and see a message
 
 ## Technical overview (operators & support)
 
-- **Transport**: RabbitMQ — exchange and routing key are configured in Settings (routing key may use `{branch_id}`, e.g. `orders.{branch_id}`). Queue name is `printer.Branch.<branch_id>`. Order payloads may include inline `pdf_base64` (preferred) and/or `file_path` / URL; the agent uses base64 first and falls back to downloading `file_path` if base64 is missing or invalid.
+- **Transport**: RabbitMQ — exchange and routing key are configured in Settings (routing key may use `{branch_id}`, e.g. `orders.{branch_id}`). Queue name is `printer.Branch.<branch_id>`. The shared queue uses **single active consumer** so desktop and Android (or two PCs) can both stay connected while only one agent receives each order; the standby takes over if the active one disconnects. If an older queue exists without that flag, the agent recreates it once on connect. Order payloads may include inline `pdf_base64` (preferred) and/or `file_path` / URL; the agent uses base64 first and falls back to downloading `file_path` if base64 is missing or invalid.
 - **First install**: Branch ID and RabbitMQ fields start empty (no silent prefills). Configure them in Settings before the agent will consume.
 - **Reconnect**: Automatic on broker/network issues, consumer cancellation, and failed health checks. While disconnected, the agent polls OS online state and probes the broker host so it reconnects **as soon as the network (or broker) is reachable again**, instead of waiting out a long backoff. Backoff starts at ~1s (cap 15s online / 30s offline). Health checks run every 5s; connect timeout is 10s.
 - **Sleep / lock**: Debounced refresh after **resume** or **screen unlock** so RabbitMQ and printer lists recover.
@@ -85,7 +85,17 @@ Auto Printing/
 ```bash
 npm install
 npm start          # development
-npm run dist       # Windows NSIS installer → dist/
+npm run dist       # Windows zip → dist/ (works on Apple Silicon)
+npm run dist:nsis  # Windows NSIS Setup.exe (needs Rosetta on Apple Silicon, or a Windows PC)
 ```
 
 Printing and spooler tracking target **Windows** (`pdf-to-printer` + PowerShell).
+
+**Building on Apple Silicon:** electron-builder’s Wine/`rcedit` and NSIS `makensis` are Intel binaries. This project sets `signAndEditExecutable: false` so packaging does not need Wine. `npm run dist` produces a **zip** (no `makensis`). For the classic **Setup.exe**, either:
+
+1. Install Rosetta, then run `npm run dist:nsis`:
+   ```bash
+   softwareupdate --install-rosetta --agree-to-license
+   npm run dist:nsis
+   ```
+2. Or build on a Windows machine / CI Windows runner.

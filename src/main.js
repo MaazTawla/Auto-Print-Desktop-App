@@ -1125,6 +1125,10 @@ let rabbitConsumerTag = null;
 let rabbitReconnectTimer = null;
 let rabbitHealthTimer = null;
 let rabbitReconnectAttempt = 0;
+/** Suppress reconnect handlers while startRabbit is declaring / migrating the queue. */
+let rabbitStarting = false;
+/** Serialize startRabbit so Settings save + reconnect don't race-migrate. */
+let rabbitStartChain = Promise.resolve();
 let networkMonitorTimer = null;
 let networkMonitorInstalled = false;
 let lastKnownOnline = null;
@@ -1271,10 +1275,17 @@ function setupCrashRestartGuards() {
   }
 
   process.on("uncaughtException", (err) => {
+    try {
+      log("Uncaught error (agent will restart if enabled): " + (err && err.message ? err.message : String(err)), "❌");
+    } catch (_) {}
     maybeRelaunch("uncaughtException", err);
   });
 
   process.on("unhandledRejection", (reason) => {
+    const detail = reason && reason.message ? reason.message : String(reason);
+    try {
+      log("Unhandled promise rejection (agent will restart if enabled): " + detail, "❌");
+    } catch (_) {}
     maybeRelaunch("unhandledRejection", reason);
   });
 
@@ -1766,51 +1777,149 @@ function getRoutingForBranch(id) {
 
 function isInequivalentArgError(err) {
   const msg = err && err.message ? String(err.message) : String(err);
-  return /PRECONDITION_FAILED/i.test(msg) && /inequivalent/i.test(msg);
+  return /PRECONDITION_FAILED|inequivalent arg/i.test(msg);
+}
+
+/** Queue exists without SAC; we need to recreate it with SAC. */
+function isQueueMissingSingleActiveConsumer(err) {
+  const msg = err && err.message ? String(err.message) : String(err);
+  // Match wrapped forms: "Connection closed (Error: Channel closed by server: 406 … current is none)"
+  return (
+    /x-single-active-consumer/i.test(msg) &&
+    /current is none/i.test(msg)
+  );
 }
 
 function wireRabbitChannel(channel) {
   channel.on("error", (err) => {
-    if (channel !== rabbitChannel) return;
+    if (channel !== rabbitChannel || rabbitStarting) return;
     log("RabbitMQ channel error: " + err.message, "❌");
     scheduleRabbitReconnect();
   });
   channel.on("close", () => {
-    if (channel !== rabbitChannel || app.isQuiting) return;
+    if (channel !== rabbitChannel || app.isQuiting || rabbitStarting) return;
     scheduleRabbitReconnect();
   });
 }
 
-/**
- * Declare the shared branch queue. Prefer single-active-consumer so a second
- * agent (Android or another PC) stays on standby instead of splitting orders.
- * Existing queues created without that argument keep competing-consumer mode.
- */
-async function assertSharedPrintQueue(connection, channel, queueName, exchange, routingKey) {
+const SHARED_QUEUE_ARGS = {
+  durable: true,
+  arguments: { "x-single-active-consumer": true },
+};
+
+/** After a failed SAC migrate, fall back to durable-only so the agent still connects. */
+let sharedQueuePreferSac = true;
+
+/** Short-lived broker connection for queue setup/migration. */
+async function withTempRabbitChannel(fn) {
+  const opts = buildRabbitOptions();
+  const connection = await amqp.connect(opts.url, {
+    timeout: RABBIT_CONNECT_TIMEOUT_MS,
+  });
+  // amqplib emits "error" on 406 channel failures — without a listener Node
+  // crashes (uncaughtException → restart-on-crash loop every few seconds).
+  connection.on("error", () => {});
+  connection.on("close", () => {});
   try {
-    await channel.assertQueue(queueName, {
-      durable: true,
-      arguments: { "x-single-active-consumer": true },
+    const channel = await connection.createChannel();
+    channel.on("error", () => {});
+    channel.on("close", () => {});
+    try {
+      return await fn(channel);
+    } finally {
+      try {
+        await channel.close();
+      } catch (_) {}
+    }
+  } finally {
+    try {
+      await connection.close();
+    } catch (_) {}
+  }
+}
+
+/**
+ * Recreate printer.Branch.* with single-active-consumer.
+ * Must use a clean connection: a failed SAC assert closes the channel and often
+ * poisons the connection, so delete/recreate on the same connection fails.
+ * Steps: assert durable (matches old queue) → delete → assert with SAC → bind.
+ */
+async function migrateQueueToSingleActiveConsumer(queueName, exchange, routingKey) {
+  log(
+    `Queue ${queueName} was created without single-active-consumer — recreating so both apps can connect with only one printing.`,
+    "⚠️"
+  );
+  await withTempRabbitChannel(async (ch) => {
+    await ch.assertExchange(exchange, "topic", { durable: true });
+    try {
+      // Match the existing queue (no SAC) so declare succeeds, then delete it.
+      await ch.assertQueue(queueName, { durable: true });
+      await ch.deleteQueue(queueName);
+    } catch (err) {
+      if (/NOT_FOUND/i.test(String(err && err.message))) {
+        // Nothing to delete.
+      } else if (
+        /x-single-active-consumer/i.test(String(err && err.message)) &&
+        /received.*none|current is true/i.test(String(err && err.message))
+      ) {
+        // Already SAC — just bind.
+        await ch.bindQueue(queueName, exchange, routingKey);
+        return;
+      } else {
+        throw err;
+      }
+    }
+    await ch.assertQueue(queueName, SHARED_QUEUE_ARGS);
+    await ch.bindQueue(queueName, exchange, routingKey);
+  });
+  log(
+    `Queue ${queueName} recreated with single active consumer — connect both apps; only the active one prints.`,
+    "✅"
+  );
+}
+
+/**
+ * Ensure the shared branch queue exists (prefer SAC), then bind.
+ * Uses a temporary connection so a 406 never poisons the consumer connection.
+ */
+async function ensureSharedPrintQueue(queueName, exchange, routingKey) {
+  sharedQueuePreferSac = true;
+  try {
+    await withTempRabbitChannel(async (ch) => {
+      await ch.assertExchange(exchange, "topic", { durable: true });
+      await ch.assertQueue(queueName, SHARED_QUEUE_ARGS);
+      await ch.bindQueue(queueName, exchange, routingKey);
     });
-    await channel.bindQueue(queueName, exchange, routingKey);
     log(
-      `Queue ${queueName} using single active consumer — a second agent on this queue stays on standby.`,
+      `Queue ${queueName} — single active consumer on; second agent stays on standby (one print per order).`,
       "ℹ️"
     );
-    return channel;
+    return;
   } catch (err) {
-    if (!isInequivalentArgError(err)) throw err;
-    rabbitChannel = null;
-    const next = await connection.createChannel();
-    rabbitChannel = next;
-    await next.prefetch(1);
-    await next.assertQueue(queueName, { durable: true });
-    await next.bindQueue(queueName, exchange, routingKey);
+    if (!isQueueMissingSingleActiveConsumer(err) && !isInequivalentArgError(err)) {
+      throw err;
+    }
+    if (
+      !isQueueMissingSingleActiveConsumer(err) &&
+      !/x-single-active-consumer/i.test(String(err && err.message))
+    ) {
+      throw err;
+    }
+  }
+
+  try {
+    await migrateQueueToSingleActiveConsumer(queueName, exchange, routingKey);
+  } catch (migErr) {
+    sharedQueuePreferSac = false;
     log(
-      `Queue ${queueName} already exists — sharing it so each order is delivered to only one agent.`,
-      "ℹ️"
+      `Could not enable single-active-consumer (${migErr.message || migErr}). Connecting in shared-queue mode — same queue still means one print per order, but work may split across apps.`,
+      "⚠️"
     );
-    return next;
+    await withTempRabbitChannel(async (ch) => {
+      await ch.assertExchange(exchange, "topic", { durable: true });
+      await ch.assertQueue(queueName, { durable: true });
+      await ch.bindQueue(queueName, exchange, routingKey);
+    });
   }
 }
 
@@ -1854,6 +1963,7 @@ function probeRabbitHostReachable() {
  */
 function forceRabbitReconnect(reason) {
   if (app.isQuiting || !isRabbitReadyToConsume()) return;
+  if (rabbitStarting) return;
   if (state.rabbitmq === "connected" || state.rabbitmq === "connecting") return;
   const now = Date.now();
   if (now - lastForceReconnectAt < FORCE_RECONNECT_DEBOUNCE_MS) return;
@@ -1978,112 +2088,123 @@ async function stopRabbit() {
 }
 
 async function startRabbit() {
-  await stopRabbit();
-  const rabbitOpts = buildRabbitOptions();
-  if (!rabbitOpts.configured) {
-    state.rabbitmq = "idle";
-    state.channel = resolveRoutingKey(getRoutingKeyTemplate(), state.branchId);
+  const run = async () => {
+    await stopRabbit();
+    const rabbitOpts = buildRabbitOptions();
+    if (!rabbitOpts.configured) {
+      state.rabbitmq = "idle";
+      state.channel = resolveRoutingKey(getRoutingKeyTemplate(), state.branchId);
+      pushState();
+      log("RabbitMQ broker host not configured — set connection in Settings when ready.", "ℹ️");
+      return;
+    }
+
+    if (!String(state.branchId || "").trim()) {
+      state.rabbitmq = "idle";
+      state.channel = "";
+      pushState();
+      log("Branch ID not set — set Branch in Settings before consuming orders.", "ℹ️");
+      return;
+    }
+
+    if (!String(rabbitOpts.exchange || "").trim()) {
+      state.rabbitmq = "idle";
+      pushState();
+      log("RabbitMQ exchange not set — set Exchange in Settings.", "ℹ️");
+      return;
+    }
+
+    const { routingKey, queueName } = getRoutingForBranch(state.branchId);
+    if (!routingKey || !queueName) {
+      state.rabbitmq = "idle";
+      state.channel = routingKey || "";
+      pushState();
+      log("Routing key not set — set Routing key in Settings (e.g. orders.{branch_id}).", "ℹ️");
+      return;
+    }
+
+    state.rabbitmq = "connecting";
+    state.channel = routingKey;
     pushState();
-    log("RabbitMQ broker host not configured — set connection in Settings when ready.", "ℹ️");
-    return;
-  }
+    rabbitStarting = true;
 
-  if (!String(state.branchId || "").trim()) {
-    state.rabbitmq = "idle";
-    state.channel = "";
-    pushState();
-    log("Branch ID not set — set Branch in Settings before consuming orders.", "ℹ️");
-    return;
-  }
+    try {
+      // Migrate/declare SAC on a throwaway connection first — a 406 must not
+      // poison the long-lived consumer connection.
+      await ensureSharedPrintQueue(queueName, rabbitOpts.exchange, routingKey);
 
-  if (!String(rabbitOpts.exchange || "").trim()) {
-    state.rabbitmq = "idle";
-    pushState();
-    log("RabbitMQ exchange not set — set Exchange in Settings.", "ℹ️");
-    return;
-  }
+      const connection = await amqp.connect(rabbitOpts.url, {
+        timeout: RABBIT_CONNECT_TIMEOUT_MS,
+      });
+      rabbitConnection = connection;
+      connection.on("error", (err) => {
+        if (connection !== rabbitConnection || rabbitStarting) return;
+        log("RabbitMQ connection error: " + err.message, "❌");
+        scheduleRabbitReconnect();
+      });
+      connection.on("close", () => {
+        if (connection !== rabbitConnection || app.isQuiting || rabbitStarting) return;
+        log("RabbitMQ disconnected — restarting...", "⚠️");
+        scheduleRabbitReconnect();
+      });
 
-  const { routingKey, queueName } = getRoutingForBranch(state.branchId);
-  if (!routingKey || !queueName) {
-    state.rabbitmq = "idle";
-    state.channel = routingKey || "";
-    pushState();
-    log("Routing key not set — set Routing key in Settings (e.g. orders.{branch_id}).", "ℹ️");
-    return;
-  }
+      const channel = await connection.createChannel();
+      rabbitChannel = channel;
 
-  state.rabbitmq = "connecting";
-  state.channel = routingKey;
-  pushState();
+      await channel.prefetch(1);
+      await channel.assertExchange(rabbitOpts.exchange, "topic", { durable: true });
+      // Do not re-assert queue args here — ensureSharedPrintQueue already did.
+      // Re-asserting SAC against a durable-only fallback would 406 again.
+      await channel.checkQueue(queueName);
+      await channel.bindQueue(queueName, rabbitOpts.exchange, routingKey);
+      wireRabbitChannel(channel);
 
-  try {
-    const connection = await amqp.connect(rabbitOpts.url, {
-      timeout: RABBIT_CONNECT_TIMEOUT_MS,
-    });
-    rabbitConnection = connection;
-    connection.on("error", (err) => {
-      if (connection !== rabbitConnection) return;
-      log("RabbitMQ connection error: " + err.message, "❌");
-      scheduleRabbitReconnect();
-    });
-    connection.on("close", () => {
-      if (connection !== rabbitConnection || app.isQuiting) return;
-      log("RabbitMQ disconnected — restarting...", "⚠️");
-      scheduleRabbitReconnect();
-    });
-
-    let channel = await connection.createChannel();
-    rabbitChannel = channel;
-
-    await channel.prefetch(1);
-    await channel.assertExchange(rabbitOpts.exchange, "topic", { durable: true });
-    channel = await assertSharedPrintQueue(
-      connection,
-      channel,
-      queueName,
-      rabbitOpts.exchange,
-      routingKey
-    );
-    rabbitChannel = channel;
-    wireRabbitChannel(channel);
-
-    const consumed = await channel.consume(queueName, async (msg) => {
-      if (!msg) {
-        if (channel === rabbitChannel && !app.isQuiting) {
-          log("RabbitMQ consumer cancelled by broker — reconnecting...", "⚠️");
-          scheduleRabbitReconnect();
+      const consumed = await channel.consume(queueName, async (msg) => {
+        if (!msg) {
+          if (channel === rabbitChannel && !app.isQuiting) {
+            log("RabbitMQ consumer cancelled by broker — reconnecting...", "⚠️");
+            scheduleRabbitReconnect();
+          }
+          return;
         }
-        return;
-      }
-      const message = msg.content ? msg.content.toString("utf8") : "";
-      const outcome = await handleMessage(routingKey, message);
-      if (channel !== rabbitChannel) return;
-      try {
-        if (outcome === "ack") channel.ack(msg);
-        else if (outcome === "reject") channel.nack(msg, false, false);
-        else channel.nack(msg, false, true);
-      } catch (_) {
-        // Channel may close between message handling and ack/nack.
-      }
-    });
-    rabbitConsumerTag = consumed.consumerTag;
+        const message = msg.content ? msg.content.toString("utf8") : "";
+        const outcome = await handleMessage(routingKey, message);
+        if (channel !== rabbitChannel) return;
+        try {
+          if (outcome === "ack") channel.ack(msg);
+          else if (outcome === "reject") channel.nack(msg, false, false);
+          else channel.nack(msg, false, true);
+        } catch (_) {
+          // Channel may close between message handling and ack/nack.
+        }
+      });
+      rabbitConsumerTag = consumed.consumerTag;
 
-    state.rabbitmq = "connected";
-    resetRabbitReconnectBackoff();
-    lastKnownOnline = true;
-    ensureRabbitHealthCheck();
-    log("RabbitMQ connected.", "✅");
-    log(
-      `Consuming shared queue ${queueName} via ${rabbitOpts.exchange} (${routingKey}). Each order is delivered to only one agent.`,
-      "📡"
-    );
-    pushState();
-  } catch (err) {
-    state.rabbitmq = "error";
-    log("RabbitMQ start failed: " + err.message, "❌");
-    pushState();
-    scheduleRabbitReconnect();
-  }
+      state.rabbitmq = "connected";
+      resetRabbitReconnectBackoff();
+      lastKnownOnline = true;
+      ensureRabbitHealthCheck();
+      log("RabbitMQ connected.", "✅");
+      log(
+        sharedQueuePreferSac
+          ? `Consuming ${queueName} via ${rabbitOpts.exchange} (${routingKey}) with single active consumer — both apps may connect; only one prints.`
+          : `Consuming ${queueName} via ${rabbitOpts.exchange} (${routingKey}) — shared queue (one delivery per order).`,
+        "📡"
+      );
+      pushState();
+    } catch (err) {
+      state.rabbitmq = "error";
+      log("RabbitMQ start failed: " + err.message, "❌");
+      pushState();
+      scheduleRabbitReconnect();
+    } finally {
+      rabbitStarting = false;
+    }
+  };
+
+  const next = rabbitStartChain.then(run, run);
+  rabbitStartChain = next.catch(() => {});
+  return next;
 }
 
 /** Order id from broker JSON — snake_case or camelCase. */
