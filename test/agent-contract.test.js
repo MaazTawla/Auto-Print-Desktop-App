@@ -89,6 +89,17 @@ describe("agent-contract v1.0", () => {
     assert.equal(parsed.rabbitConfig.queue_durable, true);
     assert.equal(parsed.rabbitConfig.queue_arguments["x-single-active-consumer"], true);
     assert.equal(parsed.rabbitConfig.hasBrokerCreds, true);
+    assert.equal(parsed.pdf_host, null);
+
+    const withPdfHost = parseRegisterResponse({
+      token: "tok2",
+      is_print_host: true,
+      host_epoch: 1,
+      branch_id: 1,
+      pdf_host: "https://api.tawla.io",
+      rabbit: { queue: "q1" },
+    });
+    assert.equal(withPdfHost.pdf_host, "https://api.tawla.io");
 
     const withQueue = normalizeRabbitConfig({ queue: "custom.q" }, 9);
     assert.equal(withQueue.queue, "custom.q");

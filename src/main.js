@@ -23,6 +23,17 @@ const { watchWindowsPrintJob } = require("./print-job-tracker");
 const { createPrintJobsStore } = require("./print-jobs-store");
 const { createStationPrintingController } = require("./station-printing");
 const { ASSUMPTIONS: STATION_PRINT_ASSUMPTIONS, verifyPdfChecksum, classifyPdfUrlHttpStatus, ERROR_CODES: STATION_ERROR_CODES } = require("./agent-contract");
+const {
+  buildPdfAxiosConfig,
+  isPdfTooLargeError,
+  DEFAULT_MAX_PDF_BYTES,
+} = require("./pdf-fetch-policy");
+const {
+  migrateAndLoadSecrets,
+  sealSecretsForPersist,
+  SECRET_KEYS,
+} = require("./secure-store");
+const { createProcessedJobsStore } = require("./processed-jobs");
 
 /** Delays after failed attempts 1, 2, 3 before attempts 2, 3, 4 (exponential-style backoff). */
 const RETRY_DELAYS_MS = [5000, 30000, 60000];
@@ -45,6 +56,7 @@ function clampRetentionDays(raw, fallback) {
 }
 
 let jobsStore = null;
+let processedJobsStore = null;
 const pendingRetries = new Map();
 /** Warn when free space below this or below DISK_WARN_PERCENT_FREE. */
 const DISK_WARN_BYTES = 500 * 1024 * 1024;
@@ -54,6 +66,15 @@ const DISK_WARN_PERCENT_FREE = 5;
 function getJobsStore() {
   if (!jobsStore) jobsStore = createPrintJobsStore(app.getPath("userData"));
   return jobsStore;
+}
+
+function getProcessedJobs() {
+  if (!processedJobsStore) {
+    processedJobsStore = createProcessedJobsStore({
+      filePath: path.join(app.getPath("userData"), "processed-jobs.json"),
+    });
+  }
+  return processedJobsStore;
 }
 
 function syncJobsToState() {
@@ -78,18 +99,43 @@ function derivePdfBasename(filePath, isUrl) {
   return `order-${Date.now()}.pdf`;
 }
 
-async function fetchPdfUrl(url, authToken) {
-  const headers = {};
-  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+async function fetchPdfUrl(url, authToken, opts = {}) {
+  const cfg = readUserConfig();
+  let apiBase = opts.apiBase || cfg.agent_api_base || "";
   try {
-    return await axios.get(url, {
-      responseType: "arraybuffer",
-      timeout: 120000,
-      headers,
-      validateStatus: () => true,
-    });
+    if (!apiBase && getStationPrinting().api && typeof getStationPrinting().api.getApiBase === "function") {
+      apiBase = getStationPrinting().api.getApiBase() || "";
+    }
+  } catch (_) {}
+  const pdfHost = opts.pdfHost || cfg.pdf_host || null;
+  const built = buildPdfAxiosConfig({
+    pdfUrl: url,
+    authToken,
+    pdfHost,
+    apiBase,
+    allowedPdfHosts: opts.allowedPdfHosts,
+    maxBytes: opts.maxBytes != null ? opts.maxBytes : DEFAULT_MAX_PDF_BYTES,
+  });
+  if (built.sendAuth) {
+    log(
+      `PDF fetch: Bearer attached (host ${built.decision.origin} matches pdf_host allowlist).`,
+      "🔒"
+    );
+  } else {
+    log(
+      `PDF fetch: Bearer withheld (${built.decision.reason}${built.decision.origin ? "; origin=" + built.decision.origin : ""}).`,
+      "🔒"
+    );
+  }
+  try {
+    return await axios.get(built.url, built.axiosConfig);
   } catch (err) {
-    // Network errors — rethrow as-is (not URL expiry)
+    if (isPdfTooLargeError(err)) {
+      const tooLarge = new Error(STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE");
+      tooLarge.code = STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE";
+      tooLarge.retryable = false;
+      throw tooLarge;
+    }
     throw err;
   }
 }
@@ -110,14 +156,21 @@ async function saveIncomingPdf(store, jobId, filePath, isUrl, opts = {}) {
   const authToken = opts.authToken != null ? opts.authToken : null;
   try {
     if (isUrl) {
-      const res = await fetchPdfUrl(filePath, authToken);
+      const res = await fetchPdfUrl(filePath, authToken, opts);
       if (classifyPdfUrlHttpStatus(res.status).expired) {
         throw pdfUrlExpiredError(res.status);
       }
       if (res.status < 200 || res.status >= 300) {
         throw new Error(`PDF download failed (HTTP ${res.status})`);
       }
-      fs.writeFileSync(dest, Buffer.from(res.data));
+      const buf = Buffer.from(res.data);
+      if (buf.length > DEFAULT_MAX_PDF_BYTES) {
+        const tooLarge = new Error(STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE");
+        tooLarge.code = STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE";
+        tooLarge.retryable = false;
+        throw tooLarge;
+      }
+      fs.writeFileSync(dest, buf);
     } else {
       const resolved = path.resolve(filePath);
       if (!fs.existsSync(resolved)) throw new Error("Local PDF not found: " + resolved);
@@ -132,14 +185,21 @@ async function saveIncomingPdf(store, jobId, filePath, isUrl, opts = {}) {
         throw new Error("Disk full — could not save PDF. Freed old logs/jobs; free more space and retry.");
       }
       if (isUrl) {
-        const res = await fetchPdfUrl(filePath, authToken);
+        const res = await fetchPdfUrl(filePath, authToken, opts);
         if (classifyPdfUrlHttpStatus(res.status).expired) {
           throw pdfUrlExpiredError(res.status);
         }
         if (res.status < 200 || res.status >= 300) {
           throw new Error(`PDF download failed (HTTP ${res.status})`);
         }
-        fs.writeFileSync(dest, Buffer.from(res.data));
+        const buf = Buffer.from(res.data);
+        if (buf.length > DEFAULT_MAX_PDF_BYTES) {
+          const tooLarge = new Error(STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE");
+          tooLarge.code = STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE";
+          tooLarge.retryable = false;
+          throw tooLarge;
+        }
+        fs.writeFileSync(dest, buf);
       } else {
         const resolved = path.resolve(filePath);
         fs.copyFileSync(resolved, dest);
@@ -211,21 +271,18 @@ function clearRetryTimer(jobId) {
   pendingRetries.delete(jobId);
 }
 
-function moveJobToDlq(jobId, errMsg) {
-  try {
-    const j = getJobsStore().findById(jobId);
-    if (j && j.serverJobId) {
-      getStationPrinting()
-        .ackFailed(j.serverJobId, errMsg || "print_failed", {
-          printerExternalId: j.printerExternalId || null,
-        })
-        .catch(() => {});
-    }
-  } catch (_) {}
-  clearRetryTimer(jobId);
+async function moveJobToDlq(jobId, errMsg) {
   const store = getJobsStore();
   const job = store.findById(jobId);
-  if (!job) return;
+  if (!job) return "dlq";
+  clearRetryTimer(jobId);
+  if (job.serverJobId) {
+    try {
+      await getStationPrinting().ackFailed(job.serverJobId, errMsg || "print_failed", {
+        printerExternalId: job.printerExternalId || null,
+      });
+    } catch (_) {}
+  }
   const dlqName = `${job.id}_${job.file}`;
   const dest = store.moveFileToDlq(job.localPath, dlqName);
   store.upsert({
@@ -238,6 +295,7 @@ function moveJobToDlq(jobId, errMsg) {
   syncJobsToState();
   pushState();
   log(`Dead letter queue: ${job.file} — ${errMsg}`, "❌");
+  return "dlq";
 }
 
 function resolveDlqSourcePath(job) {
@@ -624,15 +682,14 @@ async function ensureSpaceForIncomingPdf() {
   }
 }
 
-function onPrintFailure(jobId, errMsg) {
+async function onPrintFailure(jobId, errMsg) {
   const store = getJobsStore();
   const job = store.findById(jobId);
-  if (!job) return;
+  if (!job) return "missing";
 
   const attemptJustFinished = job.attemptNumber || 0;
   if (attemptJustFinished >= MAX_ATTEMPTS) {
-    moveJobToDlq(jobId, errMsg);
-    return;
+    return moveJobToDlq(jobId, errMsg);
   }
 
   const delay = RETRY_DELAYS_MS[attemptJustFinished - 1];
@@ -651,17 +708,21 @@ function onPrintFailure(jobId, errMsg) {
   );
 
   clearRetryTimer(jobId);
-  const t = setTimeout(() => {
-    pendingRetries.delete(jobId);
-    runPrintAttempt(jobId);
-  }, delay);
-  pendingRetries.set(jobId, t);
+  // Await retry so Rabbit ack-after-print can wait for the full attempt cycle.
+  await new Promise((resolve) => {
+    const t = setTimeout(resolve, delay);
+    pendingRetries.set(jobId, t);
+  });
+  pendingRetries.delete(jobId);
+  return runPrintAttempt(jobId);
 }
 
 async function runPrintAttempt(jobId) {
   const store = getJobsStore();
   const job = store.findById(jobId);
-  if (!job || job.status === "completed" || job.status === "dlq") return;
+  if (!job || job.status === "completed" || job.status === "dlq") {
+    return job && job.status ? job.status : "missing";
+  }
 
   const printerName = (job.printerName && String(job.printerName).trim()) || state.defaultPrinter;
   if (!printerName) {
@@ -671,17 +732,16 @@ async function runPrintAttempt(jobId) {
     log(`Job ${job.file}: no default printer — cannot print.`, "❌");
     if (job.serverJobId) {
       try {
-        getStationPrinting().ackFailed(job.serverJobId, "no_printer", {
+        await getStationPrinting().ackFailed(job.serverJobId, "no_printer", {
           printerExternalId: job.printerExternalId || null,
         });
       } catch (_) {}
     }
-    return;
+    return "failed-setup";
   }
 
   if (!job.localPath || !fs.existsSync(job.localPath)) {
-    onPrintFailure(jobId, "Saved PDF missing on disk");
-    return;
+    return onPrintFailure(jobId, "Saved PDF missing on disk");
   }
 
   if (process.platform !== "win32") {
@@ -693,7 +753,16 @@ async function runPrintAttempt(jobId) {
     syncJobsToState();
     pushState();
     log(`Job ${job.file}: printing is only supported on Windows.`, "❌");
-    return;
+    if (job.serverJobId) {
+      try {
+        await getStationPrinting().ackFailed(
+          job.serverJobId,
+          "print_requires_windows",
+          { printerExternalId: job.printerExternalId || null }
+        );
+      } catch (_) {}
+    }
+    return "failed-setup";
   }
 
   const nextAttempt = (job.attemptNumber || 0) + 1;
@@ -746,15 +815,17 @@ async function runPrintAttempt(jobId) {
       };
       log(`Print completed: ${j.file}`, "🖨️");
       if (j.serverJobId) {
-        getStationPrinting()
-          .ackPrinted(j.serverJobId, {
+        try {
+          await getStationPrinting().ackPrinted(j.serverJobId, {
             printerExternalId: j.printerExternalId || null,
-          })
-          .catch((err) => log("Ack printed failed: " + (err.message || String(err)), "⚠️"));
+          });
+        } catch (err) {
+          log("Ack printed failed: " + (err.message || String(err)), "⚠️");
+        }
       }
       syncJobsToState();
       pushState();
-      return;
+      return "completed";
     }
 
     const reason =
@@ -763,9 +834,9 @@ async function runPrintAttempt(jobId) {
         : outcome === "timeout"
           ? "Print job tracking timed out"
           : "Print did not complete successfully";
-    onPrintFailure(jobId, reason);
+    return onPrintFailure(jobId, reason);
   } catch (err) {
-    onPrintFailure(jobId, err.message || String(err));
+    return onPrintFailure(jobId, err.message || String(err));
   }
 }
 
@@ -905,7 +976,26 @@ function loadConfig() {
 
 function readUserConfig() {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+    const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+    const { cfg, migrated, persistPatch } = migrateAndLoadSecrets(raw);
+    if (migrated && persistPatch) {
+      try {
+        const sealed = { ...raw, ...persistPatch };
+        for (const key of SECRET_KEYS) {
+          if (Object.prototype.hasOwnProperty.call(persistPatch, key)) {
+            sealed[key] = persistPatch[key];
+          }
+        }
+        fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(sealed, null, 2), "utf8");
+        try {
+          if (typeof log === "function") {
+            log("Migrated agent_token / rabbit_password into Electron safeStorage.", "🔒");
+          }
+        } catch (_) {}
+      } catch (_) {}
+    }
+    return cfg;
   } catch (_) {
     return {};
   }
@@ -920,8 +1010,13 @@ function saveUserConfig(partial) {
   if ("print_paper_size" in partial && (partial.print_paper_size === null || String(partial.print_paper_size).trim() === "")) {
     delete next.print_paper_size;
   }
+  if ("queue_precondition_hint" in partial && !partial.queue_precondition_hint) {
+    delete next.queue_precondition_hint;
+  }
+  // Drop decrypted companion noise; sealSecrets writes *_enc and clears plaintext
+  const sealed = sealSecretsForPersist(next);
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf8");
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(sealed, null, 2), "utf8");
 }
 
 const RABBITMQ_HEARTBEAT_SECONDS = 15;
@@ -2095,15 +2190,25 @@ async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
         "ℹ️"
       );
     });
+    try {
+      if (readUserConfig().queue_precondition_hint) {
+        saveUserConfig({ queue_precondition_hint: null });
+      }
+    } catch (_) {}
     return;
   } catch (err) {
     if (!isInequivalentArgError(err)) throw err;
   }
 
-  log(
-    `Queue ${queueName} has incompatible options — migrating to single-active-consumer for Option A print host.`,
-    "⚠️"
-  );
+  // M4: never delete the shared queue on PRECONDITION_FAILED (message-loss risk).
+  // Match Android: passive attach + ops CTA (php artisan printing:redeclare-branch-queues).
+  const hint =
+    `Queue "${queueName}" exists with incompatible arguments (PRECONDITION_FAILED). ` +
+    `The agent will NOT delete it. Ops: php artisan printing:redeclare-branch-queues`;
+  log(hint, "⚠️");
+  try {
+    saveUserConfig({ queue_precondition_hint: hint });
+  } catch (_) {}
 
   const exTypeMigrate =
     (readUserConfig().rabbit_exchange_type &&
@@ -2111,27 +2216,25 @@ async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
     "topic";
   await withTempRabbitChannel(async (ch) => {
     await ch.assertExchange(exchange, exTypeMigrate, { durable: true });
+    // Passive: verify queue exists without changing args
+    await ch.checkQueue(queueName);
     try {
-      await ch.assertQueue(queueName, { durable: true });
-    } catch (_) {}
-    try {
-      await ch.deleteQueue(queueName);
-    } catch (delErr) {
-      if (!/NOT_FOUND/i.test(String(delErr && delErr.message))) {
-        throw delErr;
-      }
+      const keys = await bindBranchQueue(ch, queueName, exchange, routingKey, branchId);
+      log(
+        `Passive attach to existing queue ${queueName} — bound to ${exchange} [${keys.join(", ")}]. Redeclare via artisan when ready.`,
+        "ℹ️"
+      );
+    } catch (bindErr) {
+      log(
+        `Passive queue check ok but bind failed: ${bindErr && bindErr.message ? bindErr.message : String(bindErr)}. Redeclare via artisan.`,
+        "⚠️"
+      );
     }
-    await ch.assertQueue(queueName, queueOpts);
-    const keys = await bindBranchQueue(ch, queueName, exchange, routingKey, branchId);
-    log(
-      `Queue ${queueName} recreated with declare options — bound to ${exchange} [${keys.join(", ")}].`,
-      "✅"
-    );
   });
 }
 
 /** @deprecated Use ensureHostPrintQueue — kept as alias for any external callers. */
-async function ensureSharedPrintQueue(queueName, exchange, routingKey, branchId) {
+async function _ensureSharedPrintQueue(queueName, exchange, routingKey, branchId) {
   return ensureHostPrintQueue(queueName, exchange, routingKey, branchId);
 }
 
@@ -2621,7 +2724,7 @@ async function startRabbit() {
 }
 
 /** Order id from broker JSON — snake_case or camelCase. */
-function extractOrderIdFromPayload(data) {
+function _extractOrderIdFromPayload(data) {
   if (!data || typeof data !== "object") return null;
   const raw =
     data.order_id ??
@@ -2637,7 +2740,7 @@ function extractOrderIdFromPayload(data) {
 }
 
 /** Prefer file_path; accept camelCase aliases used by some publishers. */
-function extractFilePathFromPayload(data) {
+function _extractFilePathFromPayload(data) {
   if (!data || typeof data !== "object") return "";
   const fp =
     data.file_path ??
@@ -2651,7 +2754,7 @@ function extractFilePathFromPayload(data) {
 }
 
 /** Inline PDF from broker — prefer over downloading file_path when present. */
-function extractPdfBase64FromPayload(data) {
+function _extractPdfBase64FromPayload(data) {
   if (!data || typeof data !== "object") return "";
   const raw =
     data.pdf_base64 ??
@@ -2698,6 +2801,14 @@ async function handleMessage(channel, message) {
     const parsed = evaluated.parsed;
     const orderId = parsed.order_id;
     const serverJobId = parsed.job_id;
+    // M3: local dedupe — redelivered job_id already printed/failed → Rabbit ack only
+    if (serverJobId && getProcessedJobs().has(serverJobId)) {
+      log(
+        `job_id=${serverJobId} already processed locally — acking Rabbit without reprint.`,
+        "✅"
+      );
+      return "ack";
+    }
     state.lastOrder = {
       timestamp: new Date().toISOString(),
       channel,
@@ -2717,9 +2828,12 @@ async function handleMessage(channel, message) {
     if (!pdfUrl && !pdfBase64 && !filePath) {
       log("Missing pdf_url / pdf_base64 / file_path in message.", "❌");
       if (serverJobId) {
-        sp.ackFailed(serverJobId, "missing_pdf").catch(() => {});
+        try {
+          await sp.ackFailed(serverJobId, "missing_pdf");
+        } catch (_) {}
+        getProcessedJobs().mark(serverJobId);
       }
-      return "reject";
+      return "ack";
     }
 
     const route = evaluated.route;
@@ -2733,11 +2847,12 @@ async function handleMessage(channel, message) {
     if (!printerName) {
       log("No printer available for this job.", "❌");
       if (serverJobId) {
-        sp.ackFailed(serverJobId, "no_printer", {
-          printerExternalId,
-        }).catch(() => {});
+        try {
+          await sp.ackFailed(serverJobId, "no_printer", { printerExternalId });
+        } catch (_) {}
+        getProcessedJobs().mark(serverJobId);
       }
-      return "reject";
+      return "ack";
     }
 
     const jobId = crypto.randomBytes(8).toString("hex");
@@ -2818,16 +2933,21 @@ async function handleMessage(channel, message) {
           syncJobsToState();
           pushState();
           if (serverJobId) {
-            sp.ackFailed(serverJobId, reason, { printerExternalId }).catch(() => {});
+            try {
+              await sp.ackFailed(serverJobId, reason, { printerExternalId });
+            } catch (_) {}
+            getProcessedJobs().mark(serverJobId);
           }
-          return "reject";
+          return "ack";
         }
       }
     } catch (err) {
       const failReason =
         err && err.code === "PDF_URL_EXPIRED"
           ? "PDF_URL_EXPIRED"
-          : err.message || "save_failed";
+          : err && err.code === "PDF_TOO_LARGE"
+            ? "PDF_TOO_LARGE"
+            : err.message || "save_failed";
       log("Could not save PDF: " + failReason, "❌");
       store.upsert({
         id: jobId,
@@ -2848,12 +2968,18 @@ async function handleMessage(channel, message) {
       syncJobsToState();
       pushState();
       if (serverJobId) {
-        sp.ackFailed(serverJobId, failReason, {
-          printerExternalId,
-          retryable: failReason === "PDF_URL_EXPIRED" ? false : undefined,
-        }).catch(() => {});
+        try {
+          await sp.ackFailed(serverJobId, failReason, {
+            printerExternalId,
+            retryable:
+              failReason === "PDF_URL_EXPIRED" || failReason === "PDF_TOO_LARGE"
+                ? false
+                : undefined,
+          });
+        } catch (_) {}
+        getProcessedJobs().mark(serverJobId);
       }
-      return "reject";
+      return "ack";
     }
 
     const baseFile = path.basename(localPath);
@@ -2876,9 +3002,18 @@ async function handleMessage(channel, message) {
     syncJobsToState();
     pushState();
     const delayNote = parsed.delayed ? " [Delayed]" : "";
+    // Server PDF already renders the Delayed banner — log + job-log UI only (no overlay).
     log(`Saved job PDF via ${saveSource}: ${baseFile} → ${printerName}${delayNote}`, "📁");
+    if (parsed.delayed) {
+      log(
+        `Delayed job ${serverJobId || jobId} — indicator shown in job log (server PDF includes Delayed banner; no local overlay).`,
+        "⏱️"
+      );
+    }
 
-    setImmediate(() => runPrintAttempt(jobId));
+    // M3: ack Rabbit only after print success or server failure ack; dedupe job_id locally.
+    await runPrintAttempt(jobId);
+    if (serverJobId) getProcessedJobs().mark(serverJobId);
     return "ack";
   } catch (err) {
     log("Order handling error: " + err.message, "❌");

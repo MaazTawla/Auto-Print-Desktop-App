@@ -89,6 +89,8 @@ function createStationPrintingController(deps = {}) {
           : null,
       contractVersion: ASSUMPTIONS.contractVersion,
       rabbitQueue: resolveQueueName(readConfig(), readConfig().branch_id),
+      pdfHost: String(readConfig().pdf_host || "").trim() || null,
+      queuePreconditionHint: readConfig().queue_precondition_hint || null,
     };
   }
 
@@ -131,9 +133,12 @@ function createStationPrintingController(deps = {}) {
     hostConflict = null;
     writeConfig({
       agent_token: "",
+      rabbit_password: "",
       pairing_code: "",
       is_print_host: false,
       host_epoch: 1,
+      pdf_host: "",
+      queue_precondition_hint: null,
     });
     persistHostFlags();
     onStateChange(publicHostState());
@@ -242,6 +247,9 @@ function createStationPrintingController(deps = {}) {
     }
     if (result.branch_id != null) {
       patch.branch_id = String(result.branch_id);
+    }
+    if (result.pdf_host) {
+      patch.pdf_host = result.pdf_host;
     }
     // Persist rabbit.queue / durable / arguments and apply broker creds when present
     const rabbitConfig =

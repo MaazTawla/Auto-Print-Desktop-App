@@ -21,6 +21,7 @@ const ERROR_CODES = Object.freeze({
   BRANCH_MISMATCH: "BRANCH_MISMATCH",
   PDF_CHECKSUM_MISMATCH: "PDF_CHECKSUM_MISMATCH",
   PDF_URL_EXPIRED: "PDF_URL_EXPIRED",
+  PDF_TOO_LARGE: "PDF_TOO_LARGE",
   VALIDATION_ERROR: "VALIDATION_ERROR",
   UNAUTHORIZED: "UNAUTHORIZED",
 });
@@ -139,6 +140,10 @@ function parseRegisterResponse(data) {
   const hostEpoch = Number(src.host_epoch ?? src.hostEpoch ?? 1);
   const branchId = src.branch_id != null ? src.branch_id : null;
   const rabbitRaw = src.rabbit && typeof src.rabbit === "object" ? src.rabbit : null;
+  const pdfHost =
+    src.pdf_host != null && String(src.pdf_host).trim() !== ""
+      ? String(src.pdf_host).trim().replace(/\/+$/, "")
+      : null;
   return {
     ok: true,
     token,
@@ -152,6 +157,7 @@ function parseRegisterResponse(data) {
     station_printing_enabled: src.station_printing_enabled,
     rabbit: rabbitRaw,
     rabbitConfig: normalizeRabbitConfig(rabbitRaw, branchId),
+    pdf_host: pdfHost,
     raw: data,
   };
 }
@@ -219,6 +225,9 @@ function mapPrinterForApi(p) {
   }
   if (p.ip_address != null && String(p.ip_address).trim() !== "") {
     row.ip_address = String(p.ip_address).trim();
+  }
+  if (p.port != null && Number.isFinite(Number(p.port))) {
+    row.port = Number(p.port);
   }
   return row;
 }

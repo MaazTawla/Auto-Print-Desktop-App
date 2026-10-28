@@ -35,6 +35,10 @@ function createAgentApi(options = {}) {
     apiBase = String(base || "").trim();
   }
 
+  function getApiBase() {
+    return apiBase;
+  }
+
   function setToken(t) {
     token = t != null ? String(t) : "";
   }
@@ -225,6 +229,7 @@ function createAgentApi(options = {}) {
 
   return {
     setApiBase,
+    getApiBase,
     setToken,
     getToken,
     register,

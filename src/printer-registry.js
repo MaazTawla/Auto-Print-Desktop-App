@@ -6,6 +6,11 @@
 
 "use strict";
 
+const {
+  windowsPrinterExternalId,
+  inferNetworkEndpointFromWindowsPrinter,
+} = require("./windows-external-id");
+
 function normalizeExternalId(raw) {
   return String(raw || "").trim();
 }
@@ -41,7 +46,9 @@ function createPrinterRegistry(initial = {}) {
       printer.windows_name || printer.name || printer.external_id || ""
     ).trim();
     const externalId = normalizeExternalId(
-      printer.external_id || printer.externalId || windowsName
+      printer.external_id ||
+        printer.externalId ||
+        (windowsName ? windowsPrinterExternalId(windowsName) : "")
     );
     if (!externalId) return null;
     const prev = byExternalId.get(externalId);
@@ -72,6 +79,10 @@ function createPrinterRegistry(initial = {}) {
         printer.ip_address != null
           ? String(printer.ip_address)
           : (prev && prev.ip_address) || null,
+      port:
+        printer.port != null && Number.isFinite(Number(printer.port))
+          ? Number(printer.port)
+          : (prev && prev.port) || null,
       // Server-assigned numeric id from printers/sync
       server_id:
         printer.server_id != null
@@ -129,11 +140,11 @@ function createPrinterRegistry(initial = {}) {
         (p && (p.name || p.deviceName || p.printerName)) || ""
       ).trim();
       if (!name) continue;
-      const externalId = normalizeExternalId(
-        (p && (p.external_id || p.deviceId)) || name
-      );
+      // Backend confirmed: win:{Windows printer name}
+      const externalId = windowsPrinterExternalId(name);
       seen.add(externalId);
       const prev = byExternalId.get(externalId);
+      const net = inferNetworkEndpointFromWindowsPrinter(p);
       upsert({
         external_id: externalId,
         name: (prev && prev.name) || name,
@@ -147,7 +158,11 @@ function createPrinterRegistry(initial = {}) {
           externalId === defaultExternalId,
         model: (p && (p.model || p.driverName)) || (prev && prev.model),
         server_id: prev && prev.server_id,
-        ip_address: (prev && prev.ip_address) || inferIp(p),
+        ip_address:
+          (net && net.ip_address) ||
+          (prev && prev.ip_address) ||
+          inferIp(p),
+        port: (net && net.port) || (prev && prev.port) || null,
       });
     }
     if (!keepMissing) {
@@ -168,8 +183,21 @@ function createPrinterRegistry(initial = {}) {
   }
 
   function setDefault(externalId) {
-    const id = normalizeExternalId(externalId);
-    if (!id || !byExternalId.has(id)) return false;
+    let id = normalizeExternalId(externalId);
+    if (!id) return false;
+    if (!byExternalId.has(id)) {
+      const winId = windowsPrinterExternalId(id.replace(/^win:/i, "") || id);
+      if (byExternalId.has(winId)) id = winId;
+      else {
+        for (const row of byExternalId.values()) {
+          if (row.windows_name === id || row.name === id) {
+            id = row.external_id;
+            break;
+          }
+        }
+      }
+    }
+    if (!byExternalId.has(id)) return false;
     defaultExternalId = id;
     for (const row of byExternalId.values()) {
       row.is_default = row.external_id === id;
@@ -190,7 +218,10 @@ function createPrinterRegistry(initial = {}) {
         ? normalizeExternalId(msg.printer_external_id)
         : "";
     if (externalId) {
-      const found = byExternalId.get(externalId);
+      let found = byExternalId.get(externalId);
+      if (!found && !/^win:/i.test(externalId)) {
+        found = byExternalId.get(windowsPrinterExternalId(externalId));
+      }
       if (found) return { ok: true, printer: found, matchedBy: "external_id" };
       for (const row of byExternalId.values()) {
         if (row.windows_name === externalId || row.name === externalId) {
@@ -222,6 +253,7 @@ function createPrinterRegistry(initial = {}) {
       is_default: p.is_default,
       model: p.model,
       ip_address: p.ip_address,
+      ...(p.port != null ? { port: p.port } : {}),
     }));
   }
 

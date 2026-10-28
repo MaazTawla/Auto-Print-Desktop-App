@@ -58,7 +58,7 @@ function createPrintJobsStore(userDataRoot) {
         fs.unlinkSync(localPath);
       }
       return dest;
-    } catch (err) {
+    } catch (_err) {
       return null;
     }
   }

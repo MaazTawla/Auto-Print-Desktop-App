@@ -211,7 +211,7 @@ describe("station-printing controller", () => {
       status: 200,
       data: {
         accepted: 1,
-        printers: [{ id: 55, external_id: "Kitchen Printer 1", name: "Kitchen Printer 1" }],
+        printers: [{ id: 55, external_id: "win:Kitchen Printer 1", name: "Kitchen Printer 1" }],
       },
       headers: {},
     });
@@ -219,7 +219,7 @@ describe("station-printing controller", () => {
     ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
     const res = await ctrl.syncPrintersToServer({ branchId: "147" });
     assert.equal(res.ok, true);
-    assert.equal(ctrl.printers.get("Kitchen Printer 1").server_id, 55);
+    assert.equal(ctrl.printers.get("win:Kitchen Printer 1").server_id, 55);
   });
 
   it("prints when host; delayed=true held jobs parse", () => {

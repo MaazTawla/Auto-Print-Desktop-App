@@ -561,6 +561,34 @@
     .q-status-pill.failed-setup .dot { background: #ef4444; }
     .q-status-pill.retry-scheduled { background: rgba(245,158,11,0.1); color: #f59e0b; }
     .q-status-pill.retry-scheduled .dot { background: #f59e0b; }
+    .q-delayed-badge {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      background: rgba(245,158,11,0.15);
+      color: #b45309;
+      vertical-align: middle;
+    }
+    #queue-precondition-banner {
+      display: none;
+      margin: 12px 16px 0;
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: rgba(245,158,11,0.12);
+      border: 1px solid rgba(245,158,11,0.35);
+      color: #92400e;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    #queue-precondition-banner.show { display: block; }
+    #queue-precondition-banner code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
 
     .q-next-retry { color: #334155; font-size: 12px; line-height: 16px; }
     .q-next-retry .eta { font-size: 10px; line-height: 14px; color: #94a3b8; }
@@ -2328,6 +2356,11 @@
       <button type="button" class="btn-primary" id="host-conflict-retry">Retry</button>
     </div>
   </div>
+  <div id="queue-precondition-banner" role="status" aria-live="polite">
+    <strong>Rabbit queue mismatch</strong>
+    <div id="queue-precondition-message" style="margin-top:4px"></div>
+    <div style="margin-top:6px">Do not delete the queue from this agent. Ops: <code>php artisan printing:redeclare-branch-queues</code></div>
+  </div>
   <div id="tabs-bar">
     <div class="tab active" data-tab="home" onclick="switchTab('home')">
       <img
@@ -3264,7 +3297,10 @@
       const fileCell = fid
         ? `<td class="q-file"><button type="button" class="job-file-link" data-job-preview="${fid.replace(/"/g, '&quot;')}">${escHtml(j.file || '—')}</button></td>`
         : `<td class="q-file">${escHtml(j.file || '—')}</td>`;
-      const statusHtml = `<span class="q-status-pill ${stSafe}"><span class="dot"></span>${escHtml(jobStatusLabel(st))}</span>`;
+      const delayedBadge = j.delayed
+        ? ' <span class="q-delayed-badge" title="Delayed flush from server (banner is on the PDF)">Delayed</span>'
+        : '';
+      const statusHtml = `<span class="q-status-pill ${stSafe}"><span class="dot"></span>${escHtml(jobStatusLabel(st))}</span>${delayedBadge}`;
       const nextRetryHtml = formatNextRetryCell(j);
       return `
           <tr>
@@ -3779,6 +3815,17 @@
       } else {
         pairingBanner.hidden = true;
         pairingBanner.classList.remove('show');
+      }
+    }
+    const qBanner = document.getElementById('queue-precondition-banner');
+    const qMsg = document.getElementById('queue-precondition-message');
+    const qHint = sp && sp.queuePreconditionHint;
+    if (qBanner) {
+      if (qHint) {
+        qBanner.classList.add('show');
+        if (qMsg) qMsg.textContent = String(qHint);
+      } else {
+        qBanner.classList.remove('show');
       }
     }
   }
