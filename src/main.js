@@ -22,6 +22,8 @@ const amqp = require("amqplib");
 const { watchWindowsPrintJob } = require("./print-job-tracker");
 const { createPrintJobsStore } = require("./print-jobs-store");
 const { createStationPrintingController } = require("./station-printing");
+const discoveredPrinter = require("./discovered-printer");
+const { scanLanPrinters } = require("./lan-printer-scanner");
 const {
   syncBranchIdFromServer,
   shouldReconnectAfterBranchApply,
@@ -2025,6 +2027,71 @@ ipcMain.handle("retry-print-host-register", async () => {
       };
     }
     return { ok: true, stationPrinting: st };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+
+
+ipcMain.handle("scan-printers", async () => {
+  try {
+    await pollPrinters();
+    const windows = state.printers || [];
+    let lan = [];
+    let progress = "";
+    try {
+      lan = await scanLanPrinters({
+        onProgress: (msg) => {
+          progress = String(msg || "");
+        },
+      });
+    } catch (err) {
+      progress = err && err.message ? err.message : String(err);
+    }
+    const candidates = discoveredPrinter.merge({ windows, lan });
+    const managed = (() => {
+      try {
+        return getStationPrinting().printers.list();
+      } catch (_) {
+        return [];
+      }
+    })();
+    const list = candidates.map((c) => ({
+      ...c,
+      alreadyAdded: discoveredPrinter.isAlreadyAdded(c, managed),
+    }));
+    return { ok: true, printers: list, progress, lanCount: lan.length, windowsCount: windows.length };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err), printers: [] };
+  }
+});
+
+ipcMain.handle("add-discovered-printer", async (_e, raw) => {
+  try {
+    const o = raw && typeof raw === "object" ? raw : {};
+    const candidate = {
+      name: String(o.name || "").trim(),
+      connection: String(o.connection || "lan").trim(),
+      typeLabel: o.typeLabel,
+      addressLabel: o.addressLabel,
+      externalId: String(o.externalId || o.external_id || "").trim(),
+      windows_name: String(o.windows_name || o.windowsName || "").trim(),
+      host: String(o.host || "").trim(),
+      port: o.port != null ? Number(o.port) : null,
+      bluetoothAddress: String(o.bluetoothAddress || "").trim(),
+      usbIdentity: String(o.usbIdentity || "").trim(),
+    };
+    if (!candidate.externalId) {
+      return { ok: false, error: "Missing printer external_id." };
+    }
+    const sp = getStationPrinting();
+    const makeDefault = sp.printers.list().length === 0;
+    const row = discoveredPrinter.toRegistryPrinter(candidate, { makeDefault });
+    sp.printers.upsert(row);
+    if (makeDefault) sp.setDefaultPrinter(row.external_id);
+    await sp.syncPrintersToServer({ branchId: state.branchId });
+    pushState();
+    return { ok: true, printers: sp.printers.list(), added: row };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
   }

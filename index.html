@@ -2773,13 +2773,38 @@
                 <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/printer.svg" alt="" /></div>
                 <div class="settings-card-head-text">
                   <h3 class="settings-card-title" id="settings-card-printer-map-title">Printers &amp; mapping</h3>
-                  <p class="settings-card-lead">Windows printers synced by external id (no cap). Station tickets route by <span class="mono">printer_external_id</span>.</p>
+                  <p class="settings-card-lead">Scan for Windows and LAN printers, then tap one to add it. Station tickets route by <span class="mono">printer_external_id</span>.</p>
                 </div>
               </div>
               <div class="settings-card-body">
                 <div class="inline-actions" style="margin-bottom:10px;">
-                  <button type="button" class="btn-outline" id="settings-printers-refresh">Refresh Windows printers</button>
+                  <button type="button" class="btn-primary" id="settings-printers-scan">Scan printers</button>
+                  <button type="button" class="btn-outline" id="settings-printers-refresh" title="Refresh Windows spooler only">Refresh Windows list</button>
                 </div>
+                <p class="field-hint" id="settings-printers-scan-progress" style="margin:0 0 10px; min-height:1.2em;"></p>
+                <div class="printer-pick-list" id="settings-discovered-printer-list" role="list" aria-label="Discovered printers" style="max-height:260px; margin-bottom:12px;"></div>
+                <details id="settings-printer-manual-details" style="margin-bottom:14px;">
+                  <summary style="cursor:pointer; font-size:13px;">Enter printer manually</summary>
+                  <div class="settings-card-body" style="padding:10px 0 0;">
+                    <div class="field">
+                      <label for="settings-manual-printer-name">Name</label>
+                      <input type="text" id="settings-manual-printer-name" placeholder="Kitchen" autocomplete="off" />
+                    </div>
+                    <div class="field">
+                      <label for="settings-manual-printer-host">Host / IP</label>
+                      <input type="text" id="settings-manual-printer-host" placeholder="192.168.1.50" autocomplete="off" />
+                    </div>
+                    <div class="field">
+                      <label for="settings-manual-printer-port">Port</label>
+                      <input type="number" id="settings-manual-printer-port" value="9100" min="1" max="65535" />
+                    </div>
+                    <div class="inline-actions">
+                      <button type="button" class="btn-outline" id="settings-manual-printer-add">Add LAN printer</button>
+                    </div>
+                    <div class="err-text" id="settings-manual-printer-err" style="margin-top:8px;"></div>
+                  </div>
+                </details>
+                <p class="settings-card-lead" style="margin-bottom:8px;">Added printers</p>
                 <div style="overflow:auto;">
                   <table class="printer-map-table" id="settings-printer-map-table">
                     <thead>
@@ -3886,12 +3911,44 @@
     }
   }
 
+  let discoveredScanCache = [];
+  let discoveredScanBusy = false;
+
+  function renderDiscoveredPrinters(list) {
+    const el = document.getElementById('settings-discovered-printer-list');
+    if (!el) return;
+    discoveredScanCache = Array.isArray(list) ? list : [];
+    if (!discoveredScanCache.length) {
+      el.innerHTML = '<div class="field-hint">No printers found yet. Run Scan, or enter one manually below.</div>';
+      return;
+    }
+    el.innerHTML = discoveredScanCache.map((p, idx) => {
+      const added = !!p.alreadyAdded;
+      const badge = added
+        ? '<span class="printer-pick-st">Added</span>'
+        : '<span class="printer-pick-st warn">' + escHtml(p.typeLabel || p.connection || '') + '</span>';
+      const disabled = added ? ' disabled' : '';
+      const selected = added ? ' selected' : '';
+      return '<button type="button" class="printer-pick-row' + selected + '" data-discovered-idx="' + idx + '"' + disabled + ' role="listitem">' +
+        '<div class="printer-pick-card-stack">' +
+          '<div class="printer-pick-top-row">' +
+            '<div class="printer-pick-text-block">' +
+              '<div class="printer-pick-name">' + escHtml(p.name || '') + '</div>' +
+              '<div class="printer-pick-port">' + escHtml(p.addressLabel || p.externalId || '') + '</div>' +
+            '</div>' +
+            badge +
+          '</div>' +
+        '</div>' +
+      '</button>';
+    }).join('');
+  }
+
   function renderPrinterMap(s) {
     const tbody = document.getElementById('settings-printer-map-tbody');
     if (!tbody) return;
     const list = (s.stationPrinting && s.stationPrinting.printers) || [];
     if (!list.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="field-hint">No Windows printers detected yet.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" class="field-hint">No printers added yet. Scan above or enter one manually.</td></tr>';
       return;
     }
     tbody.innerHTML = list.map((p) => {
@@ -4301,7 +4358,134 @@
   if (refreshPrintersBtn) {
     refreshPrintersBtn.addEventListener('click', async () => {
       await window.api.refreshPrinters();
-      showToast('Printer list refreshed.');
+      showToast('Windows printer list refreshed.');
+    });
+  }
+
+  async function runPrinterScan() {
+    const progress = document.getElementById('settings-printers-scan-progress');
+    const scanBtn = document.getElementById('settings-printers-scan');
+    if (!window.api || typeof window.api.scanPrinters !== 'function') {
+      if (progress) progress.textContent = 'Scan is unavailable in this build.';
+      return;
+    }
+    if (discoveredScanBusy) return;
+    discoveredScanBusy = true;
+    if (scanBtn) {
+      scanBtn.disabled = true;
+      scanBtn.textContent = 'Scanning…';
+    }
+    if (progress) progress.textContent = 'Scanning Windows spooler and LAN port 9100…';
+    try {
+      const res = await window.api.scanPrinters();
+      if (!res || !res.ok) {
+        if (progress) progress.textContent = (res && res.error) || 'Scan failed.';
+        renderDiscoveredPrinters([]);
+        showToast((res && res.error) || 'Scan failed.', 'error', 3400);
+        return;
+      }
+      if (progress) {
+        progress.textContent = res.progress ||
+          ('Found ' + ((res.printers && res.printers.length) || 0) + ' printer(s).');
+      }
+      renderDiscoveredPrinters(res.printers || []);
+      const scanBtn2 = document.getElementById('settings-printers-scan');
+      if (scanBtn2) scanBtn2.textContent = 'Rescan';
+    } catch (err) {
+      if (progress) progress.textContent = err && err.message ? err.message : String(err);
+      showToast('Scan failed.', 'error', 3400);
+    } finally {
+      discoveredScanBusy = false;
+      if (scanBtn) {
+        scanBtn.disabled = false;
+        if (scanBtn.textContent === 'Scanning…') scanBtn.textContent = 'Rescan';
+      }
+    }
+  }
+
+  const scanPrintersBtn = document.getElementById('settings-printers-scan');
+  if (scanPrintersBtn) {
+    scanPrintersBtn.addEventListener('click', () => { runPrinterScan(); });
+  }
+
+  const discoveredListEl = document.getElementById('settings-discovered-printer-list');
+  if (discoveredListEl) {
+    discoveredListEl.addEventListener('click', async (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest('[data-discovered-idx]') : null;
+      if (!btn || btn.disabled) return;
+      const idx = Number(btn.getAttribute('data-discovered-idx'));
+      const candidate = discoveredScanCache[idx];
+      if (!candidate || candidate.alreadyAdded) return;
+      if (!window.api || typeof window.api.addDiscoveredPrinter !== 'function') return;
+      btn.disabled = true;
+      try {
+        const res = await window.api.addDiscoveredPrinter(candidate);
+        if (!res || !res.ok) {
+          showToast((res && res.error) || 'Could not add printer.', 'error', 3400);
+          btn.disabled = false;
+          return;
+        }
+        showToast('Added ' + (candidate.name || 'printer') + '.');
+        candidate.alreadyAdded = true;
+        renderDiscoveredPrinters(discoveredScanCache);
+      } catch (err) {
+        showToast(err && err.message ? err.message : 'Could not add printer.', 'error', 3400);
+        btn.disabled = false;
+      }
+    });
+  }
+
+  const manualAddBtn = document.getElementById('settings-manual-printer-add');
+  if (manualAddBtn) {
+    manualAddBtn.addEventListener('click', async () => {
+      const errEl = document.getElementById('settings-manual-printer-err');
+      if (errEl) errEl.textContent = '';
+      const name = (document.getElementById('settings-manual-printer-name') || {}).value || '';
+      const host = String((document.getElementById('settings-manual-printer-host') || {}).value || '').trim();
+      const portRaw = (document.getElementById('settings-manual-printer-port') || {}).value;
+      const port = Number(portRaw);
+      if (!host) {
+        if (errEl) errEl.textContent = 'Host / IP is required.';
+        return;
+      }
+      const usePort = Number.isFinite(port) && port >= 1 && port <= 65535 ? port : 9100;
+      const externalId = 'lan:' + host + ':' + usePort;
+      const candidate = {
+        name: String(name).trim() || ('Network ' + host),
+        connection: 'lan',
+        typeLabel: 'LAN',
+        addressLabel: host + ':' + usePort,
+        externalId: externalId,
+        host: host,
+        port: usePort,
+        windows_name: '',
+      };
+      if (!window.api || typeof window.api.addDiscoveredPrinter !== 'function') return;
+      manualAddBtn.disabled = true;
+      try {
+        const res = await window.api.addDiscoveredPrinter(candidate);
+        if (!res || !res.ok) {
+          if (errEl) errEl.textContent = (res && res.error) || 'Could not add printer.';
+          showToast((res && res.error) || 'Could not add printer.', 'error', 3400);
+          return;
+        }
+        showToast('Added ' + candidate.name + '.');
+        const hostEl = document.getElementById('settings-manual-printer-host');
+        const nameEl = document.getElementById('settings-manual-printer-name');
+        if (hostEl) hostEl.value = '';
+        if (nameEl) nameEl.value = '';
+        // Mark matching discovered row if present
+        discoveredScanCache = discoveredScanCache.map((c) =>
+          String(c.externalId || '').toLowerCase() === externalId.toLowerCase()
+            ? Object.assign({}, c, { alreadyAdded: true })
+            : c
+        );
+        renderDiscoveredPrinters(discoveredScanCache);
+      } catch (err) {
+        if (errEl) errEl.textContent = err && err.message ? err.message : String(err);
+      } finally {
+        manualAddBtn.disabled = false;
+      }
     });
   }
 

@@ -93,3 +93,28 @@ describe("printer-registry", () => {
     assert.equal(payload[0].port, 9100);
   });
 });
+
+describe("printer-registry scan-first prune", () => {
+  it("keeps lan: scan adds when Windows list refreshes", () => {
+    const { createPrinterRegistry } = require("../src/printer-registry");
+    const reg = createPrinterRegistry();
+    reg.upsert({
+      external_id: "lan:10.0.0.9:9100",
+      name: "Network 10.0.0.9",
+      connection: "lan",
+      ip_address: "10.0.0.9",
+      port: 9100,
+    });
+    reg.upsert({
+      external_id: "win:Old USB",
+      name: "Old USB",
+      windows_name: "Old USB",
+      connection: "usb",
+    });
+    reg.syncFromWindowsList([{ name: "New USB", portName: "USB001" }]);
+    const ids = reg.list().map((p) => p.external_id);
+    assert.ok(ids.includes("lan:10.0.0.9:9100"), "lan scan add must survive Windows refresh");
+    assert.ok(!ids.includes("win:Old USB"), "missing win: row should be pruned");
+    assert.ok(ids.some((id) => /^win:/i.test(id) && /New USB/i.test(id)));
+  });
+});

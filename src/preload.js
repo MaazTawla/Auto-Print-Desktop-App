@@ -22,6 +22,9 @@ contextBridge.exposeInMainWorld("api", {
   setAgentApiSettings: (opts) => ipcRenderer.invoke("set-agent-api-settings", opts),
   retryPrintHostRegister: () => ipcRenderer.invoke("retry-print-host-register"),
   setPrinterMapping: (opts) => ipcRenderer.invoke("set-printer-mapping", opts),
+  scanPrinters: () => ipcRenderer.invoke("scan-printers"),
+  addDiscoveredPrinter: (candidate) =>
+    ipcRenderer.invoke("add-discovered-printer", candidate),
   getWindowsPrintMeta: () => ipcRenderer.invoke("get-windows-print-meta"),
   printPreviewSample: (formOpts) => ipcRenderer.invoke("print-preview-sample", formOpts),
   onStateUpdate: (cb) => ipcRenderer.on("state-update", (_event, state) => cb(state)),

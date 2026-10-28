@@ -166,8 +166,9 @@ function createPrinterRegistry(initial = {}) {
       });
     }
     if (!keepMissing) {
+      // Only drop Windows-spooler rows that disappeared. Keep lan:/bt:/usb: scan adds.
       for (const id of [...byExternalId.keys()]) {
-        if (!seen.has(id)) byExternalId.delete(id);
+        if (!seen.has(id) && /^win:/i.test(id)) byExternalId.delete(id);
       }
     }
     if (defaultExternalId && !byExternalId.has(defaultExternalId)) {
