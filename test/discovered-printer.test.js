@@ -67,4 +67,18 @@ describe("discovered-printer", () => {
     assert.equal(row.port, 9100);
     assert.equal(row.is_default, true);
   });
+
+  it("lanExternalId refuses silent remap of invalid port", () => {
+    assert.throws(() => dp.lanExternalId("10.0.0.5", 99999), /1\.\.65535/);
+    assert.equal(dp.lanExternalId("10.0.0.5", 9101), "lan:10.0.0.5:9101");
+  });
+
+  it("external_id port agrees with stored port for valid manual LAN", () => {
+    const c = dp.fromLan({ host: "10.0.0.5", port: 9101 });
+    assert.equal(c.port, 9101);
+    assert.equal(c.externalId, "lan:10.0.0.5:9101");
+    const row = dp.toRegistryPrinter(c);
+    assert.equal(row.port, 9101);
+    assert.equal(row.external_id, "lan:10.0.0.5:9101");
+  });
 });

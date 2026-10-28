@@ -40,9 +40,11 @@ function shouldReconnectAfterBranchApply(rabbitStarting) {
  * start (branch changed while starting — see Desktop r11 M1).
  */
 function shouldFlushPendingBranchReconnect({ pending, desiredBranch, boundBranch }) {
-  if (pending) return true;
   const desired = String(desiredBranch || "").trim();
   const bound = String(boundBranch || "").trim();
+  // L1: never flush when desired already matches what this start bound.
+  if (desired && bound && desired === bound) return false;
+  if (pending) return true;
   return Boolean(desired && bound && desired !== bound);
 }
 

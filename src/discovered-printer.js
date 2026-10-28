@@ -13,8 +13,12 @@ function lanExternalId(ip, port = DEFAULT_LAN_PORT) {
   const host = String(ip || "").trim();
   if (!host) throw new Error("LAN IP required");
   const p = Number(port);
-  const use = Number.isFinite(p) && p >= 1 && p <= 65535 ? p : DEFAULT_LAN_PORT;
-  return `lan:${host}:${use}`;
+  if (!Number.isInteger(p) || p < 1 || p > 65535) {
+    throw new Error(
+      "LAN port must be 1..65535 (got " + port + "); refusing silent remap to " + DEFAULT_LAN_PORT
+    );
+  }
+  return `lan:${host}:${p}`;
 }
 
 function btExternalId(mac) {
@@ -50,8 +54,11 @@ function fromWindowsPrinter(p) {
 
 function fromLan({ host, port }) {
   const ip = String(host || "").trim();
-  const p = Number(port);
-  const use = Number.isFinite(p) && p >= 1 && p <= 65535 ? p : DEFAULT_LAN_PORT;
+  const p = port == null || port === "" ? DEFAULT_LAN_PORT : Number(port);
+  if (!Number.isInteger(p) || p < 1 || p > 65535) {
+    throw new Error("LAN port must be 1..65535");
+  }
+  const use = p;
   const externalId = lanExternalId(ip, use);
   return {
     name: `Network ${ip}`,

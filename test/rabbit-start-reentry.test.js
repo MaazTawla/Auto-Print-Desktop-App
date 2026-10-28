@@ -59,14 +59,25 @@ describe("rabbit-branch-sync helpers", () => {
     assert.equal(shouldReconnectAfterBranchApply(false), true);
   });
 
-  it("shouldFlushPendingBranchReconnect when pending flag set", () => {
+  it("shouldFlushPendingBranchReconnect when pending and branch mismatch", () => {
+    assert.equal(
+      shouldFlushPendingBranchReconnect({
+        pending: true,
+        desiredBranch: "200",
+        boundBranch: "147",
+      }),
+      true
+    );
+  });
+
+  it("L1: shouldFlushPendingBranchReconnect is false when pending but desired equals bound", () => {
     assert.equal(
       shouldFlushPendingBranchReconnect({
         pending: true,
         desiredBranch: "147",
         boundBranch: "147",
       }),
-      true
+      false
     );
   });
 

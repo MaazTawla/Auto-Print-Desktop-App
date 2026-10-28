@@ -2781,6 +2781,7 @@
                   <button type="button" class="btn-primary" id="settings-printers-scan">Scan printers</button>
                   <button type="button" class="btn-outline" id="settings-printers-refresh" title="Refresh Windows spooler only">Refresh Windows list</button>
                 </div>
+                <p class="err-text" id="settings-printers-nonhost-hint" style="display:none; margin:0 0 10px;">Only the print host can add printers. This device is an observer — ask the print host to add printers.</p>
                 <p class="field-hint" id="settings-printers-scan-progress" style="margin:0 0 10px; min-height:1.2em;"></p>
                 <div class="printer-pick-list" id="settings-discovered-printer-list" role="list" aria-label="Discovered printers" style="max-height:260px; margin-bottom:12px;"></div>
                 <details id="settings-printer-manual-details" style="margin-bottom:14px;">
@@ -3912,6 +3913,31 @@
   }
 
   let discoveredScanCache = [];
+
+  function isPrintHostState(s) {
+    return !!(s && s.stationPrinting && s.stationPrinting.isPrintHost);
+  }
+
+  function updatePrinterAddGates(s) {
+    const host = isPrintHostState(s);
+    const hint = document.getElementById('settings-printers-nonhost-hint');
+    if (hint) hint.style.display = host ? 'none' : 'block';
+    const scanBtn = document.getElementById('settings-printers-scan');
+    // Scan listing is OK for observers; adding is gated. Keep scan enabled to view devices.
+    const manualAdd = document.getElementById('settings-manual-printer-add');
+    if (manualAdd) manualAdd.disabled = !host;
+    const manualDetails = document.getElementById('settings-printer-manual-details');
+    if (manualDetails) {
+      manualDetails.open = host ? manualDetails.open : false;
+      manualDetails.style.opacity = host ? '' : '0.6';
+    }
+    // Re-render discovered so tap targets disable
+    if (discoveredScanCache.length) {
+      renderDiscoveredPrinters(discoveredScanCache.map((c) => Object.assign({}, c)));
+    }
+    window.__printerAddHost = host;
+  }
+
   let discoveredScanBusy = false;
 
   function renderDiscoveredPrinters(list) {
@@ -3924,10 +3950,11 @@
     }
     el.innerHTML = discoveredScanCache.map((p, idx) => {
       const added = !!p.alreadyAdded;
+      const canAdd = window.__printerAddHost !== false;
       const badge = added
         ? '<span class="printer-pick-st">Added</span>'
         : '<span class="printer-pick-st warn">' + escHtml(p.typeLabel || p.connection || '') + '</span>';
-      const disabled = added ? ' disabled' : '';
+      const disabled = (added || !canAdd) ? ' disabled' : '';
       const selected = added ? ' selected' : '';
       return '<button type="button" class="printer-pick-row' + selected + '" data-discovered-idx="' + idx + '"' + disabled + ' role="listitem">' +
         '<div class="printer-pick-card-stack">' +
@@ -4172,6 +4199,10 @@
     syncThemeControls(dark);
     applyTopology(s);
     applySettingsForm(s);
+    applyPrintHostForm(s);
+    renderHostConflict(s);
+    renderPrinterMap(s);
+    updatePrinterAddGates(s);
     updateDiskBanner(s);
     const filterSel = document.getElementById('jobs-status-filter');
     if (filterSel && document.activeElement !== filterSel) {
@@ -4416,6 +4447,10 @@
       const idx = Number(btn.getAttribute('data-discovered-idx'));
       const candidate = discoveredScanCache[idx];
       if (!candidate || candidate.alreadyAdded) return;
+      if (window.__printerAddHost === false) {
+        showToast('Only the print host can add printers. This device is an observer — ask the print host to add printers.', 'error', 3400);
+        return;
+      }
       if (!window.api || typeof window.api.addDiscoveredPrinter !== 'function') return;
       btn.disabled = true;
       try {
@@ -4440,15 +4475,43 @@
     manualAddBtn.addEventListener('click', async () => {
       const errEl = document.getElementById('settings-manual-printer-err');
       if (errEl) errEl.textContent = '';
+      if (window.__printerAddHost === false) {
+        const msg = 'Only the print host can add printers. This device is an observer — ask the print host to add printers.';
+        if (errEl) errEl.textContent = msg;
+        showToast(msg, 'error', 3400);
+        return;
+      }
       const name = (document.getElementById('settings-manual-printer-name') || {}).value || '';
       const host = String((document.getElementById('settings-manual-printer-host') || {}).value || '').trim();
       const portRaw = (document.getElementById('settings-manual-printer-port') || {}).value;
-      const port = Number(portRaw);
+      // Inline validation (mirrors src/lan-host-validation.js / BE v1.6)
+      function isIpv6(h) {
+        let x = String(h || '').trim();
+        if (x.startsWith('[') && x.endsWith(']')) x = x.slice(1, -1);
+        if (!x.includes(':')) return false;
+        // Rough IPv6 literal check without net module in renderer
+        return /^[0-9a-fA-F:]+$/.test(x) && x.includes(':');
+      }
+      function parsePortStrict(raw) {
+        const t = String(raw == null ? '' : raw).trim();
+        if (!t || !/^\d+$/.test(t)) return null;
+        const n = Number(t);
+        if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
+        return n;
+      }
       if (!host) {
         if (errEl) errEl.textContent = 'Host / IP is required.';
         return;
       }
-      const usePort = Number.isFinite(port) && port >= 1 && port <= 65535 ? port : 9100;
+      if (isIpv6(host)) {
+        if (errEl) errEl.textContent = 'IPv6 addresses are not supported for LAN printers; use IPv4 or a hostname.';
+        return;
+      }
+      const usePort = parsePortStrict(portRaw);
+      if (usePort == null) {
+        if (errEl) errEl.textContent = 'Port must be an integer between 1 and 65535.';
+        return;
+      }
       const externalId = 'lan:' + host + ':' + usePort;
       const candidate = {
         name: String(name).trim() || ('Network ' + host),

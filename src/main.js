@@ -24,6 +24,7 @@ const { createPrintJobsStore } = require("./print-jobs-store");
 const { createStationPrintingController } = require("./station-printing");
 const discoveredPrinter = require("./discovered-printer");
 const { scanLanPrinters } = require("./lan-printer-scanner");
+const lanHostValidation = require("./lan-host-validation");
 const {
   syncBranchIdFromServer,
   shouldReconnectAfterBranchApply,
@@ -2068,6 +2069,16 @@ ipcMain.handle("scan-printers", async () => {
 
 ipcMain.handle("add-discovered-printer", async (_e, raw) => {
   try {
+    const sp = getStationPrinting();
+    const pub = sp.publicHostState ? sp.publicHostState() : {};
+    const hostErr = lanHostValidation.assertPrintHostCanAdd(!!pub.isPrintHost);
+    if (hostErr) {
+      return {
+        ok: false,
+        error: hostErr,
+        code: "NOT_PRINT_HOST",
+      };
+    }
     const o = raw && typeof raw === "object" ? raw : {};
     const candidate = {
       name: String(o.name || "").trim(),
@@ -2081,10 +2092,30 @@ ipcMain.handle("add-discovered-printer", async (_e, raw) => {
       bluetoothAddress: String(o.bluetoothAddress || "").trim(),
       usbIdentity: String(o.usbIdentity || "").trim(),
     };
+    const conn = String(candidate.connection || "").toLowerCase();
+    // Skip LAN rules for Windows-spooler rows (win:… / windows_name), even if portName looked like LAN.
+    const isWinSpooler =
+      Boolean(candidate.windows_name) || /^win:/i.test(candidate.externalId || "");
+    if ((conn === "lan" || conn === "network") && !isWinSpooler) {
+      const portRaw =
+        o.port != null && String(o.port).trim() !== ""
+          ? String(o.port).trim()
+          : candidate.port != null
+            ? String(candidate.port)
+            : "";
+      const lanErr = lanHostValidation.validateManualLan(candidate.host, portRaw);
+      if (lanErr) {
+        return { ok: false, error: lanErr, code: "LAN_VALIDATION" };
+      }
+      const usePort = lanHostValidation.parsePortStrict(portRaw);
+      candidate.port = usePort;
+      // Keep external_id in sync with validated host:port
+      candidate.externalId = discoveredPrinter.lanExternalId(candidate.host, usePort);
+      candidate.addressLabel = candidate.host + ":" + usePort;
+    }
     if (!candidate.externalId) {
       return { ok: false, error: "Missing printer external_id." };
     }
-    const sp = getStationPrinting();
     const makeDefault = sp.printers.list().length === 0;
     const row = discoveredPrinter.toRegistryPrinter(candidate, { makeDefault });
     sp.printers.upsert(row);
