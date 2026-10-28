@@ -351,4 +351,133 @@ describe("station-printing controller", () => {
     assert.equal(res.ok, false);
     assert.equal(ctrl.hostConflict.code, "PRINT_HOST_ALREADY_CONFIGURED");
   });
+
+  it("heartbeat retries SYNC_CONFLICT then succeeds (same policy as printers/sync)", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 2,
+    });
+    let calls = 0;
+    const sleeps = [];
+    const request = async (cfg) => {
+      const url = String(cfg.url || "");
+      if (url.includes("/heartbeat")) {
+        calls += 1;
+        if (calls < 3) {
+          return {
+            status: 409,
+            data: { error: { code: "SYNC_CONFLICT", message: "hb lock" } },
+            headers: {},
+          };
+        }
+        return {
+          status: 200,
+          data: { is_print_host: true, host_epoch: 2, pending_job_count: 1 },
+          headers: {},
+        };
+      }
+      return { status: 200, data: {}, headers: {} };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 2 });
+    const res = await ctrl.heartbeat({ branchId: "147" });
+    assert.equal(res.ok, true);
+    assert.equal(calls, 3);
+    assert.equal(sleeps.length, 2);
+    assert.ok(sleeps[0] >= 200);
+  });
+
+  it("heartbeat exhausts SYNC_CONFLICT then defers (not host conflict)", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      return {
+        status: 409,
+        data: { error: { code: "SYNC_CONFLICT", message: "still" } },
+        headers: {},
+      };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async () => {},
+    });
+    const res = await ctrl.heartbeat({ branchId: "147" });
+    assert.equal(res.ok, false);
+    assert.equal(res.syncConflict, true);
+    assert.equal(res.retriesExhausted, true);
+    assert.equal(calls, 3);
+    assert.equal(ctrl.hostConflict, null);
+  });
+
+  it("single-flight: sync and heartbeat never overlap printer upserts", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const events = [];
+    const request = async (cfg) => {
+      const url = String(cfg.url || "");
+      const kind = url.includes("/heartbeat")
+        ? "heartbeat"
+        : url.includes("/printers/sync")
+          ? "sync"
+          : "other";
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      events.push("start:" + kind);
+      await new Promise((r) => setTimeout(r, 30));
+      inFlight -= 1;
+      events.push("end:" + kind);
+      if (kind === "heartbeat") {
+        return {
+          status: 200,
+          data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+          headers: {},
+        };
+      }
+      return {
+        status: 200,
+        data: {
+          accepted: 1,
+          printers: [{ id: 1, external_id: "win:Kitchen Printer 1", name: "Kitchen Printer 1" }],
+        },
+        headers: {},
+      };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async () => {},
+    });
+    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
+    // Overlap like Rabbit connect: fire HB then await sync
+    const hbP = ctrl.heartbeat({ branchId: "147" });
+    const syncP = ctrl.syncPrintersToServer({ branchId: "147" });
+    const [hb, sync] = await Promise.all([hbP, syncP]);
+    assert.equal(hb.ok, true);
+    assert.equal(sync.ok, true);
+    assert.equal(maxInFlight, 1, "expected single-flight, saw " + maxInFlight + " overlapping; events=" + events.join(","));
+    assert.ok(ctrl.isPrinterSyncInFlight() === false);
+  });
 });

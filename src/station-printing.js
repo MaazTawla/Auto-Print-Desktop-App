@@ -293,21 +293,116 @@ function createStationPrintingController(deps = {}) {
     };
   }
 
+  const sleep =
+    typeof deps.sleep === "function"
+      ? deps.sleep
+      : (ms) => new Promise((r) => setTimeout(r, ms));
+  const SYNC_CONFLICT_MAX_ATTEMPTS = 3;
+
+  /**
+   * Single-flight gate so printers/sync and heartbeat printer upsert never overlap
+   * (Rabbit connect starts HB before awaiting sync). Callers serialize on this chain.
+   */
+  let printerSyncGate = Promise.resolve();
+  let printerSyncInFlight = 0;
+
+  function withPrinterSyncSingleFlight(task) {
+    const run = printerSyncGate.then(
+      () => {
+        printerSyncInFlight += 1;
+        return Promise.resolve()
+          .then(() => task())
+          .finally(() => {
+            printerSyncInFlight = Math.max(0, printerSyncInFlight - 1);
+          });
+      },
+      () => {
+        printerSyncInFlight += 1;
+        return Promise.resolve()
+          .then(() => task())
+          .finally(() => {
+            printerSyncInFlight = Math.max(0, printerSyncInFlight - 1);
+          });
+      }
+    );
+    printerSyncGate = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  function isPrinterSyncInFlight() {
+    return printerSyncInFlight > 0;
+  }
+
+  function isSyncConflictResult(result) {
+    return (
+      Boolean(result) &&
+      (result.syncConflict === true || result.code === ERROR_CODES.SYNC_CONFLICT)
+    );
+  }
+
+  /**
+   * Shared SYNC_CONFLICT retry (contract v1.4 / Android SyncConflictPolicy):
+   * ~3 jittered attempts, then defer to next poll/heartbeat.
+   */
+  async function withSyncConflictRetries(label, attemptFn) {
+    let last = null;
+    for (let attempt = 1; attempt <= SYNC_CONFLICT_MAX_ATTEMPTS; attempt++) {
+      const result = await attemptFn(attempt);
+      last = result;
+      if (!result || result.ok || !isSyncConflictResult(result)) {
+        return result;
+      }
+      if (attempt >= SYNC_CONFLICT_MAX_ATTEMPTS) {
+        try {
+          log(
+            `${label} SYNC_CONFLICT after ${attempt} attempts — will retry on next poll/heartbeat.`,
+            "⚠️"
+          );
+        } catch (_) {}
+        return {
+          ...result,
+          syncConflict: true,
+          retriesExhausted: true,
+          attempts: attempt,
+        };
+      }
+      const delay = syncConflictBackoffMs(attempt);
+      try {
+        log(
+          `${label} SYNC_CONFLICT (attempt ${attempt}/${SYNC_CONFLICT_MAX_ATTEMPTS}) — retry in ${delay}ms.`,
+          "⚠️"
+        );
+      } catch (_) {}
+      await sleep(delay);
+    }
+    return last || { ok: false, syncConflict: true, retriesExhausted: true };
+  }
+
   async function heartbeat({ branchId } = {}) {
     const cfg = readConfig();
     if (!api.getToken() || !(cfg.agent_api_base || "").trim()) {
       return { ok: false, skipped: true, shouldConsume: consumeEnabled };
     }
     api.setApiBase(cfg.agent_api_base || "");
-    const result = await api.heartbeat({
-      appId,
-      branchId: branchId || cfg.branch_id,
-      printers: printers.toSyncPayload(),
-    });
+
+    // Single-flight with printers/sync; retry SYNC_CONFLICT like dedicated sync.
+    const result = await withPrinterSyncSingleFlight(() =>
+      withSyncConflictRetries("Heartbeat", async () => {
+        const r = await api.heartbeat({
+          appId,
+          branchId: branchId || cfg.branch_id,
+          printers: printers.toSyncPayload(),
+        });
+        return r;
+      })
+    );
     lastHeartbeatAt = new Date().toISOString();
 
-    if (!result.ok) {
-      if (handleAuthFailure(result, "heartbeat_unauthorized")) {
+    if (!result || !result.ok) {
+      if (result && handleAuthFailure(result, "heartbeat_unauthorized")) {
         return {
           ok: false,
           authError: true,
@@ -317,7 +412,13 @@ function createStationPrintingController(deps = {}) {
         };
       }
       onStateChange(publicHostState());
-      return { ok: false, error: result.error, shouldConsume: consumeEnabled };
+      return {
+        ok: false,
+        error: (result && result.error) || { code: "HEARTBEAT_FAILED", message: "Heartbeat failed" },
+        syncConflict: Boolean(result && result.syncConflict),
+        retriesExhausted: Boolean(result && result.retriesExhausted),
+        shouldConsume: consumeEnabled,
+      };
     }
 
     const applied = policy.applyServerState({
@@ -399,72 +500,41 @@ function createStationPrintingController(deps = {}) {
     return { ...reg, resumed: false };
   }
 
-  const sleep =
-    typeof deps.sleep === "function"
-      ? deps.sleep
-      : (ms) => new Promise((r) => setTimeout(r, ms));
-  const SYNC_CONFLICT_MAX_ATTEMPTS = 3;
-
   /**
-   * Upsert printers. On 409 SYNC_CONFLICT (v1.4), retry ~3 times with short
-   * jittered backoff, then fall through so the next poll/heartbeat can retry.
-   * Distinguished from PRINT_HOST_ALREADY_CONFIGURED by error.code.
+   * Upsert printers via POST printers/sync. Single-flight with heartbeat.
+   * On 409 SYNC_CONFLICT (v1.4), retry ~3 times with short jittered backoff,
+   * then defer to the next poll/heartbeat. Not PRINT_HOST_ALREADY_CONFIGURED.
    */
   async function syncPrintersToServer({ branchId } = {}) {
     const cfg = readConfig();
     if (!api.getToken()) return { ok: false, skipped: true };
-    let last = null;
-    for (let attempt = 1; attempt <= SYNC_CONFLICT_MAX_ATTEMPTS; attempt++) {
-      const result = await api.syncPrinters({
-        appId,
-        branchId: branchId || cfg.branch_id,
-        printers: printers.toSyncPayload(),
-      });
-      last = result;
-      if (handleAuthFailure(result, "sync_unauthorized")) {
-        return {
-          ok: false,
-          authError: true,
-          needsPairing: true,
-          error: lastRegisterError,
-        };
-      }
-      if (result.ok) {
-        if (Array.isArray(result.printers) && result.printers.length) {
-          printers.applyServerSync(result.printers);
-          persistHostFlags();
-          onStateChange(publicHostState());
+    return withPrinterSyncSingleFlight(() =>
+      withSyncConflictRetries("Printers sync", async () => {
+        const result = await api.syncPrinters({
+          appId,
+          branchId: branchId || cfg.branch_id,
+          printers: printers.toSyncPayload(),
+        });
+        if (handleAuthFailure(result, "sync_unauthorized")) {
+          return {
+            ok: false,
+            authError: true,
+            needsPairing: true,
+            error: lastRegisterError,
+            // not a sync conflict — stop retries
+            code: (lastRegisterError && lastRegisterError.code) || "UNAUTHORIZED",
+          };
+        }
+        if (result.ok) {
+          if (Array.isArray(result.printers) && result.printers.length) {
+            printers.applyServerSync(result.printers);
+            persistHostFlags();
+            onStateChange(publicHostState());
+          }
         }
         return result;
-      }
-      const isSyncConflict =
-        result.syncConflict === true ||
-        result.code === ERROR_CODES.SYNC_CONFLICT;
-      if (!isSyncConflict) return result;
-      if (attempt >= SYNC_CONFLICT_MAX_ATTEMPTS) {
-        try {
-          log(
-            `Printers sync SYNC_CONFLICT after ${attempt} attempts — will retry on next poll/heartbeat.`,
-            "⚠️"
-          );
-        } catch (_) {}
-        return {
-          ...result,
-          syncConflict: true,
-          retriesExhausted: true,
-          attempts: attempt,
-        };
-      }
-      const delay = syncConflictBackoffMs(attempt);
-      try {
-        log(
-          `Printers sync SYNC_CONFLICT (attempt ${attempt}/${SYNC_CONFLICT_MAX_ATTEMPTS}) — retry in ${delay}ms.`,
-          "⚠️"
-        );
-      } catch (_) {}
-      await sleep(delay);
-    }
-    return last || { ok: false, syncConflict: true, retriesExhausted: true };
+      })
+    );
   }
 
   function syncWindowsPrinters(windowsList) {
@@ -614,6 +684,7 @@ function createStationPrintingController(deps = {}) {
     heartbeat,
     deregister,
     syncPrintersToServer,
+    isPrinterSyncInFlight,
     syncWindowsPrinters,
     setDefaultPrinter,
     evaluateIncomingMessage,

@@ -128,16 +128,33 @@ function createAgentApi(options = {}) {
         error: { code: "UNAUTHORIZED", message: "Agent token rejected" },
       };
     }
+    // v1.4 M5: heartbeat printer upsert can return 409 SYNC_CONFLICT (same as printers/sync)
+    if (status === 409) {
+      const syncConflict = parseSyncConflictError(data, status);
+      if (syncConflict) {
+        return {
+          ok: false,
+          status,
+          syncConflict: true,
+          code: ERROR_CODES.SYNC_CONFLICT,
+          error: syncConflict,
+          message: syncConflict.message,
+        };
+      }
+    }
     if (status < 200 || status >= 300) {
+      const parsed = parseAgentError(data, status);
       return {
         ok: false,
         status,
         error: {
-          code: "HEARTBEAT_FAILED",
+          code: parsed.code || "HEARTBEAT_FAILED",
           message:
+            parsed.message ||
             (data && data.error && data.error.message) ||
             `Heartbeat failed (${status})`,
         },
+        code: parsed.code || "HEARTBEAT_FAILED",
       };
     }
     return { ok: true, status, ...parseHeartbeatResponse(data) };
