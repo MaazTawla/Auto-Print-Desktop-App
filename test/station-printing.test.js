@@ -623,4 +623,163 @@ describe("station-printing controller", () => {
     assert.equal(sync.ok, true);
     assert.equal(syncAttempts, 3);
   });
+
+  it("skips overlapping ungated liveness — second tick while ping in flight", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    let liveInFlight = 0;
+    let maxLive = 0;
+    let liveCalls = 0;
+    let release;
+    const hold = new Promise((r) => {
+      release = r;
+    });
+    const ctrl = createStationPrintingController({
+      ...store,
+      log: () => {},
+      sleep: async () => {},
+      request: async (cfg) => {
+        const body = cfg.data || {};
+        const list = Array.isArray(body.printers) ? body.printers : [];
+        if (String(cfg.url || "").includes("/heartbeat") && list.length === 0) {
+          liveCalls += 1;
+          liveInFlight += 1;
+          maxLive = Math.max(maxLive, liveInFlight);
+          await hold;
+          liveInFlight -= 1;
+          return {
+            status: 200,
+            data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+            headers: {},
+          };
+        }
+        return {
+          status: 200,
+          data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+          headers: {},
+        };
+      },
+    });
+    const a = ctrl.heartbeat({ branchId: "147" });
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(ctrl.isLivenessInFlight(), true);
+    const b = await ctrl.heartbeat({ branchId: "147" });
+    assert.equal(b.livenessSkipped, true);
+    assert.equal(b.skipped, true);
+    assert.equal(b.ok, true);
+    release();
+    const aRes = await a;
+    assert.equal(aRes.ok, true);
+    assert.equal(liveCalls, 1, "second tick must not send another printers:[]");
+    assert.equal(maxLive, 1);
+    assert.equal(ctrl.isLivenessInFlight(), false);
+  });
+
+  it("liveness can tick again while prior gated upsert still runs", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    let liveCalls = 0;
+    let releaseUpsert;
+    const upsertHold = new Promise((r) => {
+      releaseUpsert = r;
+    });
+    let upsertStarted = false;
+    const ctrl = createStationPrintingController({
+      ...store,
+      log: () => {},
+      sleep: async () => {},
+      request: async (cfg) => {
+        const body = cfg.data || {};
+        const list = Array.isArray(body.printers) ? body.printers : [];
+        const url = String(cfg.url || "");
+        if (url.includes("/heartbeat") && list.length === 0) {
+          liveCalls += 1;
+          return {
+            status: 200,
+            data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+            headers: {},
+          };
+        }
+        if (url.includes("/heartbeat") && list.length > 0) {
+          upsertStarted = true;
+          await upsertHold;
+          return {
+            status: 200,
+            data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+            headers: {},
+          };
+        }
+        return { status: 200, data: {}, headers: {} };
+      },
+    });
+    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
+    const first = ctrl.heartbeat({ branchId: "147" });
+    for (let i = 0; i < 40 && !upsertStarted; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(upsertStarted, "first heartbeat should be in gated upsert");
+    assert.equal(ctrl.isLivenessInFlight(), false);
+    // Do not await full second HB yet — its gated upsert queues behind first.
+    const secondP = ctrl.heartbeat({ branchId: "147" });
+    for (let i = 0; i < 40 && liveCalls < 2; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(liveCalls, 2, "second liveness must proceed once prior ping finished");
+    releaseUpsert();
+    const [firstRes, second] = await Promise.all([first, secondP]);
+    assert.equal(firstRes.ok, true);
+    assert.equal(second.ok, true);
+    assert.notEqual(second.livenessSkipped, true);
+  });
+
+  it("gated upsert timeout after liveness is caught — no rejection", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    const logs = [];
+    const ctrl = createStationPrintingController({
+      ...store,
+      log: (msg) => {
+        logs.push(String(msg));
+      },
+      sleep: async () => {},
+      request: async (cfg) => {
+        const body = cfg.data || {};
+        const list = Array.isArray(body.printers) ? body.printers : [];
+        if (String(cfg.url || "").includes("/heartbeat") && list.length === 0) {
+          return {
+            status: 200,
+            data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+            headers: {},
+          };
+        }
+        if (list.length > 0) {
+          const err = new Error("timeout of " + cfg.timeout + "ms exceeded");
+          err.code = "ECONNABORTED";
+          throw err;
+        }
+        return { status: 200, data: {}, headers: {} };
+      },
+    });
+    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
+    const res = await ctrl.heartbeat({ branchId: "147" });
+    assert.equal(res.ok, true);
+    assert.ok(res.printerUpsert);
+    assert.equal(res.printerUpsert.ok, false);
+    assert.equal(res.printerUpsert.timedOut, true);
+    assert.equal(res.printerUpsert.error.code, "TIMEOUT");
+    assert.equal(ctrl.isPrinterSyncInFlight(), false);
+    assert.ok(
+      logs.some((m) => /printer upsert failed after liveness/i.test(m)),
+      "must log upsert failure"
+    );
+  });
 });

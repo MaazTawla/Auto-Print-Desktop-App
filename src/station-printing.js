@@ -422,26 +422,49 @@ function createStationPrintingController(deps = {}) {
   }
 
   /**
-   * Heartbeat split (r6 M1):
+   * Heartbeat split (r6 M1 / r7 L1–L2):
    * 1) Ungated liveness ping with printers: [] (contract: empty OK if unchanged) —
    *    never waits on the sync gate or sync retries, so 30s ticks beat the 90s offline TTL.
+   *    In-flight guard: skip a tick if the previous liveness ping is still in flight.
    * 2) Gated full printer upsert (preferred snapshot) with SYNC_CONFLICT retries,
    *    serialized with printers/sync and bounded by PRINTER_SYNC_BUDGET_MS.
+   *    Timeout/errors after liveness are caught and logged (no unhandled rejection).
    */
+  let livenessInFlight = false;
+
+  function isLivenessInFlight() {
+    return livenessInFlight;
+  }
+
   async function heartbeat({ branchId } = {}) {
     const cfg = readConfig();
     if (!api.getToken() || !(cfg.agent_api_base || "").trim()) {
       return { ok: false, skipped: true, shouldConsume: consumeEnabled };
     }
+    // r7 L1: never overlap ungated liveness pings — skip this tick.
+    if (livenessInFlight) {
+      return {
+        ok: true,
+        skipped: true,
+        livenessSkipped: true,
+        shouldConsume: consumeEnabled,
+      };
+    }
     api.setApiBase(cfg.agent_api_base || "");
     const bid = branchId || cfg.branch_id;
 
     // 1) Ungated liveness — outside the printer-sync gate.
-    const live = await api.heartbeat({
-      appId,
-      branchId: bid,
-      printers: [],
-    });
+    livenessInFlight = true;
+    let live;
+    try {
+      live = await api.heartbeat({
+        appId,
+        branchId: bid,
+        printers: [],
+      });
+    } finally {
+      livenessInFlight = false;
+    }
     lastHeartbeatAt = new Date().toISOString();
 
     if (!live || !live.ok) {
@@ -484,27 +507,53 @@ function createStationPrintingController(deps = {}) {
     onStateChange(publicHostState());
 
     // 2) Gated printer upsert — may wait behind sync; liveness already refreshed.
+    // r7 L2: catch timeout/errors so heartbeat() never rejects after a successful liveness.
     let printerUpsert = null;
     const payload = printers.toSyncPayload();
     if (payload.length > 0) {
-      printerUpsert = await withPrinterSyncSingleFlight(() =>
-        withSyncConflictRetries(
-          "Heartbeat printers",
-          async (_attempt, { timeoutMs }) => {
-            const r = await api.heartbeat({
-              appId,
-              branchId: bid,
-              printers: payload,
-              timeout: timeoutMs,
-            });
-            if (r && r.authError) {
-              handleAuthFailure(r, "heartbeat_unauthorized");
-            }
-            return r;
+      try {
+        printerUpsert = await withPrinterSyncSingleFlight(() =>
+          withSyncConflictRetries(
+            "Heartbeat printers",
+            async (_attempt, { timeoutMs }) => {
+              const r = await api.heartbeat({
+                appId,
+                branchId: bid,
+                printers: payload,
+                timeout: timeoutMs,
+              });
+              if (r && r.authError) {
+                handleAuthFailure(r, "heartbeat_unauthorized");
+              }
+              return r;
+            },
+            { budgetMs: PRINTER_SYNC_BUDGET_MS }
+          )
+        );
+      } catch (err) {
+        const msg =
+          (err && err.message != null && String(err.message)) ||
+          String(err || "printer upsert failed");
+        const code = err && err.code != null ? String(err.code) : "";
+        const timedOut =
+          code === "ECONNABORTED" ||
+          code === "ETIMEDOUT" ||
+          /timeout|timed\s*out|ECONNABORTED|ETIMEDOUT/i.test(msg);
+        try {
+          log(
+            `Heartbeat printer upsert failed after liveness: ${msg}`,
+            "⚠️"
+          );
+        } catch (_) {}
+        printerUpsert = {
+          ok: false,
+          timedOut,
+          error: {
+            code: timedOut ? "TIMEOUT" : "UPSERT_FAILED",
+            message: msg,
           },
-          { budgetMs: PRINTER_SYNC_BUDGET_MS }
-        )
-      );
+        };
+      }
     }
 
     return {
@@ -761,6 +810,7 @@ function createStationPrintingController(deps = {}) {
     deregister,
     syncPrintersToServer,
     isPrinterSyncInFlight,
+    isLivenessInFlight,
     syncWindowsPrinters,
     setDefaultPrinter,
     evaluateIncomingMessage,
