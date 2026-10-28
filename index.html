@@ -2668,7 +2668,7 @@
                 <div class="field">
                   <label for="settings-pairing-code">Pairing code</label>
                   <input type="password" id="settings-pairing-code" placeholder="From merchant / branch" autocomplete="new-password" />
-                  <div class="field-hint">Exchanged at register for an agent token. Leave blank to keep the stored token.</div>
+                  <div class="field-hint">Required to register. Exchanged for an agent token. Blank pairing codes are blocked.</div>
                 </div>
                 <div class="field-hint">App ID: <span class="mono" id="settings-app-id">—</span></div>
                 <div class="err-text" id="settings-agent-err"></div>
@@ -3750,24 +3750,35 @@
 
   function renderHostConflict(s) {
     const banner = document.getElementById('host-conflict-banner');
-    if (!banner) return;
+    const pairingBanner = document.getElementById('pairing-required-banner');
     const sp = s && s.stationPrinting;
     const conflict = sp && sp.hostConflict;
-    if (!conflict) {
-      banner.classList.remove('show');
-      return;
-    }
-    banner.classList.add('show');
-    const msg = document.getElementById('host-conflict-message');
-    const meta = document.getElementById('host-conflict-meta');
-    if (msg) msg.textContent = conflict.message || 'Another device is already configured as print host for this branch.';
-    if (meta) {
-      const host = conflict.current_host;
-      if (host) {
-        const online = host.is_online ? 'online' : 'offline';
-        meta.textContent = 'Current host: ' + (host.device_label || host.app_id || '—') + ' (' + online + ')';
+    if (banner) {
+      if (!conflict) {
+        banner.classList.remove('show');
       } else {
-        meta.textContent = '';
+        banner.classList.add('show');
+        const msg = document.getElementById('host-conflict-message');
+        const meta = document.getElementById('host-conflict-meta');
+        if (msg) msg.textContent = conflict.message || 'Another device is already configured as print host for this branch.';
+        if (meta) {
+          const host = conflict.current_host;
+          if (host) {
+            const online = host.is_online ? 'online' : 'offline';
+            meta.textContent = 'Current host: ' + (host.device_label || host.app_id || '—') + ' (' + online + '). If you reinstalled this app, your app id changed — admin must Change print host to this PC.';
+          } else {
+            meta.textContent = 'If you reinstalled this app, your app id changed — admin must Change print host to this PC, then tap Retry.';
+          }
+        }
+      }
+    }
+    if (pairingBanner) {
+      if (sp && sp.needsPairing && !conflict) {
+        pairingBanner.hidden = false;
+        pairingBanner.classList.add('show');
+      } else {
+        pairingBanner.hidden = true;
+        pairingBanner.classList.remove('show');
       }
     }
   }
@@ -3815,6 +3826,11 @@
     if (!editing) {
       if (apiBase) apiBase.value = (sp && sp.agentApiBase) || '';
       if (deviceLabel) deviceLabel.value = (sp && sp.deviceLabel) || '';
+    }
+    const errEl = document.getElementById('settings-agent-err');
+    if (errEl && sp && sp.lastRegisterError && !editing) {
+      const e = sp.lastRegisterError;
+      errEl.textContent = (e.code ? e.code + ': ' : '') + (e.message || '');
     }
   }
 
@@ -4026,9 +4042,17 @@
   const agentRetry = document.getElementById('settings-agent-retry');
   if (agentRetry) {
     agentRetry.addEventListener('click', async () => {
+      const errEl = document.getElementById('settings-agent-err');
+      if (errEl) errEl.textContent = '';
       const res = await window.api.retryPrintHostRegister();
       if (!res || !res.ok) {
-        showToast((res && res.error) || 'Retry failed.', 'error', 3400);
+        const msg =
+          (res && res.pairingError && res.pairingError.message) ||
+          (res && res.error) ||
+          'Retry failed.';
+        const code = res && (res.code || (res.pairingError && res.pairingError.code));
+        if (errEl) errEl.textContent = code ? `${code}: ${msg}` : msg;
+        showToast(msg, 'error', 3400);
         return;
       }
       showToast('Retried print-host registration.');
@@ -4041,10 +4065,20 @@
     const apiBase = document.getElementById('settings-agent-api-base').value.trim();
     const deviceLabel = document.getElementById('settings-device-label').value.trim();
     const pairingCode = document.getElementById('settings-pairing-code').value;
-    const payload = { apiBase, deviceLabel };
-    if (pairingCode && String(pairingCode).trim() !== '') {
-      payload.pairingCode = pairingCode.trim();
+    if (!pairingCode || String(pairingCode).trim() === '') {
+      const msg = 'Pairing code is required.';
+      if (errEl) errEl.textContent = msg;
+      const pairingInput = document.getElementById('settings-pairing-code');
+      if (pairingInput) {
+        pairingInput.classList.add('field-invalid');
+        pairingInput.focus();
+      }
+      showToast(msg, 'error', 3400);
+      return;
     }
+    const pairingInput = document.getElementById('settings-pairing-code');
+    if (pairingInput) pairingInput.classList.remove('field-invalid');
+    const payload = { apiBase, deviceLabel, pairingCode: pairingCode.trim() };
     const saveRes = await window.api.setAgentApiSettings(payload);
     if (!saveRes || !saveRes.ok) {
       const msg = (saveRes && saveRes.error) || 'Could not save agent settings.';
@@ -4055,9 +4089,16 @@
     document.getElementById('settings-pairing-code').value = '';
     const reg = await window.api.retryPrintHostRegister();
     if (!reg || !reg.ok) {
-      showToast((reg && reg.error) || 'Saved, but register failed.', 'error', 3400);
+      const msg =
+        (reg && reg.pairingError && reg.pairingError.message) ||
+        (reg && reg.error) ||
+        'Saved, but register failed.';
+      const code = reg && (reg.code || (reg.pairingError && reg.pairingError.code));
+      if (errEl) errEl.textContent = code ? `${code}: ${msg}` : msg;
+      showToast(msg, 'error', 3400);
       return;
     }
+    if (errEl) errEl.textContent = '';
     showToast('Print host settings saved.');
   });
 

@@ -22,7 +22,7 @@ const amqp = require("amqplib");
 const { watchWindowsPrintJob } = require("./print-job-tracker");
 const { createPrintJobsStore } = require("./print-jobs-store");
 const { createStationPrintingController } = require("./station-printing");
-const { ASSUMPTIONS: STATION_PRINT_ASSUMPTIONS } = require("./agent-contract");
+const { ASSUMPTIONS: STATION_PRINT_ASSUMPTIONS, verifyPdfChecksum, classifyPdfUrlHttpStatus, ERROR_CODES: STATION_ERROR_CODES } = require("./agent-contract");
 
 /** Delays after failed attempts 1, 2, 3 before attempts 2, 3, 4 (exponential-style backoff). */
 const RETRY_DELAYS_MS = [5000, 30000, 60000];
@@ -78,14 +78,45 @@ function derivePdfBasename(filePath, isUrl) {
   return `order-${Date.now()}.pdf`;
 }
 
-async function saveIncomingPdf(store, jobId, filePath, isUrl) {
+async function fetchPdfUrl(url, authToken) {
+  const headers = {};
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  try {
+    return await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 120000,
+      headers,
+      validateStatus: () => true,
+    });
+  } catch (err) {
+    // Network errors — rethrow as-is (not URL expiry)
+    throw err;
+  }
+}
+
+function pdfUrlExpiredError(status) {
+  const err = new Error(STATION_ERROR_CODES.PDF_URL_EXPIRED || "PDF_URL_EXPIRED");
+  err.code = STATION_ERROR_CODES.PDF_URL_EXPIRED || "PDF_URL_EXPIRED";
+  err.httpStatus = status;
+  err.retryable = false;
+  return err;
+}
+
+async function saveIncomingPdf(store, jobId, filePath, isUrl, opts = {}) {
   await ensureSpaceForIncomingPdf();
   const rawBase = derivePdfBasename(filePath, isUrl);
   const safeBase = rawBase.replace(/[^a-zA-Z0-9._-]/g, "_") || "order.pdf";
   const dest = path.join(store.incoming, `${jobId}_${safeBase}`);
+  const authToken = opts.authToken != null ? opts.authToken : null;
   try {
     if (isUrl) {
-      const res = await axios.get(filePath, { responseType: "arraybuffer", timeout: 120000 });
+      const res = await fetchPdfUrl(filePath, authToken);
+      if (classifyPdfUrlHttpStatus(res.status).expired) {
+        throw pdfUrlExpiredError(res.status);
+      }
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error(`PDF download failed (HTTP ${res.status})`);
+      }
       fs.writeFileSync(dest, Buffer.from(res.data));
     } else {
       const resolved = path.resolve(filePath);
@@ -93,6 +124,7 @@ async function saveIncomingPdf(store, jobId, filePath, isUrl) {
       fs.copyFileSync(resolved, dest);
     }
   } catch (err) {
+    if (err && err.code === "PDF_URL_EXPIRED") throw err;
     if (isNoSpaceError(err)) {
       await emergencyDiskCleanup();
       await refreshDiskSpaceStatus({ silent: true });
@@ -100,7 +132,13 @@ async function saveIncomingPdf(store, jobId, filePath, isUrl) {
         throw new Error("Disk full — could not save PDF. Freed old logs/jobs; free more space and retry.");
       }
       if (isUrl) {
-        const res = await axios.get(filePath, { responseType: "arraybuffer", timeout: 120000 });
+        const res = await fetchPdfUrl(filePath, authToken);
+        if (classifyPdfUrlHttpStatus(res.status).expired) {
+          throw pdfUrlExpiredError(res.status);
+        }
+        if (res.status < 200 || res.status >= 300) {
+          throw new Error(`PDF download failed (HTTP ${res.status})`);
+        }
         fs.writeFileSync(dest, Buffer.from(res.data));
       } else {
         const resolved = path.resolve(filePath);
@@ -1052,9 +1090,20 @@ function buildRabbitOptions() {
       : layer.routingKey;
   const encodedUser = encodeURIComponent(username);
   const encodedPass = encodeURIComponent(password);
+  let vhost = "/";
+  if (cfg.rabbit_vhost != null && String(cfg.rabbit_vhost).trim() !== "") {
+    vhost = String(cfg.rabbit_vhost);
+  }
+  // amqp URL path is the vhost; encode so "/" stays %2F when non-default
+  const vhostPath =
+    vhost === "/" ? "/" : "/" + encodeURIComponent(vhost).replace(/%2F/gi, "%2F");
   const url =
-    `${layer.protocol}://${encodedUser}:${encodedPass}@${host}:${port}/` +
+    `${layer.protocol}://${encodedUser}:${encodedPass}@${host}:${port}${vhostPath}` +
     `?heartbeat=${RABBITMQ_HEARTBEAT_SECONDS}`;
+  const exchangeType =
+    cfg.rabbit_exchange_type != null && String(cfg.rabbit_exchange_type).trim() !== ""
+      ? String(cfg.rabbit_exchange_type).trim()
+      : "topic";
   return {
     configured: true,
     protocol: layer.protocol,
@@ -1063,7 +1112,9 @@ function buildRabbitOptions() {
     username,
     password,
     exchange,
+    exchangeType,
     routingKey: routingKeyTemplate,
+    vhost,
     url,
   };
 }
@@ -1596,11 +1647,45 @@ ipcMain.handle("set-agent-api-settings", async (_e, opts) => {
 
 ipcMain.handle("retry-print-host-register", async () => {
   try {
-    getStationPrinting().clearHostConflict();
+    const sp = getStationPrinting();
+    sp.clearHostConflict();
+    const cfg = readUserConfig();
+    if (!(cfg.pairing_code && String(cfg.pairing_code).trim())) {
+      const pairingError = {
+        code: "PAIRING_CODE_REQUIRED",
+        message: "Pairing code is required.",
+      };
+      pushState();
+      return {
+        ok: false,
+        error: pairingError.message,
+        code: pairingError.code,
+        pairingError,
+        stationPrinting: sp.publicHostState(),
+      };
+    }
     resetRabbitReconnectBackoff();
     await startRabbit();
     pushState();
-    return { ok: true, stationPrinting: getStationPrinting().publicHostState() };
+    const st = sp.publicHostState();
+    if (st.lastRegisterError) {
+      return {
+        ok: false,
+        error: st.lastRegisterError.message,
+        code: st.lastRegisterError.code,
+        pairingError: st.lastRegisterError,
+        stationPrinting: st,
+      };
+    }
+    if (st.hostConflict) {
+      return {
+        ok: false,
+        error: st.hostConflict.message,
+        code: st.hostConflict.code,
+        stationPrinting: st,
+      };
+    }
+    return { ok: true, stationPrinting: st };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
   }
@@ -1878,9 +1963,14 @@ async function pollPrinters() {
 function getRoutingForBranch(id) {
   const branch = String(id || "").trim();
   const routingKey = resolveRoutingKey(getRoutingKeyTemplate(), branch);
-  // Shared branch queue with Android. Option A: only the print host consumes
-  // (HostOnlyPolicy + single-active-consumer). Non-hosts must not basicConsume.
-  const queueName = branch ? `printer.Branch.${branch}` : "";
+  // Queue from register.rabbit.queue, else printer.Branch.{branchId}
+  let queueName = "";
+  try {
+    queueName = getStationPrinting().rabbitQueueName(branch);
+  } catch (_) {
+    queueName = branch ? `printer.Branch.${branch}` : "";
+  }
+  if (!queueName && branch) queueName = `printer.Branch.${branch}`;
   return {
     routingKey,
     queueName,
@@ -1981,19 +2071,27 @@ async function withTempRabbitChannel(fn) {
  * HostOnlyPolicy still nacks stray messages if this device is not the host.
  */
 async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
-  const sacArgs = getStationPrinting().rabbitConsumeArgs();
+  const declare = getStationPrinting().rabbitQueueDeclareOptions
+    ? getStationPrinting().rabbitQueueDeclareOptions()
+    : { durable: true, arguments: { "x-single-active-consumer": true } };
   const queueOpts = {
-    durable: true,
-    ...(Object.keys(sacArgs).length ? { arguments: sacArgs } : {}),
+    durable: declare.durable !== false,
+    ...(declare.arguments && Object.keys(declare.arguments).length
+      ? { arguments: declare.arguments }
+      : { arguments: { "x-single-active-consumer": true } }),
   };
 
   try {
+    const exType =
+      (readUserConfig().rabbit_exchange_type &&
+        String(readUserConfig().rabbit_exchange_type).trim()) ||
+      "topic";
     await withTempRabbitChannel(async (ch) => {
-      await ch.assertExchange(exchange, "topic", { durable: true });
+      await ch.assertExchange(exchange, exType, { durable: true });
       await ch.assertQueue(queueName, queueOpts);
       const keys = await bindBranchQueue(ch, queueName, exchange, routingKey, branchId);
       log(
-        `Queue ${queueName} ready (single-active-consumer) — bound to ${exchange} [${keys.join(", ")}]. Only the print host consumes.`,
+        `Queue ${queueName} ready (durable=${queueOpts.durable}, args=${JSON.stringify(queueOpts.arguments || {})}) — bound to ${exchange} [${keys.join(", ")}]. Only the print host consumes.`,
         "ℹ️"
       );
     });
@@ -2007,8 +2105,12 @@ async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
     "⚠️"
   );
 
+  const exTypeMigrate =
+    (readUserConfig().rabbit_exchange_type &&
+      String(readUserConfig().rabbit_exchange_type).trim()) ||
+    "topic";
   await withTempRabbitChannel(async (ch) => {
-    await ch.assertExchange(exchange, "topic", { durable: true });
+    await ch.assertExchange(exchange, exTypeMigrate, { durable: true });
     try {
       await ch.assertQueue(queueName, { durable: true });
     } catch (_) {}
@@ -2022,7 +2124,7 @@ async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
     await ch.assertQueue(queueName, queueOpts);
     const keys = await bindBranchQueue(ch, queueName, exchange, routingKey, branchId);
     log(
-      `Queue ${queueName} recreated with single-active-consumer — bound to ${exchange} [${keys.join(", ")}].`,
+      `Queue ${queueName} recreated with declare options — bound to ${exchange} [${keys.join(", ")}].`,
       "✅"
     );
   });
@@ -2199,6 +2301,16 @@ async function runAgentHeartbeat() {
   if (!sp.api.getToken()) return;
   const result = await sp.heartbeat({ branchId: state.branchId });
   if (!result || result.skipped) return;
+  if (result.authError || result.needsPairing) {
+    log(
+      "Agent token rejected (401/403) — cleared session. Enter a fresh pairing code to register again.",
+      "⚠️"
+    );
+    await stopRabbit();
+    state.rabbitmq = "idle";
+    pushState();
+    return;
+  }
   if (result.revoked) {
     log("Host revoked on heartbeat — cancelling Rabbit consumer.", "⚠️");
     await stopRabbit();
@@ -2251,14 +2363,11 @@ async function stopRabbit() {
 async function startRabbit() {
   const run = async () => {
     await stopRabbit();
-    const rabbitOpts = buildRabbitOptions();
-    if (!rabbitOpts.configured) {
-      state.rabbitmq = "idle";
-      state.channel = resolveRoutingKey(getRoutingKeyTemplate(), state.branchId);
-      pushState();
-      log("RabbitMQ broker host not configured — set connection in Settings when ready.", "ℹ️");
-      return;
-    }
+    let rabbitOpts = buildRabbitOptions();
+    const cfgEarly = readUserConfig();
+    const apiConfiguredEarly = Boolean(
+      cfgEarly.agent_api_base && String(cfgEarly.agent_api_base).trim()
+    );
 
     if (!String(state.branchId || "").trim()) {
       state.rabbitmq = "idle";
@@ -2268,81 +2377,136 @@ async function startRabbit() {
       return;
     }
 
-    if (!String(rabbitOpts.exchange || "").trim()) {
+    // When Agent API is configured, register first (may supply rabbit.*). Otherwise require local broker settings.
+    if (!apiConfiguredEarly) {
+      if (!rabbitOpts.configured) {
+        state.rabbitmq = "idle";
+        state.channel = resolveRoutingKey(getRoutingKeyTemplate(), state.branchId);
+        pushState();
+        log("RabbitMQ broker host not configured — set connection in Settings when ready.", "ℹ️");
+        return;
+      }
+      if (!String(rabbitOpts.exchange || "").trim()) {
+        state.rabbitmq = "idle";
+        pushState();
+        log("RabbitMQ exchange not set — set Exchange in Settings.", "ℹ️");
+        return;
+      }
+      log(
+        "Agent API base URL not set — configure it in Settings to claim print host. Rabbit stays idle.",
+        "ℹ️"
+      );
       state.rabbitmq = "idle";
       pushState();
-      log("RabbitMQ exchange not set — set Exchange in Settings.", "ℹ️");
-      return;
-    }
-
-    const { routingKey, queueName } = getRoutingForBranch(state.branchId);
-    if (!routingKey || !queueName) {
-      state.rabbitmq = "idle";
-      state.channel = routingKey || "";
-      pushState();
-      log("Routing key not set — set Routing key in Settings (e.g. orders.{branch_id}).", "ℹ️");
       return;
     }
 
     state.rabbitmq = "connecting";
-    state.channel = routingKey;
+    state.channel = resolveRoutingKey(getRoutingKeyTemplate(), state.branchId);
     pushState();
     rabbitStarting = true;
 
     try {
-      // Declare/bind on a throwaway connection first so a 406 cannot poison consume.
-      await ensureHostPrintQueue(
-        queueName,
-        rabbitOpts.exchange,
-        routingKey,
-        state.branchId
-      );
-
-      // Option A: register / honour host flag before consuming.
+      // Resume via heartbeat when token exists; otherwise register (pairing required).
       let sp;
-      try {
-        sp = getStationPrinting();
-        const reg = await sp.registerAsHost({ branchId: state.branchId });
-        if (reg && reg.conflict) {
-          state.rabbitmq = "idle";
+      const cfg0 = readUserConfig();
+      const apiConfigured = Boolean(cfg0.agent_api_base && String(cfg0.agent_api_base).trim());
+      if (apiConfigured) {
+        try {
+          sp = getStationPrinting();
+          const sess = await sp.ensureSession({ branchId: state.branchId });
+          if (sess && sess.needsPairing) {
+            state.rabbitmq = "idle";
+            log(
+              "Agent token missing or revoked — enter a fresh pairing code in Settings → Print host, then Save & register.",
+              "⚠️"
+            );
+            pushState();
+            return;
+          }
+          if (sess && sess.pairingError) {
+            state.rabbitmq = "idle";
+            log(`Register blocked: ${sess.pairingError.message}`, "⚠️");
+            pushState();
+            return;
+          }
+          if (sess && sess.conflict) {
+            state.rabbitmq = "idle";
+            log(
+              "RabbitMQ consumer idle — another device is print host (or this is a reinstall with a new app_id). Ask admin to Change print host in Settings → Printing to this device, then Retry.",
+              "⚠️"
+            );
+            pushState();
+            return;
+          }
+          if (sess && !sess.ok) {
+            state.rabbitmq = "idle";
+            const errMsg =
+              (sess.error && `${sess.error.code || ""} ${sess.error.message || ""}`.trim()) ||
+              "Session failed";
+            log(`Print-agent session failed: ${errMsg} — Rabbit stays idle.`, "⚠️");
+            pushState();
+            return;
+          }
+          if (sess && sess.resumed) {
+            log("Resumed print-host session via heartbeat (no re-register).", "✅");
+            if (sess.flushPending || (sess.pending_job_count > 0)) {
+              log(
+                "Held jobs may arrive with delayed=true after reconnect — server flush on heartbeat.",
+                "⏱️"
+              );
+            }
+          }
+          if (!sp.shouldConsume()) {
+            state.rabbitmq = "idle";
+            log(
+              "Not the print host for this branch — Rabbit consumer stays idle (HostOnlyPolicy).",
+              "ℹ️"
+            );
+            pushState();
+            startAgentHeartbeatLoop();
+            return;
+          }
+        } catch (regErr) {
           log(
-            "RabbitMQ consumer idle — another device is print host. Ask admin to Change print host in Settings → Printing, then Retry.",
+            "Print-agent session skipped/failed: " +
+              (regErr.message || String(regErr)) +
+              " — will not consume until host is confirmed.",
             "⚠️"
           );
-          pushState();
-          return;
-        }
-        if (!sp.shouldConsume()) {
-          state.rabbitmq = "idle";
-          log(
-            "Not the print host for this branch — Rabbit consumer stays idle (HostOnlyPolicy).",
-            "ℹ️"
-          );
-          pushState();
-          startAgentHeartbeatLoop();
-          return;
-        }
-      } catch (regErr) {
-        log(
-          "Print-agent register skipped/failed: " + (regErr.message || String(regErr)) + " — will not consume until host is confirmed.",
-          "⚠️"
-        );
-        // If API base is not configured, fall through only when legacy mode allowed?
-        // Option A: do not assume any agent may print. Stay idle without API proof of host.
-        const cfg = readUserConfig();
-        if (!(cfg.agent_api_base && String(cfg.agent_api_base).trim())) {
-          log(
-            "Agent API base URL not set — configure it in Settings to claim print host. Rabbit stays idle.",
-            "ℹ️"
-          );
           state.rabbitmq = "idle";
           pushState();
           return;
         }
+      }
+
+      // Rebuild broker options after register may have applied rabbit.* creds
+      rabbitOpts = buildRabbitOptions();
+      if (!rabbitOpts.configured || !String(rabbitOpts.exchange || "").trim()) {
         state.rabbitmq = "idle";
         pushState();
+        log("RabbitMQ not configured after register — set connection in Settings.", "ℹ️");
         return;
       }
+      const routed = getRoutingForBranch(state.branchId);
+      const liveRoutingKey = routed.routingKey;
+      const liveQueueName = routed.queueName;
+      if (!liveRoutingKey || !liveQueueName) {
+        state.rabbitmq = "idle";
+        state.channel = liveRoutingKey || "";
+        pushState();
+        log("Routing key / queue not set after register.", "ℹ️");
+        return;
+      }
+      state.channel = liveRoutingKey;
+
+      // Declare/bind on a throwaway connection first so a 406 cannot poison consume.
+      await ensureHostPrintQueue(
+        liveQueueName,
+        rabbitOpts.exchange,
+        liveRoutingKey,
+        state.branchId
+      );
 
       const connection = await amqp.connect(rabbitOpts.url, {
         timeout: RABBIT_CONNECT_TIMEOUT_MS,
@@ -2362,33 +2526,38 @@ async function startRabbit() {
       const channel = await connection.createChannel();
       rabbitChannel = channel;
 
-      await channel.prefetch(1);
+      const prefetchN =
+        getStationPrinting().rabbitPrefetch
+          ? getStationPrinting().rabbitPrefetch()
+          : 1;
+      await channel.prefetch(prefetchN);
+      const exchangeType = rabbitOpts.exchangeType || "topic";
       try {
-        await channel.assertExchange(rabbitOpts.exchange, "topic", { durable: true });
+        await channel.assertExchange(rabbitOpts.exchange, exchangeType, { durable: true });
       } catch (exErr) {
         if (!isInequivalentArgError(exErr)) throw exErr;
         // Exchange already exists with different args — continue and bind only.
         rabbitChannel = null;
         const nextCh = await connection.createChannel();
         rabbitChannel = nextCh;
-        await nextCh.prefetch(1);
+        await nextCh.prefetch(prefetchN);
       }
       const liveChannel = rabbitChannel;
-      await liveChannel.checkQueue(queueName);
+      await liveChannel.checkQueue(liveQueueName);
       const bound = await bindBranchQueue(
         liveChannel,
-        queueName,
+        liveQueueName,
         rabbitOpts.exchange,
-        routingKey,
+        liveRoutingKey,
         state.branchId
       );
       wireRabbitChannel(liveChannel);
 
-      // Contract: exclusive=false, prefetch=1 (channel.prefetch above). SAC is on the queue declare.
+      // Contract: exclusive=false; prefetch from register (default 1). SAC is on the queue declare.
       const consumeOpts = getStationPrinting().rabbitConsumeOptions
         ? getStationPrinting().rabbitConsumeOptions()
         : { exclusive: false, noAck: false };
-      const consumed = await liveChannel.consume(queueName, async (msg) => {
+      const consumed = await liveChannel.consume(liveQueueName, async (msg) => {
         if (!msg) {
           if (liveChannel === rabbitChannel && !app.isQuiting) {
             log("RabbitMQ consumer cancelled by broker — reconnecting...", "⚠️");
@@ -2397,7 +2566,7 @@ async function startRabbit() {
           return;
         }
         const message = msg.content ? msg.content.toString("utf8") : "";
-        const outcome = await handleMessage(routingKey, message);
+        const outcome = await handleMessage(liveRoutingKey, message);
         if (liveChannel !== rabbitChannel) return;
         try {
           if (outcome === "ack") liveChannel.ack(msg);
@@ -2411,7 +2580,7 @@ async function startRabbit() {
 
       let queueInfo = { messageCount: "?", consumerCount: "?" };
       try {
-        queueInfo = await liveChannel.checkQueue(queueName);
+        queueInfo = await liveChannel.checkQueue(liveQueueName);
       } catch (_) {}
 
       state.rabbitmq = "connected";
@@ -2420,7 +2589,7 @@ async function startRabbit() {
       ensureRabbitHealthCheck();
       log("RabbitMQ connected.", "✅");
       log(
-        `Consuming ${queueName} as print host (${queueInfo.messageCount} ready, ${queueInfo.consumerCount} consumers). Bindings: ${bound.join("; ") || "(none)"}`,
+        `Consuming ${liveQueueName} as print host (${queueInfo.messageCount} ready, ${queueInfo.consumerCount} consumers). Bindings: ${bound.join("; ") || "(none)"}`,
         "📡"
       );
       startAgentHeartbeatLoop();
@@ -2585,9 +2754,16 @@ async function handleMessage(channel, message) {
       // Prefer signed pdf_url (default delivery), then base64, then legacy file_path.
       if (remoteUrl) {
         try {
-          localPath = await saveIncomingPdf(store, jobId, remoteUrl, true);
+          const bearer =
+            (getStationPrinting().api && getStationPrinting().api.getToken()) ||
+            readUserConfig().agent_token ||
+            "";
+          localPath = await saveIncomingPdf(store, jobId, remoteUrl, true, {
+            authToken: bearer,
+          });
           saveSource = pdfUrl ? "pdf_url" : "file_path_url";
         } catch (urlErr) {
+          if (urlErr && urlErr.code === "PDF_URL_EXPIRED") throw urlErr;
           if (!pdfBase64) throw urlErr;
           log(
             `pdf_url download failed (${urlErr.message || String(urlErr)}) — falling back to pdf_base64.`,
@@ -2613,22 +2789,46 @@ async function handleMessage(channel, message) {
         localPath = await saveIncomingPdf(store, jobId, localFilePath, false);
         saveSource = "file_path";
       }
-      // Best-effort sha256 check when server provided one
+      // Contract: pdf_sha256 mismatch → ack failed PDF_CHECKSUM_MISMATCH; do not print
       if (parsed.pdf_sha256 && localPath) {
-        try {
-          const cryptoNode = require("crypto");
-          const buf = fs.readFileSync(localPath);
-          const digest = cryptoNode.createHash("sha256").update(buf).digest("hex");
-          if (digest.toLowerCase() !== String(parsed.pdf_sha256).toLowerCase()) {
-            log(
-              `pdf_sha256 mismatch (got ${digest.slice(0, 12)}… expected ${String(parsed.pdf_sha256).slice(0, 12)}…) — printing anyway.`,
-              "⚠️"
-            );
+        const buf = fs.readFileSync(localPath);
+        const check = verifyPdfChecksum(buf, parsed.pdf_sha256);
+        if (!check.ok) {
+          const reason = check.reason || "PDF_CHECKSUM_MISMATCH";
+          log(
+            `pdf_sha256 mismatch (got ${(check.digest || "").slice(0, 12)}… expected ${String(parsed.pdf_sha256).slice(0, 12)}…) — ack failed, not printing.`,
+            "❌"
+          );
+          store.upsert({
+            id: jobId,
+            file: preferredName,
+            orderId,
+            serverJobId,
+            printerName,
+            printerExternalId,
+            delayed: !!parsed.delayed,
+            ticketType: parsed.ticket_type,
+            status: "failed-setup",
+            attemptNumber: 0,
+            nextRetryAt: null,
+            lastError: reason,
+            channel,
+            localPath,
+          });
+          syncJobsToState();
+          pushState();
+          if (serverJobId) {
+            sp.ackFailed(serverJobId, reason, { printerExternalId }).catch(() => {});
           }
-        } catch (_) {}
+          return "reject";
+        }
       }
     } catch (err) {
-      log("Could not save PDF: " + err.message, "❌");
+      const failReason =
+        err && err.code === "PDF_URL_EXPIRED"
+          ? "PDF_URL_EXPIRED"
+          : err.message || "save_failed";
+      log("Could not save PDF: " + failReason, "❌");
       store.upsert({
         id: jobId,
         file: preferredName,
@@ -2641,15 +2841,16 @@ async function handleMessage(channel, message) {
         status: "failed-setup",
         attemptNumber: 0,
         nextRetryAt: null,
-        lastError: err.message || String(err),
+        lastError: failReason,
         channel,
         localPath: "",
       });
       syncJobsToState();
       pushState();
       if (serverJobId) {
-        sp.ackFailed(serverJobId, err.message || "save_failed", {
+        sp.ackFailed(serverJobId, failReason, {
           printerExternalId,
+          retryable: failReason === "PDF_URL_EXPIRED" ? false : undefined,
         }).catch(() => {});
       }
       return "reject";

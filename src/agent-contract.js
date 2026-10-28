@@ -15,9 +15,14 @@ const ERROR_CODES = Object.freeze({
   PRINT_HOST_ALREADY_CONFIGURED: "PRINT_HOST_ALREADY_CONFIGURED",
   PAIRING_CODE_INVALID: "PAIRING_CODE_INVALID",
   PAIRING_CODE_EXPIRED: "PAIRING_CODE_EXPIRED",
+  PAIRING_CODE_REQUIRED: "PAIRING_CODE_REQUIRED",
   NOT_PRINT_HOST: "NOT_PRINT_HOST",
   HOST_EPOCH_MISMATCH: "HOST_EPOCH_MISMATCH",
   BRANCH_MISMATCH: "BRANCH_MISMATCH",
+  PDF_CHECKSUM_MISMATCH: "PDF_CHECKSUM_MISMATCH",
+  PDF_URL_EXPIRED: "PDF_URL_EXPIRED",
+  VALIDATION_ERROR: "VALIDATION_ERROR",
+  UNAUTHORIZED: "UNAUTHORIZED",
 });
 
 /** Relative paths under /api/v1/print-agent */
@@ -59,12 +64,24 @@ const ASSUMPTIONS = Object.freeze({
   /** printers/sync keyed by external_id; server assigns numeric id */
   printersSyncKey: "external_id",
   printersServerAssignsId: true,
+  /** Apply register.rabbit broker fields into local Rabbit settings */
+  applyRabbitFromRegister: true,
+  /** Default queue name when rabbit.queue omitted */
+  defaultQueueTemplate: "printer.Branch.{branchId}",
+  defaultQueueDurable: true,
+  defaultQueueArguments: Object.freeze({ "x-single-active-consumer": true }),
+  /** pdf_sha256 mismatch → ack failed PDF_CHECKSUM_MISMATCH; do not print */
+  pdfSha256MismatchFails: true,
+  /** pdf_url is signed/short-lived; fetch with Bearer; 403/410 → PDF_URL_EXPIRED */
+  pdfUrlRequiresBearer: true,
+  /** Restart with token resumes via heartbeat (no re-register) */
+  resumeViaHeartbeat: true,
+  /** app_id stable across app updates; reinstall creates a new id (server 409) */
+  appIdStableAcrossUpdates: true,
 });
 
 /** Open / deferred items from contract §11 that Desktop does not fully own. */
 const REMAINING_GAPS = Object.freeze([
-  "Optional apply of register.rabbit credentials into local Rabbit settings (fields present; UI/ops may still configure manually).",
-  "pdf_sha256 verification on download is best-effort; failure still attempts print with a warning.",
   "Deregister clears branch host on server — product confirmation is with Work Planner, not Desktop.",
 ]);
 
@@ -80,8 +97,8 @@ function buildRegisterRequest({
   const code = pairingCode != null ? String(pairingCode).trim() : "";
   const label = deviceLabel != null ? String(deviceLabel).trim() : "";
   if (!code) {
-    const err = new Error("pairing_code is required");
-    err.code = "VALIDATION_ERROR";
+    const err = new Error("Pairing code is required.");
+    err.code = ERROR_CODES.PAIRING_CODE_REQUIRED;
     throw err;
   }
   if (!label) {
@@ -120,6 +137,8 @@ function parseRegisterResponse(data) {
   const token = src.token != null ? String(src.token) : "";
   const isPrintHost = Boolean(src.is_print_host ?? src.isPrintHost);
   const hostEpoch = Number(src.host_epoch ?? src.hostEpoch ?? 1);
+  const branchId = src.branch_id != null ? src.branch_id : null;
+  const rabbitRaw = src.rabbit && typeof src.rabbit === "object" ? src.rabbit : null;
   return {
     ok: true,
     token,
@@ -127,11 +146,12 @@ function parseRegisterResponse(data) {
     is_print_host: isPrintHost,
     host_epoch: Number.isFinite(hostEpoch) ? hostEpoch : 1,
     app_id: src.app_id != null ? String(src.app_id) : null,
-    branch_id: src.branch_id != null ? src.branch_id : null,
+    branch_id: branchId,
     heartbeat_interval_seconds: Number(src.heartbeat_interval_seconds) || 30,
     heartbeat_ttl_seconds: Number(src.heartbeat_ttl_seconds) || 90,
     station_printing_enabled: src.station_printing_enabled,
-    rabbit: src.rabbit && typeof src.rabbit === "object" ? src.rabbit : null,
+    rabbit: rabbitRaw,
+    rabbitConfig: normalizeRabbitConfig(rabbitRaw, branchId),
     raw: data,
   };
 }
@@ -429,6 +449,214 @@ function parsePrintMessage(raw) {
   };
 }
 
+/**
+ * Normalize register.rabbit (+ defaults). Queue falls back to printer.Branch.{branchId}.
+ */
+function normalizeRabbitConfig(rabbit, branchId) {
+  const r = rabbit && typeof rabbit === "object" ? rabbit : {};
+  const branch = branchId != null ? String(branchId).trim() : "";
+  const defaultQueue = branch
+    ? `printer.Branch.${branch}`
+    : "";
+  const queue =
+    r.queue != null && String(r.queue).trim() !== ""
+      ? String(r.queue).trim()
+      : defaultQueue;
+  let queueArguments =
+    r.queue_arguments && typeof r.queue_arguments === "object"
+      ? { ...r.queue_arguments }
+      : { ...ASSUMPTIONS.defaultQueueArguments };
+  if (
+    ASSUMPTIONS.rabbitSingleActiveConsumer &&
+    queueArguments["x-single-active-consumer"] == null
+  ) {
+    queueArguments["x-single-active-consumer"] = true;
+  }
+  const durable =
+    r.queue_durable != null ? Boolean(r.queue_durable) : ASSUMPTIONS.defaultQueueDurable;
+  const portRaw = r.port != null ? Number(r.port) : null;
+  return {
+    host: r.host != null ? String(r.host).trim() : "",
+    port: Number.isFinite(portRaw) && portRaw > 0 ? Math.floor(portRaw) : null,
+    vhost: r.vhost != null ? String(r.vhost) : "/",
+    username: r.username != null ? String(r.username).trim() : "",
+    password: r.password != null ? String(r.password) : "",
+    exchange: r.exchange != null ? String(r.exchange).trim() : "",
+    exchange_type:
+      r.exchange_type != null && String(r.exchange_type).trim() !== ""
+        ? String(r.exchange_type).trim()
+        : "topic",
+    routing_key: r.routing_key != null ? String(r.routing_key).trim() : "",
+    queue,
+    queue_durable: durable,
+    queue_arguments: queueArguments,
+    consume_exclusive:
+      r.consume_exclusive != null
+        ? Boolean(r.consume_exclusive)
+        : ASSUMPTIONS.consumeExclusive,
+    prefetch:
+      r.prefetch != null && Number.isFinite(Number(r.prefetch))
+        ? Number(r.prefetch)
+        : ASSUMPTIONS.prefetch,
+    hasBrokerCreds: Boolean(
+      (r.host && String(r.host).trim()) ||
+        (r.username && String(r.username).trim()) ||
+        (r.password != null && String(r.password) !== "")
+    ),
+  };
+}
+
+/** Config patch to persist rabbit from register into local settings. */
+function rabbitConfigToPersistPatch(rabbitConfig) {
+  if (!rabbitConfig || typeof rabbitConfig !== "object") return {};
+  const patch = {
+    rabbit_queue: rabbitConfig.queue || "",
+    rabbit_queue_durable: rabbitConfig.queue_durable !== false,
+    rabbit_queue_arguments: rabbitConfig.queue_arguments || {
+      "x-single-active-consumer": true,
+    },
+    rabbit_consume_exclusive: Boolean(rabbitConfig.consume_exclusive),
+    rabbit_prefetch:
+      rabbitConfig.prefetch != null ? Number(rabbitConfig.prefetch) : 1,
+    rabbit_exchange_type: rabbitConfig.exchange_type || "topic",
+    rabbit_vhost: rabbitConfig.vhost != null ? rabbitConfig.vhost : "/",
+  };
+  if (rabbitConfig.host) patch.rabbit_host = rabbitConfig.host;
+  if (rabbitConfig.port != null) patch.rabbit_port = rabbitConfig.port;
+  if (rabbitConfig.username) patch.rabbit_username = rabbitConfig.username;
+  if (rabbitConfig.password !== "" && rabbitConfig.password != null) {
+    patch.rabbit_password = rabbitConfig.password;
+  }
+  if (rabbitConfig.exchange) patch.rabbit_exchange = rabbitConfig.exchange;
+  if (rabbitConfig.routing_key) patch.rabbit_routing_key = rabbitConfig.routing_key;
+  return patch;
+}
+
+/** Queue declare options from persisted config or defaults. */
+function resolveQueueDeclareOptions(cfg = {}) {
+  const durable =
+    cfg.rabbit_queue_durable != null
+      ? Boolean(cfg.rabbit_queue_durable)
+      : ASSUMPTIONS.defaultQueueDurable;
+  let args =
+    cfg.rabbit_queue_arguments && typeof cfg.rabbit_queue_arguments === "object"
+      ? { ...cfg.rabbit_queue_arguments }
+      : { ...ASSUMPTIONS.defaultQueueArguments };
+  if (args["x-single-active-consumer"] == null && ASSUMPTIONS.rabbitSingleActiveConsumer) {
+    args["x-single-active-consumer"] = true;
+  }
+  return { durable, arguments: args };
+}
+
+function resolveQueueName(cfg = {}, branchId) {
+  const fromCfg =
+    cfg.rabbit_queue != null ? String(cfg.rabbit_queue).trim() : "";
+  if (fromCfg) return fromCfg;
+  const branch = branchId != null ? String(branchId).trim() : "";
+  return branch ? `printer.Branch.${branch}` : "";
+}
+
+/**
+ * Agent error body: { error: { code, message } } + HTTP status.
+ */
+function parseAgentError(payload, httpStatus) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const err = root.error && typeof root.error === "object" ? root.error : null;
+  const code =
+    (err && err.code != null && String(err.code)) ||
+    (root.code != null && String(root.code)) ||
+    "HTTP_" + String(httpStatus || 0);
+  const message =
+    (err && err.message != null && String(err.message).trim()) ||
+    (root.message != null && String(root.message).trim()) ||
+    `Request failed (${httpStatus})`;
+  return { code, message, status: httpStatus, details: err || root };
+}
+
+/**
+ * Flat ack/status success. Tolerates accidental { data } envelope.
+ */
+function unwrapFlatAgentSuccess(data) {
+  if (!data || typeof data !== "object") return {};
+  if (
+    data.data &&
+    typeof data.data === "object" &&
+    data.id == null &&
+    data.status == null &&
+    data.ok === true
+  ) {
+    return data.data;
+  }
+  if (data.data && typeof data.data === "object" && data.token == null && data.status == null && data.id == null) {
+    // Prefer data when root only has ok/data wrapper
+    const keys = Object.keys(data).filter((k) => k !== "ok" && k !== "data");
+    if (keys.length === 0) return data.data;
+  }
+  return data;
+}
+
+function parseAckResponse(data, httpStatus) {
+  if (httpStatus < 200 || httpStatus >= 300) {
+    return { ok: false, error: parseAgentError(data, httpStatus) };
+  }
+  const src = unwrapFlatAgentSuccess(data);
+  return {
+    ok: true,
+    id: src.id != null ? src.id : null,
+    status: src.status != null ? String(src.status) : null,
+    attempts: src.attempts != null ? Number(src.attempts) : null,
+    raw: data,
+  };
+}
+
+function parsePrinterStatusResponse(data, httpStatus) {
+  if (httpStatus < 200 || httpStatus >= 300) {
+    return { ok: false, error: parseAgentError(data, httpStatus) };
+  }
+  const src = unwrapFlatAgentSuccess(data);
+  return {
+    ok: true,
+    id: src.id != null ? src.id : null,
+    status: src.status != null ? String(src.status) : null,
+    status_detail: src.status_detail != null ? String(src.status_detail) : null,
+    raw: data,
+  };
+}
+
+/**
+ * Verify PDF bytes against pdf_sha256. Mismatch → PDF_CHECKSUM_MISMATCH.
+ */
+function classifyPdfUrlHttpStatus(status) {
+  const s = Number(status);
+  if (s === 403 || s === 410) {
+    return {
+      expired: true,
+      reason: ERROR_CODES.PDF_URL_EXPIRED,
+      retryable: false,
+    };
+  }
+  return { expired: false, reason: null, retryable: true };
+}
+
+function verifyPdfChecksum(buffer, expectedSha256) {
+  if (expectedSha256 == null || String(expectedSha256).trim() === "") {
+    return { ok: true, skipped: true };
+  }
+  const crypto = require("crypto");
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  const digest = crypto.createHash("sha256").update(buf).digest("hex");
+  const expected = String(expectedSha256).trim().toLowerCase();
+  if (digest.toLowerCase() !== expected) {
+    return {
+      ok: false,
+      reason: ERROR_CODES.PDF_CHECKSUM_MISMATCH,
+      digest,
+      expected,
+    };
+  }
+  return { ok: true, digest };
+}
+
 function resolveApiUrl(apiBase, path) {
   const base = String(apiBase || "")
     .trim()
@@ -467,6 +695,15 @@ module.exports = {
   buildPrintersSyncRequest,
   parsePrintersSyncResponse,
   parsePrintMessage,
+  normalizeRabbitConfig,
+  rabbitConfigToPersistPatch,
+  resolveQueueDeclareOptions,
+  resolveQueueName,
+  parseAgentError,
+  parseAckResponse,
+  parsePrinterStatusResponse,
+  verifyPdfChecksum,
+  classifyPdfUrlHttpStatus,
   resolveApiUrl,
   mapPrinterForApi,
 };

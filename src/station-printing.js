@@ -17,6 +17,10 @@ const {
   parsePrintMessage,
   ERROR_CODES,
   PLATFORM,
+  rabbitConfigToPersistPatch,
+  resolveQueueDeclareOptions,
+  resolveQueueName,
+  normalizeRabbitConfig,
 } = require("./agent-contract");
 
 function createStationPrintingController(deps = {}) {
@@ -44,6 +48,8 @@ function createStationPrintingController(deps = {}) {
   });
 
   let hostConflict = null; // 409 payload for UI
+  let lastRegisterError = null; // { code, message } for inline UI
+  let needsPairing = false; // prompt UI after token revoke / deregister
   let lastHeartbeatAt = null;
   let consumeEnabled = policy.shouldConsume();
   let flushPending = false;
@@ -74,7 +80,15 @@ function createStationPrintingController(deps = {}) {
       agentApiBase: String(readConfig().agent_api_base || ""),
       deviceLabel: String(readConfig().device_label || defaultDeviceLabel()),
       pairingCodeConfigured: Boolean(String(readConfig().pairing_code || "").trim()),
+      pairingError: lastRegisterError,
+      lastRegisterError,
+      needsPairing: Boolean(needsPairing),
+      pairingPrompt:
+        needsPairing
+          ? "Agent token was revoked or cleared. Enter a fresh pairing code, then Save & register."
+          : null,
       contractVersion: ASSUMPTIONS.contractVersion,
+      rabbitQueue: resolveQueueName(readConfig(), readConfig().branch_id),
     };
   }
 
@@ -105,6 +119,43 @@ function createStationPrintingController(deps = {}) {
   }
 
   /**
+   * Clear local agent auth after deregister or 401/403 token revoke.
+   * Deletes token, host flags, epoch; clears pairing code so a fresh one is required.
+   */
+  function clearLocalAuth(reason) {
+    api.setToken("");
+    policy.revoke(reason || "token_cleared");
+    policy.applyServerState({ is_print_host: false, host_epoch: 1 });
+    consumeEnabled = false;
+    needsPairing = true;
+    hostConflict = null;
+    writeConfig({
+      agent_token: "",
+      pairing_code: "",
+      is_print_host: false,
+      host_epoch: 1,
+    });
+    persistHostFlags();
+    onStateChange(publicHostState());
+    log(
+      `Agent session cleared (${reason || "auth"}) — enter a fresh pairing code to register again.`,
+      "⚠️"
+    );
+  }
+
+  function handleAuthFailure(result, context) {
+    if (!result || !result.authError) return false;
+    clearLocalAuth(context || "token_revoked");
+    lastRegisterError = {
+      code: (result.error && result.error.code) || "UNAUTHORIZED",
+      message:
+        (result.error && result.error.message) ||
+        "Agent token rejected. Enter a fresh pairing code.",
+    };
+    return true;
+  }
+
+  /**
    * Register as print host. pairing_code + role print_host required (contract §2.1).
    * On 409, Rabbit must stay idle.
    */
@@ -128,12 +179,22 @@ function createStationPrintingController(deps = {}) {
           null,
       });
     } catch (err) {
-      if (err && err.code === "VALIDATION_ERROR") {
-        log(`Register validation: ${err.message}`, "❌");
+      if (
+        err &&
+        (err.code === ERROR_CODES.PAIRING_CODE_REQUIRED ||
+          err.code === "VALIDATION_ERROR" ||
+          err.code === ERROR_CODES.VALIDATION_ERROR)
+      ) {
+        lastRegisterError = {
+          code: err.code || ERROR_CODES.PAIRING_CODE_REQUIRED,
+          message: err.message || "Pairing code is required.",
+        };
+        log(`Register validation: ${lastRegisterError.message}`, "❌");
         onStateChange(publicHostState());
         return {
           ok: false,
-          error: { code: "VALIDATION_ERROR", message: err.message },
+          error: lastRegisterError,
+          pairingError: lastRegisterError,
           shouldConsume: false,
         };
       }
@@ -142,6 +203,10 @@ function createStationPrintingController(deps = {}) {
 
     if (!result.ok && result.conflict) {
       hostConflict = result.conflict;
+      lastRegisterError = {
+        code: result.conflict.code,
+        message: result.conflict.message,
+      };
       policy.revoke("print_host_already_configured");
       consumeEnabled = false;
       persistHostFlags();
@@ -151,8 +216,12 @@ function createStationPrintingController(deps = {}) {
     }
 
     if (!result.ok) {
+      lastRegisterError = result.error || {
+        code: "REGISTER_FAILED",
+        message: "Register failed",
+      };
       log(
-        `Register failed: ${(result.error && result.error.message) || "unknown"}`,
+        `Register failed: ${lastRegisterError.code || ""} ${lastRegisterError.message || "unknown"}`.trim(),
         "❌"
       );
       onStateChange(publicHostState());
@@ -160,15 +229,33 @@ function createStationPrintingController(deps = {}) {
     }
 
     hostConflict = null;
+    lastRegisterError = null;
+    needsPairing = false;
     if (result.token) {
       writeConfig({ agent_token: result.token });
       api.setToken(result.token);
     }
+    const patch = {};
     if (result.heartbeat_interval_seconds) {
-      writeConfig({
-        heartbeat_interval_seconds: result.heartbeat_interval_seconds,
-        heartbeat_ttl_seconds: result.heartbeat_ttl_seconds || 90,
-      });
+      patch.heartbeat_interval_seconds = result.heartbeat_interval_seconds;
+      patch.heartbeat_ttl_seconds = result.heartbeat_ttl_seconds || 90;
+    }
+    if (result.branch_id != null) {
+      patch.branch_id = String(result.branch_id);
+    }
+    // Persist rabbit.queue / durable / arguments and apply broker creds when present
+    const rabbitConfig =
+      result.rabbitConfig ||
+      normalizeRabbitConfig(result.rabbit, result.branch_id || branchId || cfg.branch_id);
+    Object.assign(patch, rabbitConfigToPersistPatch(rabbitConfig));
+    if (Object.keys(patch).length) writeConfig(patch);
+    if (rabbitConfig.hasBrokerCreds) {
+      log(
+        `Applied Rabbit settings from register (${rabbitConfig.host || "host?"}:${rabbitConfig.port || "?"}, queue ${rabbitConfig.queue}).`,
+        "⚙️"
+      );
+    } else if (rabbitConfig.queue) {
+      log(`Using print queue ${rabbitConfig.queue} (from register / default).`, "ℹ️");
     }
     const applied = policy.applyServerState({
       is_print_host: result.is_print_host,
@@ -190,6 +277,7 @@ function createStationPrintingController(deps = {}) {
       promoted: applied.promoted,
       revoked: applied.revoked,
       rabbit: result.rabbit || null,
+      rabbitConfig,
     };
   }
 
@@ -207,6 +295,15 @@ function createStationPrintingController(deps = {}) {
     lastHeartbeatAt = new Date().toISOString();
 
     if (!result.ok) {
+      if (handleAuthFailure(result, "heartbeat_unauthorized")) {
+        return {
+          ok: false,
+          authError: true,
+          needsPairing: true,
+          error: lastRegisterError,
+          shouldConsume: false,
+        };
+      }
       onStateChange(publicHostState());
       return { ok: false, error: result.error, shouldConsume: consumeEnabled };
     }
@@ -237,12 +334,57 @@ function createStationPrintingController(deps = {}) {
 
   async function deregister() {
     try {
-      await api.deregister({});
+      await api.deregister({ reason: "explicit_deregister" });
     } catch (_) {}
-    policy.revoke("deregister");
-    consumeEnabled = false;
-    persistHostFlags();
-    onStateChange(publicHostState());
+    // Explicit deregister revokes token and clears host on server — mirror locally.
+    clearLocalAuth("deregister");
+    return { ok: true, needsPairing: true };
+  }
+
+  /**
+   * Resume existing session via heartbeat when token is present; otherwise register.
+   * Restart with same app_id + valid token must not call register again.
+   */
+  async function ensureSession({ branchId } = {}) {
+    const cfg = readConfig();
+    api.setApiBase(cfg.agent_api_base || "");
+    const token = api.getToken() || cfg.agent_token || "";
+    if (token && String(token).trim()) {
+      api.setToken(token);
+      const hb = await heartbeat({ branchId });
+      if (hb.authError || hb.needsPairing) {
+        return {
+          ok: false,
+          resumed: false,
+          needsPairing: true,
+          error: hb.error,
+          shouldConsume: false,
+        };
+      }
+      if (!hb.ok && hb.skipped) {
+        return { ok: false, resumed: false, skipped: true, shouldConsume: false };
+      }
+      if (!hb.ok) {
+        return {
+          ok: false,
+          resumed: true,
+          error: hb.error,
+          shouldConsume: consumeEnabled,
+        };
+      }
+      return {
+        ok: true,
+        resumed: true,
+        shouldConsume: consumeEnabled,
+        promoted: hb.promoted,
+        revoked: hb.revoked,
+        pending_job_count: hb.pending_job_count,
+        flushPending: hb.flushPending || flushPending,
+      };
+    }
+    // No token — must register with pairing code
+    const reg = await registerAsHost({ branchId });
+    return { ...reg, resumed: false };
   }
 
   async function syncPrintersToServer({ branchId } = {}) {
@@ -253,6 +395,9 @@ function createStationPrintingController(deps = {}) {
       branchId: branchId || cfg.branch_id,
       printers: printers.toSyncPayload(),
     });
+    if (handleAuthFailure(result, "sync_unauthorized")) {
+      return { ok: false, authError: true, needsPairing: true, error: lastRegisterError };
+    }
     if (result.ok && Array.isArray(result.printers) && result.printers.length) {
       printers.applyServerSync(result.printers);
       persistHostFlags();
@@ -357,18 +502,36 @@ function createStationPrintingController(deps = {}) {
   }
 
   function rabbitConsumeArgs() {
-    // Prefer single-active-consumer so a second device is standby only.
-    return ASSUMPTIONS.rabbitSingleActiveConsumer
-      ? { "x-single-active-consumer": true }
-      : {};
+    const opts = resolveQueueDeclareOptions(readConfig());
+    return opts.arguments || { "x-single-active-consumer": true };
+  }
+
+  function rabbitQueueDeclareOptions() {
+    return resolveQueueDeclareOptions(readConfig());
+  }
+
+  function rabbitQueueName(branchId) {
+    const cfg = readConfig();
+    return resolveQueueName(cfg, branchId || cfg.branch_id);
   }
 
   /** Consume options: exclusive must be false; prefetch is set on the channel. */
   function rabbitConsumeOptions() {
+    const cfg = readConfig();
+    const exclusive =
+      cfg.rabbit_consume_exclusive != null
+        ? Boolean(cfg.rabbit_consume_exclusive)
+        : ASSUMPTIONS.consumeExclusive;
     return {
-      exclusive: ASSUMPTIONS.consumeExclusive === true,
+      exclusive: exclusive === true,
       noAck: false,
     };
+  }
+
+  function rabbitPrefetch() {
+    const cfg = readConfig();
+    const n = Number(cfg.rabbit_prefetch);
+    return Number.isFinite(n) && n > 0 ? n : ASSUMPTIONS.prefetch;
   }
 
   return {
@@ -384,7 +547,9 @@ function createStationPrintingController(deps = {}) {
     setDeviceLabel,
     setPairingCode,
     clearHostConflict,
+    clearLocalAuth,
     registerAsHost,
+    ensureSession,
     heartbeat,
     deregister,
     syncPrintersToServer,
@@ -397,12 +562,21 @@ function createStationPrintingController(deps = {}) {
     markFlushDone,
     shouldConsume,
     rabbitConsumeArgs,
+    rabbitQueueDeclareOptions,
+    rabbitQueueName,
     rabbitConsumeOptions,
+    rabbitPrefetch,
     get flushPending() {
       return flushPending;
     },
     get hostConflict() {
       return hostConflict;
+    },
+    get lastRegisterError() {
+      return lastRegisterError;
+    },
+    get needsPairing() {
+      return needsPairing;
     },
   };
 }

@@ -16,6 +16,9 @@ const {
   buildAckRequest,
   buildPrintersSyncRequest,
   parsePrintersSyncResponse,
+  parseAckResponse,
+  parsePrinterStatusResponse,
+  parseAgentError,
   resolveApiUrl,
   ERROR_CODES,
 } = require("./agent-contract");
@@ -95,16 +98,13 @@ function createAgentApi(options = {}) {
       };
     }
     if (status < 200 || status >= 300) {
+      const error = parseAgentError(data, status);
       return {
         ok: false,
         status,
-        error: {
-          code: (data && data.error && data.error.code) || "REGISTER_FAILED",
-          message:
-            (data && data.error && data.error.message) ||
-            (data && data.message) ||
-            `Register failed (${status})`,
-        },
+        error,
+        code: error.code,
+        message: error.message,
       };
     }
     const parsed = parseRegisterResponse(data);
@@ -150,8 +150,28 @@ function createAgentApi(options = {}) {
   async function syncPrinters(fields) {
     const body = buildPrintersSyncRequest(fields);
     const { status, data } = await call("POST", ENDPOINTS.printersSync, body);
+    if (status === 401 || status === 403) {
+      return {
+        ok: false,
+        status,
+        authError: true,
+        error: parseAgentError(data, status),
+        code: parseAgentError(data, status).code,
+        message: parseAgentError(data, status).message,
+        ...parsePrintersSyncResponse({}),
+      };
+    }
     if (status < 200 || status >= 300) {
-      return { ok: false, status, data, ...parsePrintersSyncResponse({}) };
+      const error = parseAgentError(data, status);
+      return {
+        ok: false,
+        status,
+        error,
+        code: error.code,
+        message: error.message,
+        data,
+        ...parsePrintersSyncResponse({}),
+      };
     }
     return { ok: true, status, ...parsePrintersSyncResponse(data), raw: data };
   }
@@ -163,7 +183,19 @@ function createAgentApi(options = {}) {
       ENDPOINTS.jobAck(jobId),
       body
     );
-    return { ok: status >= 200 && status < 300, status, data };
+    const parsed = parseAckResponse(data, status);
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        status,
+        authError: status === 401 || status === 403,
+        error: parsed.error,
+        code: parsed.error.code,
+        message: parsed.error.message,
+        data,
+      };
+    }
+    return { ok: true, status, ...parsed };
   }
 
   async function reportPrinterStatus(printerId, payload) {
@@ -176,7 +208,19 @@ function createAgentApi(options = {}) {
       ENDPOINTS.printerStatus(pathId),
       payload || {}
     );
-    return { ok: status >= 200 && status < 300, status, data };
+    const parsed = parsePrinterStatusResponse(data, status);
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        status,
+        authError: status === 401 || status === 403,
+        error: parsed.error,
+        code: parsed.error.code,
+        message: parsed.error.message,
+        data,
+      };
+    }
+    return { ok: true, status, ...parsed };
   }
 
   return {
