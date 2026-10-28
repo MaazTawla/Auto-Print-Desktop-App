@@ -21,6 +21,8 @@ const axios = require("axios");
 const amqp = require("amqplib");
 const { watchWindowsPrintJob } = require("./print-job-tracker");
 const { createPrintJobsStore } = require("./print-jobs-store");
+const { createStationPrintingController } = require("./station-printing");
+const { ASSUMPTIONS: STATION_PRINT_ASSUMPTIONS } = require("./agent-contract");
 
 /** Delays after failed attempts 1, 2, 3 before attempts 2, 3, 4 (exponential-style backoff). */
 const RETRY_DELAYS_MS = [5000, 30000, 60000];
@@ -172,6 +174,14 @@ function clearRetryTimer(jobId) {
 }
 
 function moveJobToDlq(jobId, errMsg) {
+  try {
+    const j = getJobsStore().findById(jobId);
+    if (j && j.serverJobId) {
+      getStationPrinting()
+        .ackFailed(j.serverJobId, errMsg || "print_failed")
+        .catch(() => {});
+    }
+  } catch (_) {}
   clearRetryTimer(jobId);
   const store = getJobsStore();
   const job = store.findById(jobId);
@@ -613,12 +623,15 @@ async function runPrintAttempt(jobId) {
   const job = store.findById(jobId);
   if (!job || job.status === "completed" || job.status === "dlq") return;
 
-  const printerName = state.defaultPrinter;
+  const printerName = (job.printerName && String(job.printerName).trim()) || state.defaultPrinter;
   if (!printerName) {
     store.upsert({ ...job, status: "failed-setup", lastError: "No default printer selected" });
     syncJobsToState();
     pushState();
     log(`Job ${job.file}: no default printer — cannot print.`, "❌");
+    if (job.serverJobId) {
+      try { getStationPrinting().ackFailed(job.serverJobId, "no_printer"); } catch (_) {}
+    }
     return;
   }
 
@@ -688,6 +701,11 @@ async function runPrintAttempt(jobId) {
         at: new Date().toISOString(),
       };
       log(`Print completed: ${j.file}`, "🖨️");
+      if (j.serverJobId) {
+        getStationPrinting()
+          .ackPrinted(j.serverJobId)
+          .catch((err) => log("Ack printed failed: " + (err.message || String(err)), "⚠️"));
+      }
       syncJobsToState();
       pushState();
       return;
@@ -1056,6 +1074,24 @@ const {
   jobRetentionDays: initialJobRetentionDays,
 } = loadConfig();
 
+// ─── Station printing (Option A — single print host) ───────────────────────────
+let stationPrinting = null;
+let agentHeartbeatTimer = null;
+const AGENT_HEARTBEAT_MS = STATION_PRINT_ASSUMPTIONS.heartbeatIntervalMs || 30000;
+
+function getStationPrinting() {
+  if (stationPrinting) return stationPrinting;
+  stationPrinting = createStationPrintingController({
+    readConfig: readUserConfig,
+    writeConfig: saveUserConfig,
+    log,
+    onStateChange: () => {
+      try { pushState(); } catch (_) {}
+    },
+  });
+  return stationPrinting;
+}
+
 // ─── State ────────────────────────────────────────────────────────────────────
 let state = {
   rabbitmq: isRabbitBrokerConfigured() ? "connecting" : "idle", // idle | connecting | connected | error
@@ -1082,6 +1118,8 @@ let state = {
     freePercent: null,
     checkedAt: null,
   },
+  // Station printing host state (mirrors controller; refreshed via pushState)
+  stationPrinting: null,
 };
 
 function getEffectiveLogRetentionDays() {
@@ -1329,6 +1367,13 @@ function getPublicState() {
     userDataPath: app.getPath("userData"),
     platform: process.platform,
     printJobsRoot: path.join(app.getPath("userData"), "print-jobs"),
+    stationPrinting: (() => {
+      try {
+        return getStationPrinting().publicHostState();
+      } catch (_) {
+        return null;
+      }
+    })(),
   };
 }
 
@@ -1519,6 +1564,60 @@ ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
   await startRabbit();
   pushState();
   return { ok: true };
+});
+
+ipcMain.handle("set-agent-api-settings", async (_e, opts) => {
+  try {
+    const o = opts && typeof opts === "object" ? opts : {};
+    const sp = getStationPrinting();
+    if (Object.prototype.hasOwnProperty.call(o, "apiBase")) {
+      sp.setApiBase(o.apiBase);
+    }
+    if (Object.prototype.hasOwnProperty.call(o, "deviceLabel")) {
+      sp.setDeviceLabel(o.deviceLabel);
+    }
+    if (Object.prototype.hasOwnProperty.call(o, "pairingCode")) {
+      sp.setPairingCode(o.pairingCode);
+    }
+    pushState();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle("retry-print-host-register", async () => {
+  try {
+    getStationPrinting().clearHostConflict();
+    resetRabbitReconnectBackoff();
+    await startRabbit();
+    pushState();
+    return { ok: true, stationPrinting: getStationPrinting().publicHostState() };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle("set-printer-mapping", async (_e, opts) => {
+  try {
+    const o = opts && typeof opts === "object" ? opts : {};
+    const sp = getStationPrinting();
+    if (o.externalId && o.name) {
+      sp.printers.upsert({
+        external_id: o.externalId,
+        name: o.name,
+        windows_name: o.windowsName || o.name,
+        connection: o.connection || "lan",
+        is_default: !!o.isDefault,
+      });
+    }
+    if (o.defaultExternalId) sp.setDefaultPrinter(o.defaultExternalId);
+    await sp.syncPrintersToServer({ branchId: state.branchId });
+    pushState();
+    return { ok: true, printers: sp.printers.list() };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
 });
 
 ipcMain.handle("retry-print-job", async (_e, rawId) => {
@@ -1760,14 +1859,19 @@ async function pollPrinters() {
   }
 
   pushState();
+  try {
+    const sp = getStationPrinting();
+    sp.syncWindowsPrinters(state.printers || []);
+    if (state.defaultPrinter) sp.setDefaultPrinter(state.defaultPrinter);
+  } catch (_) {}
 }
 
 // ─── RabbitMQ ─────────────────────────────────────────────────────────────────
 function getRoutingForBranch(id) {
   const branch = String(id || "").trim();
   const routingKey = resolveRoutingKey(getRoutingKeyTemplate(), branch);
-  // Shared with the Android agent. Both apps must consume this same queue so
-  // RabbitMQ delivers each order to only one consumer (duplicate queues = duplicate prints).
+  // Shared branch queue with Android. Option A: only the print host consumes
+  // (HostOnlyPolicy + single-active-consumer). Non-hosts must not basicConsume.
   const queueName = branch ? `printer.Branch.${branch}` : "";
   return {
     routingKey,
@@ -1863,19 +1967,25 @@ async function withTempRabbitChannel(fn) {
 }
 
 /**
- * Shared durable queue (no single-active-consumer).
- * Both apps can consume; RabbitMQ delivers each order to exactly one consumer.
- * If the queue was previously created with SAC, recreate it without SAC so this
- * agent is not stuck as a silent standby while another consumer holds the slot.
+ * Option A: durable queue with single-active-consumer.
+ * Only the designated print host should consume; SAC is belt-and-suspenders
+ * so a second connected agent is standby and receives nothing until the host disconnects.
+ * HostOnlyPolicy still nacks stray messages if this device is not the host.
  */
-async function ensureSharedPrintQueue(queueName, exchange, routingKey, branchId) {
+async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
+  const sacArgs = getStationPrinting().rabbitConsumeArgs();
+  const queueOpts = {
+    durable: true,
+    ...(Object.keys(sacArgs).length ? { arguments: sacArgs } : {}),
+  };
+
   try {
     await withTempRabbitChannel(async (ch) => {
       await ch.assertExchange(exchange, "topic", { durable: true });
-      await ch.assertQueue(queueName, { durable: true });
+      await ch.assertQueue(queueName, queueOpts);
       const keys = await bindBranchQueue(ch, queueName, exchange, routingKey, branchId);
       log(
-        `Queue ${queueName} ready — bound to ${exchange} [${keys.join(", ")}]. Each order goes to one connected agent.`,
+        `Queue ${queueName} ready (single-active-consumer) — bound to ${exchange} [${keys.join(", ")}]. Only the print host consumes.`,
         "ℹ️"
       );
     });
@@ -1885,36 +1995,34 @@ async function ensureSharedPrintQueue(queueName, exchange, routingKey, branchId)
   }
 
   log(
-    `Queue ${queueName} has incompatible options (often single-active-consumer) — recreating as a normal shared queue so this app receives orders.`,
+    `Queue ${queueName} has incompatible options — migrating to single-active-consumer for Option A print host.`,
     "⚠️"
   );
 
   await withTempRabbitChannel(async (ch) => {
     await ch.assertExchange(exchange, "topic", { durable: true });
-    // Match whatever args exist (SAC), then delete and recreate durable-only.
     try {
-      await ch.assertQueue(queueName, {
-        durable: true,
-        arguments: { "x-single-active-consumer": true },
-      });
-    } catch (_) {
-      // Channel may already be closed; continue on a delete attempt below via fresh conn.
-    }
+      await ch.assertQueue(queueName, { durable: true });
+    } catch (_) {}
     try {
       await ch.deleteQueue(queueName);
     } catch (delErr) {
       if (!/NOT_FOUND/i.test(String(delErr && delErr.message))) {
-        // delete may fail if channel died after assert — use another connection
         throw delErr;
       }
     }
-    await ch.assertQueue(queueName, { durable: true });
+    await ch.assertQueue(queueName, queueOpts);
     const keys = await bindBranchQueue(ch, queueName, exchange, routingKey, branchId);
     log(
-      `Queue ${queueName} recreated — bound to ${exchange} [${keys.join(", ")}].`,
+      `Queue ${queueName} recreated with single-active-consumer — bound to ${exchange} [${keys.join(", ")}].`,
       "✅"
     );
   });
+}
+
+/** @deprecated Use ensureHostPrintQueue — kept as alias for any external callers. */
+async function ensureSharedPrintQueue(queueName, exchange, routingKey, branchId) {
+  return ensureHostPrintQueue(queueName, exchange, routingKey, branchId);
 }
 
 function isNetworkLikelyOnline() {
@@ -2059,7 +2167,58 @@ function clearRabbitHealthCheck() {
   rabbitHealthTimer = null;
 }
 
+function stopAgentHeartbeatLoop() {
+  if (agentHeartbeatTimer) {
+    clearInterval(agentHeartbeatTimer);
+    agentHeartbeatTimer = null;
+  }
+}
+
+function startAgentHeartbeatLoop() {
+  stopAgentHeartbeatLoop();
+  agentHeartbeatTimer = setInterval(() => {
+    runAgentHeartbeat().catch(() => {});
+  }, AGENT_HEARTBEAT_MS);
+  // Immediate heartbeat so Delayed flush can start
+  runAgentHeartbeat().catch(() => {});
+}
+
+async function runAgentHeartbeat() {
+  if (app.isQuiting) return;
+  const sp = getStationPrinting();
+  const cfg = readUserConfig();
+  if (!(cfg.agent_api_base && String(cfg.agent_api_base).trim())) return;
+  if (!sp.api.getToken()) return;
+  const result = await sp.heartbeat({ branchId: state.branchId });
+  if (!result || result.skipped) return;
+  if (result.revoked) {
+    log("Host revoked on heartbeat — cancelling Rabbit consumer.", "⚠️");
+    await stopRabbit();
+    state.rabbitmq = "idle";
+    pushState();
+    return;
+  }
+  if (result.promoted && result.shouldConsume) {
+    log("Promoted to print host on heartbeat — starting Rabbit consumer.", "✅");
+    if (result.flushPending || sp.flushPending) {
+      log("Flushing Delayed jobs after reconnect as print host (server-side publish).", "⏱️");
+      sp.markFlushDone();
+    }
+    resetRabbitReconnectBackoff();
+    await startRabbit();
+    return;
+  }
+  if (result.ok && result.shouldConsume && sp.flushPending) {
+    log(
+      `Host heartbeat ok — pending_job_count=${result.pending_job_count || 0} (Delayed flush expected from server).`,
+      "⏱️"
+    );
+    sp.markFlushDone();
+  }
+}
+
 async function stopRabbit() {
+  // Keep heartbeat running while registered; only clear on full quit via clear on before-quit.
   clearRabbitHealthCheck();
   if (rabbitReconnectTimer) {
     clearTimeout(rabbitReconnectTimer);
@@ -2124,12 +2283,58 @@ async function startRabbit() {
 
     try {
       // Declare/bind on a throwaway connection first so a 406 cannot poison consume.
-      await ensureSharedPrintQueue(
+      await ensureHostPrintQueue(
         queueName,
         rabbitOpts.exchange,
         routingKey,
         state.branchId
       );
+
+      // Option A: register / honour host flag before consuming.
+      let sp;
+      try {
+        sp = getStationPrinting();
+        const reg = await sp.registerAsHost({ branchId: state.branchId });
+        if (reg && reg.conflict) {
+          state.rabbitmq = "idle";
+          log(
+            "RabbitMQ consumer idle — another device is print host. Ask admin to Change print host in Settings → Printing, then Retry.",
+            "⚠️"
+          );
+          pushState();
+          return;
+        }
+        if (!sp.shouldConsume()) {
+          state.rabbitmq = "idle";
+          log(
+            "Not the print host for this branch — Rabbit consumer stays idle (HostOnlyPolicy).",
+            "ℹ️"
+          );
+          pushState();
+          startAgentHeartbeatLoop();
+          return;
+        }
+      } catch (regErr) {
+        log(
+          "Print-agent register skipped/failed: " + (regErr.message || String(regErr)) + " — will not consume until host is confirmed.",
+          "⚠️"
+        );
+        // If API base is not configured, fall through only when legacy mode allowed?
+        // Option A: do not assume any agent may print. Stay idle without API proof of host.
+        const cfg = readUserConfig();
+        if (!(cfg.agent_api_base && String(cfg.agent_api_base).trim())) {
+          log(
+            "Agent API base URL not set — configure it in Settings to claim print host. Rabbit stays idle.",
+            "ℹ️"
+          );
+          state.rabbitmq = "idle";
+          pushState();
+          return;
+        }
+        state.rabbitmq = "idle";
+        pushState();
+        return;
+      }
 
       const connection = await amqp.connect(rabbitOpts.url, {
         timeout: RABBIT_CONNECT_TIMEOUT_MS,
@@ -2203,9 +2408,21 @@ async function startRabbit() {
       ensureRabbitHealthCheck();
       log("RabbitMQ connected.", "✅");
       log(
-        `Consuming ${queueName} (${queueInfo.messageCount} ready, ${queueInfo.consumerCount} consumers). Bindings: ${bound.join("; ") || "(none)"}`,
+        `Consuming ${queueName} as print host (${queueInfo.messageCount} ready, ${queueInfo.consumerCount} consumers). Bindings: ${bound.join("; ") || "(none)"}`,
         "📡"
       );
+      startAgentHeartbeatLoop();
+      try {
+        const sp2 = getStationPrinting();
+        if (sp2.flushPending) {
+          log(
+            "Print host online — server will flush queued jobs with Delayed marker (pending_job_count from heartbeat).",
+            "⏱️"
+          );
+          // Server publishes Delayed jobs on host heartbeat; local flag cleared after HB confirms.
+        }
+        await sp2.syncPrintersToServer({ branchId: state.branchId });
+      } catch (_) {}
       pushState();
     } catch (err) {
       state.rabbitmq = "error";
@@ -2283,8 +2500,23 @@ async function handleMessage(channel, message) {
   log(`New order on ${channel}`, "📩");
 
   try {
-    const data = JSON.parse(message);
-    const orderId = extractOrderIdFromPayload(data);
+    const sp = getStationPrinting();
+    const evaluated = sp.evaluateIncomingMessage(message);
+    if (evaluated.action === "nack") {
+      log(
+        `Skipping message (${evaluated.reason || "policy"}) — nack without requeue.`,
+        "⚠️"
+      );
+      return "reject"; // reject = nack no-requeue in consume handler
+    }
+    if (evaluated.action !== "print" || !evaluated.parsed) {
+      log("Rejecting unprintable message: " + (evaluated.reason || "unknown"), "❌");
+      return "reject";
+    }
+
+    const parsed = evaluated.parsed;
+    const orderId = parsed.order_id;
+    const serverJobId = parsed.job_id;
     state.lastOrder = {
       timestamp: new Date().toISOString(),
       channel,
@@ -2292,10 +2524,23 @@ async function handleMessage(channel, message) {
     };
     pushState();
 
-    const pdfBase64 = extractPdfBase64FromPayload(data);
-    const filePath = extractFilePathFromPayload(data);
+    const pdfBase64 = parsed.pdf_base64;
+    const filePath = parsed.file_path;
     if (!pdfBase64 && !filePath) {
       log("Missing pdf_base64 and file_path in message.", "❌");
+      if (serverJobId) {
+        sp.ackFailed(serverJobId, "missing_pdf").catch(() => {});
+      }
+      return "reject";
+    }
+
+    const route = evaluated.route;
+    const printerName =
+      (route && route.printer && (route.printer.windows_name || route.printer.name)) ||
+      state.defaultPrinter;
+    if (!printerName) {
+      log("No printer available for this job.", "❌");
+      if (serverJobId) sp.ackFailed(serverJobId, "no_printer").catch(() => {});
       return "reject";
     }
 
@@ -2332,6 +2577,10 @@ async function handleMessage(channel, message) {
         id: jobId,
         file: preferredName,
         orderId,
+        serverJobId,
+        printerName,
+        delayed: !!parsed.delayed,
+        ticketType: parsed.ticket_type,
         status: "failed-setup",
         attemptNumber: 0,
         nextRetryAt: null,
@@ -2341,8 +2590,7 @@ async function handleMessage(channel, message) {
       });
       syncJobsToState();
       pushState();
-      // Poison message guard: avoid infinite broker requeue loops
-      // when the payload points to a missing/invalid file.
+      if (serverJobId) sp.ackFailed(serverJobId, err.message || "save_failed").catch(() => {});
       return "reject";
     }
 
@@ -2351,6 +2599,11 @@ async function handleMessage(channel, message) {
       id: jobId,
       file: baseFile,
       orderId,
+      serverJobId,
+      printerName,
+      printerExternalId: route && route.printer ? route.printer.external_id : null,
+      delayed: !!parsed.delayed,
+      ticketType: parsed.ticket_type,
       status: "in-queue",
       attemptNumber: 0,
       nextRetryAt: null,
@@ -2360,7 +2613,8 @@ async function handleMessage(channel, message) {
     });
     syncJobsToState();
     pushState();
-    log(`Saved job PDF via ${saveSource}: ${baseFile}`, "📁");
+    const delayNote = parsed.delayed ? " [Delayed]" : "";
+    log(`Saved job PDF via ${saveSource}: ${baseFile} → ${printerName}${delayNote}`, "📁");
 
     setImmediate(() => runPrintAttempt(jobId));
     return "ack";
@@ -2647,6 +2901,10 @@ if (!gotSingleInstanceLock) {
     if (printDataCleanupInterval) clearInterval(printDataCleanupInterval);
     if (diskSpaceCheckTimer) clearInterval(diskSpaceCheckTimer);
     clearNetworkOnlineMonitor();
+    stopAgentHeartbeatLoop();
+    try {
+      await getStationPrinting().deregister();
+    } catch (_) {}
     await stopRabbit();
   });
 }

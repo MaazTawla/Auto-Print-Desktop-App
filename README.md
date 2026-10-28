@@ -54,7 +54,10 @@ If Windows disk space runs low, you may get a **notification** and see a message
 
 ## Technical overview (operators & support)
 
-- **Transport**: RabbitMQ — exchange and routing key are configured in Settings (routing key may use `{branch_id}`, e.g. `orders.{branch_id}`). Queue name is `printer.Branch.<branch_id>`. The agent binds that queue to your configured exchange plus the server defaults `auto_print` and `orders.print` (so a wrong exchange name in Settings does not silently drop orders). Order payloads may include inline `pdf_base64` (preferred) and/or `file_path` / URL; the agent uses base64 first and falls back to downloading `file_path` if base64 is missing or invalid.
+- **Transport**: RabbitMQ — exchange and routing key are configured in Settings (routing key may use `{branch_id}`, e.g. `orders.{branch_id}`). Queue name is `printer.Branch.<branch_id>` with **single-active-consumer**. The agent binds that queue to your configured exchange plus the server defaults `auto_print` and `orders.print`.
+- **Print host (Option A)**: Only the branch **print host** may consume and print. Register/heartbeat with the Agent API (`/api/v1/print-agent`) must report `is_print_host=true`. Non-hosts keep Rabbit idle. A second device that registers as host receives **HTTP 409 PRINT_HOST_ALREADY_CONFIGURED** — ask an admin to **Change print host** in Settings → Printing, then Retry. Host changes bump `host_epoch`; the old host stops consuming.
+- **Multi-printer**: Windows printers are listed with stable `external_id` (no cap). v2 messages route by `printer_external_id`; legacy messages use the default printer. Jobs are acked `printed` / `failed` to the server.
+- **Payloads**: Order payloads may include inline `pdf_base64` (preferred) and/or `file_path` / URL; the agent uses base64 first and falls back to downloading `file_path` if base64 is missing or invalid.
 - **First install**: Branch ID and RabbitMQ fields start empty (no silent prefills). Configure them in Settings before the agent will consume.
 - **Reconnect**: Automatic on broker/network issues, consumer cancellation, and failed health checks. While disconnected, the agent polls OS online state and probes the broker host so it reconnects **as soon as the network (or broker) is reachable again**, instead of waiting out a long backoff. Backoff starts at ~1s (cap 15s online / 30s offline). Health checks run every 5s; connect timeout is 10s.
 - **Sleep / lock**: Debounced refresh after **resume** or **screen unlock** so RabbitMQ and printer lists recover.
@@ -75,7 +78,14 @@ Auto Printing/
 │   ├── main.js
 │   ├── preload.js
 │   ├── print-job-tracker.js
-│   └── print-jobs-store.js
+│   ├── print-jobs-store.js
+│   ├── agent-contract.js
+│   ├── agent-api.js
+│   ├── app-identity.js
+│   ├── host-only-policy.js
+│   ├── printer-registry.js
+│   └── station-printing.js
+├── test/
 ├── assets/
 └── package.json
 ```
@@ -84,6 +94,7 @@ Auto Printing/
 
 ```bash
 npm install
+npm test           # unit tests (policy, 409, routing, app_id)
 npm start          # development
 npm run dist       # Windows zip → dist/ (works on Apple Silicon)
 npm run dist:nsis  # Windows NSIS Setup.exe (needs Rosetta on Apple Silicon, or a Windows PC)

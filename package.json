@@ -1,12 +1,13 @@
 {
   "name": "tawla-print-agent",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Tawla Local Print Agent",
   "main": "src/main.js",
   "scripts": {
     "start": "node scripts/ensure-rabbit-defaults.js && electron .",
     "generate:ico": "node scripts/generate-win-icon.js",
-    "dist": "node scripts/ensure-rabbit-defaults.js && node scripts/generate-win-icon.js && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --x64"
+    "dist": "node scripts/ensure-rabbit-defaults.js && node scripts/generate-win-icon.js && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --x64",
+    "test": "node --test test/**/*.test.js"
   },
   "build": {
     "appId": "com.tawla.print-agent",

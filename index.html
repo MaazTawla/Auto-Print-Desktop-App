@@ -1086,6 +1086,54 @@
     .spinning { display: inline-block; animation: spin 0.8s linear infinite; }
 
     /* ── Disk warning banner ─────────────────────────── */
+    .host-conflict-banner {
+      display: none;
+      margin: 0 0 12px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(220, 38, 38, 0.35);
+      background: rgba(220, 38, 38, 0.08);
+      color: #b91c1c;
+      gap: 10px;
+      align-items: flex-start;
+    }
+    .host-conflict-banner.show { display: flex; }
+    .host-conflict-banner .hc-body { flex: 1; min-width: 0; }
+    .host-conflict-banner .hc-title { font-weight: 600; margin-bottom: 4px; }
+    .host-conflict-banner .hc-msg { font-size: 13px; line-height: 1.45; }
+    .host-conflict-banner .hc-meta { margin-top: 6px; font-size: 12px; opacity: 0.9; }
+    .host-conflict-banner .hc-actions { display: flex; flex-direction: column; gap: 8px; }
+    :root[data-theme="dark"] .host-conflict-banner {
+      border-color: rgba(248, 113, 113, 0.4);
+      background: rgba(127, 29, 29, 0.35);
+      color: #fecaca;
+    }
+    .printer-map-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .printer-map-table th,
+    .printer-map-table td {
+      text-align: left;
+      padding: 8px 6px;
+      border-bottom: 1px solid var(--border, #e5e7eb);
+      vertical-align: middle;
+    }
+    .printer-map-table .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .host-status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .host-status-pill.on { background: rgba(6, 108, 73, 0.12); color: #066c49; }
+    .host-status-pill.off { background: rgba(100, 116, 139, 0.14); color: #64748b; }
+    .host-status-pill.conflict { background: rgba(220, 38, 38, 0.12); color: #b91c1c; }
+
     .disk-warning-banner {
       padding: 10px 18px;
       font-size: 12px;
@@ -2269,6 +2317,17 @@
 
 <div id="app">
   <div id="disk-warning-banner" class="disk-warning-banner" role="status" hidden></div>
+  <div id="host-conflict-banner" class="host-conflict-banner" role="alert" aria-live="assertive">
+    <div class="hc-body">
+      <div class="hc-title">Print host already configured</div>
+      <div class="hc-msg" id="host-conflict-message"></div>
+      <div class="hc-meta" id="host-conflict-meta"></div>
+      <div class="hc-meta">Ask admin to Change print host in Settings → Printing.</div>
+    </div>
+    <div class="hc-actions">
+      <button type="button" class="btn-primary" id="host-conflict-retry">Retry</button>
+    </div>
+  </div>
   <div id="tabs-bar">
     <div class="tab active" data-tab="home" onclick="switchTab('home')">
       <img
@@ -2587,6 +2646,69 @@
           </div>
 
           <div class="settings-col">
+            <section class="settings-card" id="settings-section-print-host" aria-labelledby="settings-card-print-host-title">
+              <div class="settings-card-head">
+                <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/pc.svg" alt="" /></div>
+                <div class="settings-card-head-text">
+                  <h3 class="settings-card-title" id="settings-card-print-host-title">Print host</h3>
+                  <p class="settings-card-lead">This PC can consume station tickets only while it is the branch print host.</p>
+                </div>
+              </div>
+              <div class="settings-card-body">
+                <div class="settings-callout" id="settings-host-status-line">Host status: —</div>
+                <div class="field">
+                  <label for="settings-agent-api-base">Agent API base URL</label>
+                  <input type="text" id="settings-agent-api-base" placeholder="https://api.example.com" autocomplete="off" />
+                  <div class="field-hint">Used for register, heartbeat, printer sync and job ack (<span class="mono">/api/v1/print-agent</span>).</div>
+                </div>
+                <div class="field">
+                  <label for="settings-device-label">Device label</label>
+                  <input type="text" id="settings-device-label" placeholder="Front counter PC" autocomplete="off" />
+                </div>
+                <div class="field">
+                  <label for="settings-pairing-code">Pairing code</label>
+                  <input type="password" id="settings-pairing-code" placeholder="From merchant / branch" autocomplete="new-password" />
+                  <div class="field-hint">Exchanged at register for an agent token. Leave blank to keep the stored token.</div>
+                </div>
+                <div class="field-hint">App ID: <span class="mono" id="settings-app-id">—</span></div>
+                <div class="err-text" id="settings-agent-err"></div>
+                <div class="settings-card-actions settings-card-actions-split">
+                  <button type="button" class="btn-outline" id="settings-agent-retry">Retry as print host</button>
+                  <button type="button" class="btn-primary" id="settings-agent-save">Save &amp; register</button>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-card" id="settings-section-printer-map" aria-labelledby="settings-card-printer-map-title">
+              <div class="settings-card-head">
+                <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/printer.svg" alt="" /></div>
+                <div class="settings-card-head-text">
+                  <h3 class="settings-card-title" id="settings-card-printer-map-title">Printers &amp; mapping</h3>
+                  <p class="settings-card-lead">Windows printers synced by external id (no cap). Station tickets route by <span class="mono">printer_external_id</span>.</p>
+                </div>
+              </div>
+              <div class="settings-card-body">
+                <div class="inline-actions" style="margin-bottom:10px;">
+                  <button type="button" class="btn-outline" id="settings-printers-refresh">Refresh Windows printers</button>
+                </div>
+                <div style="overflow:auto;">
+                  <table class="printer-map-table" id="settings-printer-map-table">
+                    <thead>
+                      <tr>
+                        <th>Name</th>
+                        <th>External ID</th>
+                        <th>Connection</th>
+                        <th>Status</th>
+                        <th>Default</th>
+                      </tr>
+                    </thead>
+                    <tbody id="settings-printer-map-tbody"></tbody>
+                  </table>
+                </div>
+                <p class="settings-card-footnote"><span class="settings-footnote-info" aria-hidden="true">i</span> Default is used for legacy messages without <span class="mono">printer_external_id</span>.</p>
+              </div>
+            </section>
+
             <section class="settings-card" aria-labelledby="settings-card-printer-title">
               <div class="settings-card-head">
                 <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/printer.svg" alt="" /></div>
@@ -3625,7 +3747,78 @@
     return !!(el && el.classList.contains('open'));
   }
 
-  function applySettingsForm(s) {
+
+  function renderHostConflict(s) {
+    const banner = document.getElementById('host-conflict-banner');
+    if (!banner) return;
+    const sp = s && s.stationPrinting;
+    const conflict = sp && sp.hostConflict;
+    if (!conflict) {
+      banner.classList.remove('show');
+      return;
+    }
+    banner.classList.add('show');
+    const msg = document.getElementById('host-conflict-message');
+    const meta = document.getElementById('host-conflict-meta');
+    if (msg) msg.textContent = conflict.message || 'Another device is already configured as print host for this branch.';
+    if (meta) {
+      const host = conflict.current_host;
+      if (host) {
+        const online = host.is_online ? 'online' : 'offline';
+        meta.textContent = 'Current host: ' + (host.device_label || host.app_id || '—') + ' (' + online + ')';
+      } else {
+        meta.textContent = '';
+      }
+    }
+  }
+
+  function renderPrinterMap(s) {
+    const tbody = document.getElementById('settings-printer-map-tbody');
+    if (!tbody) return;
+    const list = (s.stationPrinting && s.stationPrinting.printers) || [];
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="field-hint">No Windows printers detected yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = list.map((p) => {
+      const def = p.is_default ? 'Yes' : '';
+      return '<tr>' +
+        '<td>' + escHtml(p.name || '') + '</td>' +
+        '<td class="mono">' + escHtml(p.external_id || '') + '</td>' +
+        '<td>' + escHtml(p.connection || '') + '</td>' +
+        '<td>' + escHtml(p.status || '') + '</td>' +
+        '<td>' + def + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function applyPrintHostForm(s) {
+    const sp = s && s.stationPrinting;
+    const status = document.getElementById('settings-host-status-line');
+    if (status) {
+      if (!sp) {
+        status.textContent = 'Host status: —';
+      } else if (sp.hostConflict) {
+        status.innerHTML = '<span class="host-status-pill conflict">Conflict</span> Another device is print host. Rabbit stays idle.';
+      } else if (sp.isPrintHost) {
+        status.innerHTML = '<span class="host-status-pill on">Print host</span> epoch ' + escHtml(String(sp.hostEpoch)) + ' — consuming station tickets.';
+      } else {
+        status.innerHTML = '<span class="host-status-pill off">Standby</span> Not print host — consumer idle.';
+      }
+    }
+    const appIdEl = document.getElementById('settings-app-id');
+    if (appIdEl) appIdEl.textContent = (sp && sp.appId) || '—';
+    const apiBase = document.getElementById('settings-agent-api-base');
+    const deviceLabel = document.getElementById('settings-device-label');
+    const sec = document.getElementById('settings-section-print-host');
+    const editing = !!(sec && document.activeElement && sec.contains(document.activeElement));
+    if (!editing) {
+      if (apiBase) apiBase.value = (sp && sp.agentApiBase) || '';
+      if (deviceLabel) deviceLabel.value = (sp && sp.deviceLabel) || '';
+    }
+  }
+
+    function applySettingsForm(s) {
     const pdfModalOpen = isPdfPrintModalOpen();
     const active = document.activeElement;
     const branchSec = document.getElementById('settings-section-branch');
@@ -3815,6 +4008,65 @@
   if (rabbitSecEl) {
     rabbitSecEl.addEventListener('input', () => { rabbitFormDirty = true; });
     rabbitSecEl.addEventListener('change', () => { rabbitFormDirty = true; });
+  }
+
+  
+  const hostRetryBtn = document.getElementById('host-conflict-retry');
+  if (hostRetryBtn) {
+    hostRetryBtn.addEventListener('click', async () => {
+      const res = await window.api.retryPrintHostRegister();
+      if (!res || !res.ok) {
+        showToast((res && res.error) || 'Retry failed.', 'error', 3400);
+        return;
+      }
+      showToast('Retried print-host registration.');
+    });
+  }
+
+  const agentRetry = document.getElementById('settings-agent-retry');
+  if (agentRetry) {
+    agentRetry.addEventListener('click', async () => {
+      const res = await window.api.retryPrintHostRegister();
+      if (!res || !res.ok) {
+        showToast((res && res.error) || 'Retry failed.', 'error', 3400);
+        return;
+      }
+      showToast('Retried print-host registration.');
+    });
+  }
+
+  document.getElementById('settings-agent-save').addEventListener('click', async () => {
+    const errEl = document.getElementById('settings-agent-err');
+    if (errEl) errEl.textContent = '';
+    const apiBase = document.getElementById('settings-agent-api-base').value.trim();
+    const deviceLabel = document.getElementById('settings-device-label').value.trim();
+    const pairingCode = document.getElementById('settings-pairing-code').value;
+    const payload = { apiBase, deviceLabel };
+    if (pairingCode && String(pairingCode).trim() !== '') {
+      payload.pairingCode = pairingCode.trim();
+    }
+    const saveRes = await window.api.setAgentApiSettings(payload);
+    if (!saveRes || !saveRes.ok) {
+      const msg = (saveRes && saveRes.error) || 'Could not save agent settings.';
+      if (errEl) errEl.textContent = msg;
+      showToast(msg, 'error', 3400);
+      return;
+    }
+    document.getElementById('settings-pairing-code').value = '';
+    const reg = await window.api.retryPrintHostRegister();
+    if (!reg || !reg.ok) {
+      showToast((reg && reg.error) || 'Saved, but register failed.', 'error', 3400);
+      return;
+    }
+    showToast('Print host settings saved.');
+  });
+
+  const refreshPrintersBtn = document.getElementById('settings-printers-refresh');
+  if (refreshPrintersBtn) {
+    refreshPrintersBtn.addEventListener('click', async () => {
+      await window.api.refreshPrinters();
+      showToast('Printer list refreshed.');
+    });
   }
 
   document.getElementById('settings-branch-save').addEventListener('click', async () => {
