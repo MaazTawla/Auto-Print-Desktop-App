@@ -783,3 +783,52 @@ describe("station-printing controller", () => {
     );
   });
 });
+
+
+describe("station printing rabbit manual override", () => {
+  it("register with override on keeps local broker host", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      branch_id: "147",
+      pairing_code: "PAIR",
+      device_label: "Desk",
+      rabbit_host: "manual.local",
+      rabbit_port: 5673,
+      rabbit_username: "manual",
+      rabbit_password: "manualpw",
+      rabbit_exchange: "manual_ex",
+      rabbit_routing_key: "manual.key",
+      rabbit_manual_override: true,
+    });
+    const request = async () => ({
+      status: 200,
+      data: {
+        token: "tok",
+        is_print_host: true,
+        host_epoch: 2,
+        branch_id: 147,
+        rabbit: {
+          host: "mq.example.com",
+          port: 5672,
+          username: "agent",
+          password: "secret",
+          exchange: "auto_print",
+          routing_key: "orders.147",
+          queue: "printer.Branch.147",
+          queue_durable: true,
+          queue_arguments: { "x-single-active-consumer": true },
+          prefetch: 1,
+          vhost: "/",
+        },
+      },
+      headers: {},
+    });
+    const ctrl = createStationPrintingController({ ...store, request, log: () => {} });
+    const res = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(res.ok, true);
+    assert.equal(store.get().rabbit_host, "manual.local");
+    assert.equal(store.get().rabbit_password, "manualpw");
+    assert.equal(store.get().rabbit_queue, "printer.Branch.147");
+    assert.equal(store.get().branch_id, "147");
+  });
+});

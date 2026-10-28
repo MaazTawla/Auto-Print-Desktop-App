@@ -1698,6 +1698,7 @@ function getPublicState() {
     rabbitExchange: rabbitOpts.exchange,
     rabbitRoutingKey: routingTemplate,
     rabbitAuthConfigured,
+    rabbitManualOverride: Boolean(readUserConfig().rabbit_manual_override),
     appVersion: app.getVersion(),
     userDataPath: app.getPath("userData"),
     platform: process.platform,
@@ -1888,6 +1889,7 @@ ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
     rabbit_username: username,
     rabbit_exchange: exchange,
     rabbit_routing_key: routingKey,
+    rabbit_manual_override: true,
   };
   if (passwordMode === "clear") {
     patch.rabbit_password = "";
@@ -1902,6 +1904,19 @@ ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
   await startRabbit();
   pushState();
   return { ok: true };
+});
+
+ipcMain.handle("set-rabbit-manual-override", async (_e, enabled) => {
+  const on = Boolean(enabled);
+  saveUserConfig({ rabbit_manual_override: on });
+  log(
+    on
+      ? "Advanced: manual RabbitMQ override ON — server register will not overwrite broker fields."
+      : "Advanced: manual RabbitMQ override OFF — broker settings will follow the server.",
+    "⚙️"
+  );
+  pushState();
+  return { ok: true, rabbitManualOverride: on };
 });
 
 ipcMain.handle("set-agent-api-settings", async (_e, opts) => {

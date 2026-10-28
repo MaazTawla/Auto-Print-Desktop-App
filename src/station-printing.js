@@ -19,6 +19,7 @@ const {
   PLATFORM,
   syncConflictBackoffMs,
   rabbitConfigToPersistPatch,
+  rabbitConnectionFingerprint,
   resolveQueueDeclareOptions,
   resolveQueueName,
   normalizeRabbitConfig,
@@ -255,13 +256,25 @@ function createStationPrintingController(deps = {}) {
     if (result.pdf_host) {
       patch.pdf_host = result.pdf_host;
     }
-    // Persist rabbit.queue / durable / arguments and apply broker creds when present
+    // Persist rabbit.queue / durable / arguments; broker creds unless Advanced override is on.
+    const beforeFp = rabbitConnectionFingerprint(cfg);
+    const manualOverride = Boolean(cfg.rabbit_manual_override);
     const rabbitConfig =
       result.rabbitConfig ||
       normalizeRabbitConfig(result.rabbit, result.branch_id || branchId || cfg.branch_id);
-    Object.assign(patch, rabbitConfigToPersistPatch(rabbitConfig));
+    Object.assign(
+      patch,
+      rabbitConfigToPersistPatch(rabbitConfig, { manualOverride })
+    );
     if (Object.keys(patch).length) writeConfig(patch);
-    if (rabbitConfig.hasBrokerCreds) {
+    const afterCfg = readConfig();
+    const afterFp = rabbitConnectionFingerprint(afterCfg);
+    if (manualOverride) {
+      log(
+        "Register rabbit payload received; Advanced manual override is on — keeping local broker settings.",
+        "ℹ️"
+      );
+    } else if (rabbitConfig.hasBrokerCreds) {
       log(
         `Applied Rabbit settings from register (${rabbitConfig.host || "host?"}:${rabbitConfig.port || "?"}, queue ${rabbitConfig.queue}).`,
         "⚙️"
@@ -269,6 +282,7 @@ function createStationPrintingController(deps = {}) {
     } else if (rabbitConfig.queue) {
       log(`Using print queue ${rabbitConfig.queue} (from register / default).`, "ℹ️");
     }
+    const rabbitChanged = beforeFp !== afterFp;
     const applied = policy.applyServerState({
       is_print_host: result.is_print_host,
       host_epoch: result.host_epoch,
@@ -290,6 +304,7 @@ function createStationPrintingController(deps = {}) {
       revoked: applied.revoked,
       rabbit: result.rabbit || null,
       rabbitConfig,
+      rabbitChanged: Boolean(rabbitChanged),
     };
   }
 

@@ -2587,83 +2587,137 @@
       <div class="panel-scroll">
         <div class="settings-shell">
         <div class="panel-title">Settings</div>
-        <p class="panel-sub">Configure your print agent, connection, printer and startup preferences.</p>
+        <p class="panel-sub">Connect with server URL + pairing code. Branch and RabbitMQ come from the server.</p>
 
         <div class="settings-layout">
           <div class="settings-col">
-            <section class="settings-card" id="settings-section-branch" aria-labelledby="settings-card-branch-title">
+            <section class="settings-card" id="settings-section-print-host" aria-labelledby="settings-card-print-host-title">
               <div class="settings-card-head">
-                <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/branch.svg" alt="" /></div>
+                <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/pc.svg" alt="" /></div>
                 <div class="settings-card-head-text">
-                  <h3 class="settings-card-title" id="settings-card-branch-title">Branch</h3>
-                  <p class="settings-card-lead">Routing key and queue identity for this station.</p>
+                  <h3 class="settings-card-title" id="settings-card-print-host-title">Print host</h3>
+                  <p class="settings-card-lead">Enter server URL and pairing code, then Connect. Branch ID and RabbitMQ come from the server.</p>
                 </div>
               </div>
               <div class="settings-card-body">
-                <div class="settings-callout">Orders will be routed for this branch only.</div>
-                <div class="field">
-                  <label for="settings-branch">Branch ID</label>
-                  <input type="text" id="settings-branch" placeholder="e.g. 147" autocomplete="off" />
-                  <div class="field-hint">Resolved routing key: <span class="mono" id="settings-channel-hint">—</span></div>
-                  <div class="err-text" id="settings-branch-err"></div>
+                <div class="settings-callout" id="settings-host-status-line">Host status: —</div>
+                <div id="secure-storage-warning" role="alert" aria-live="polite">
+                  <strong>Secure storage unavailable.</strong>
+                  OS encryption (Electron safeStorage) is not available on this machine.
+                  The agent token and Rabbit password are kept in memory for this session only and are never written to disk.
+                  You will need to re-enter the pairing code after restart.
                 </div>
-                <div class="settings-card-actions">
-                  <button type="button" class="btn-primary" id="settings-branch-save">Save changes</button>
+                <div id="ack-outbox-corrupt-warning" role="alert" aria-live="assertive">
+                  <strong>Server ack outbox was corrupt.</strong>
+                  The damaged file was quarantined and a fresh outbox was started.
+                  Pending acknowledgements from the corrupt file were not recovered — check Print jobs and logs.
+                  <div class="field-hint" id="ack-outbox-corrupt-path" style="margin-top:6px"></div>
+                </div>
+                <div class="field">
+                  <label for="settings-agent-api-base">Server URL</label>
+                  <input type="text" id="settings-agent-api-base" placeholder="https://api.example.com" autocomplete="off" />
+                  <div class="field-hint">API base for register, heartbeat, printer sync and job ack (<span class="mono">/api/v1/print-agent</span>).</div>
+                </div>
+                <div class="field">
+                  <label for="settings-device-label">Device label</label>
+                  <input type="text" id="settings-device-label" placeholder="Front counter PC" autocomplete="off" />
+                </div>
+                <div class="field">
+                  <label for="settings-pairing-code">Pairing code</label>
+                  <input type="password" id="settings-pairing-code" placeholder="From merchant / branch" autocomplete="new-password" />
+                  <div class="field-hint">From Settings → Printing → Generate pairing code. Blank codes are blocked.</div>
+                </div>
+                <div class="field-hint">App ID: <span class="mono" id="settings-app-id">—</span></div>
+                <div class="err-text" id="settings-agent-err"></div>
+                <div class="settings-card-actions settings-card-actions-split">
+                  <button type="button" class="btn-outline" id="settings-agent-retry">Retry</button>
+                  <button type="button" class="btn-primary" id="settings-agent-save">
+                    <span class="btn-label" id="settings-agent-save-label">Connect</span>
+                  </button>
                 </div>
               </div>
             </section>
 
-            <section class="settings-card" id="settings-section-rabbit" aria-labelledby="settings-card-rabbit-title">
+            <section class="settings-card" id="settings-section-advanced" aria-labelledby="settings-card-advanced-title">
               <div class="settings-card-head">
-                <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/rabbit.svg" alt="" /></div>
+                <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/settings.svg" alt="" /></div>
                 <div class="settings-card-head-text">
-                  <h3 class="settings-card-title" id="settings-card-rabbit-title">RabbitMQ server</h3>
-                  <p class="settings-card-lead">Broker connection used for incoming print jobs.</p>
+                  <h3 class="settings-card-title" id="settings-card-advanced-title">Advanced</h3>
+                  <p class="settings-card-lead">Debug only — normal setup uses Connect above. Branch and RabbitMQ come from the server.</p>
                 </div>
               </div>
               <div class="settings-card-body">
-                <div class="field">
-                  <label for="settings-rabbit-host">Host</label>
-                  <input type="text" id="settings-rabbit-host" autocomplete="off" />
-                </div>
-                <div class="field">
-                  <label for="settings-rabbit-port">Port</label>
-                  <input type="number" id="settings-rabbit-port" min="1" max="65535" placeholder="5672" />
-                </div>
-                <div class="field">
-                  <label for="settings-rabbit-username">Username</label>
-                  <input type="text" id="settings-rabbit-username" autocomplete="off" />
-                </div>
-                <div class="field">
-                  <label for="settings-rabbit-exchange">Exchange</label>
-                  <input type="text" id="settings-rabbit-exchange" placeholder="e.g. orders.print" autocomplete="off" />
-                </div>
-                <div class="field">
-                  <label for="settings-rabbit-routing-key">Routing key</label>
-                  <input type="text" id="settings-rabbit-routing-key" placeholder="e.g. orders.{branch_id}" autocomplete="off" />
-                  <div class="field-hint">Use <span class="mono">{branch_id}</span> to insert the Branch ID. Example: <span class="mono">orders.{branch_id}</span></div>
-                </div>
-                <div class="field">
-                  <label>Password</label>
-                  <p class="field-hint" id="settings-rabbit-pw-hint">—</p>
-                  <div class="inline-actions" style="margin-bottom:8px;">
-                    <label class="field-hint" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-                      <input type="checkbox" id="settings-rabbit-pw-change" />
-                      Set new password
+                <details id="settings-advanced-details">
+                  <summary style="cursor:pointer;font-weight:600;margin-bottom:10px;">Show advanced (branch &amp; RabbitMQ)</summary>
+                  <p class="field-hint" style="margin-bottom:12px;">Leave closed unless you need a temporary broker override for debugging.</p>
+
+                  <div id="settings-section-branch" aria-labelledby="settings-card-branch-title">
+                    <h4 class="settings-card-title" id="settings-card-branch-title" style="font-size:1rem;margin:0 0 8px;">Branch</h4>
+                    <div class="settings-callout">Normally set automatically when you Connect. Override only for debug.</div>
+                    <div class="field">
+                      <label for="settings-branch">Branch ID</label>
+                      <input type="text" id="settings-branch" placeholder="e.g. 147" autocomplete="off" />
+                      <div class="field-hint">Resolved routing key: <span class="mono" id="settings-channel-hint">—</span></div>
+                      <div class="err-text" id="settings-branch-err"></div>
+                    </div>
+                    <div class="settings-card-actions">
+                      <button type="button" class="btn-primary" id="settings-branch-save">Save branch override</button>
+                    </div>
+                  </div>
+
+                  <hr style="border:none;border-top:1px solid rgba(255,255,255,0.08);margin:16px 0;" />
+
+                  <div id="settings-section-rabbit" aria-labelledby="settings-card-rabbit-title">
+                    <h4 class="settings-card-title" id="settings-card-rabbit-title" style="font-size:1rem;margin:0 0 8px;">RabbitMQ server</h4>
+                    <label class="field-hint" style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:12px;">
+                      <input type="checkbox" id="settings-rabbit-manual-override" />
+                      Use manual RabbitMQ settings (debug)
                     </label>
+                    <p class="field-hint" id="settings-rabbit-override-hint">Override is off — Connect applies RabbitMQ from the server.</p>
+                    <div class="field">
+                      <label for="settings-rabbit-host">Host</label>
+                      <input type="text" id="settings-rabbit-host" autocomplete="off" />
+                    </div>
+                    <div class="field">
+                      <label for="settings-rabbit-port">Port</label>
+                      <input type="number" id="settings-rabbit-port" min="1" max="65535" placeholder="5672" />
+                    </div>
+                    <div class="field">
+                      <label for="settings-rabbit-username">Username</label>
+                      <input type="text" id="settings-rabbit-username" autocomplete="off" />
+                    </div>
+                    <div class="field">
+                      <label for="settings-rabbit-exchange">Exchange</label>
+                      <input type="text" id="settings-rabbit-exchange" placeholder="e.g. orders.print" autocomplete="off" />
+                    </div>
+                    <div class="field">
+                      <label for="settings-rabbit-routing-key">Routing key</label>
+                      <input type="text" id="settings-rabbit-routing-key" placeholder="e.g. orders.{branch_id}" autocomplete="off" />
+                      <div class="field-hint">Use <span class="mono">{branch_id}</span> to insert the Branch ID. Example: <span class="mono">orders.{branch_id}</span></div>
+                    </div>
+                    <div class="field">
+                      <label>Password</label>
+                      <p class="field-hint" id="settings-rabbit-pw-hint">—</p>
+                      <div class="inline-actions" style="margin-bottom:8px;">
+                        <label class="field-hint" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                          <input type="checkbox" id="settings-rabbit-pw-change" />
+                          Set new password
+                        </label>
+                      </div>
+                      <input type="password" id="settings-rabbit-pw-new" placeholder="New password" autocomplete="new-password" disabled style="max-width:400px;" />
+                      <div class="inline-actions" style="margin-top:10px;">
+                        <button type="button" class="btn-small" id="settings-rabbit-pw-clear">Clear stored password</button>
+                      </div>
+                    </div>
+                    <div class="err-text" id="settings-rabbit-err"></div>
+                    <div class="settings-card-actions settings-card-actions-split">
+                      <button type="button" class="btn-outline" id="settings-rabbit-test">Test connection</button>
+                      <button type="button" class="btn-primary" id="settings-rabbit-save">
+                        <span class="btn-label">Save manual &amp; reconnect</span>
+                      </button>
+                    </div>
                   </div>
-                  <input type="password" id="settings-rabbit-pw-new" placeholder="New password" autocomplete="new-password" disabled style="max-width:400px;" />
-                  <div class="inline-actions" style="margin-top:10px;">
-                    <button type="button" class="btn-small" id="settings-rabbit-pw-clear">Clear stored password</button>
-                  </div>
-                </div>
-                <div class="err-text" id="settings-rabbit-err"></div>
-                <div class="settings-card-actions settings-card-actions-split">
-                  <button type="button" class="btn-outline" id="settings-rabbit-test">Test connection</button>
-                  <button type="button" class="btn-primary" id="settings-rabbit-save">
-                    <span class="btn-label">Reconnect</span>
-                  </button>
-                </div>
+                </details>
               </div>
             </section>
 
@@ -2713,50 +2767,6 @@
           </div>
 
           <div class="settings-col">
-            <section class="settings-card" id="settings-section-print-host" aria-labelledby="settings-card-print-host-title">
-              <div class="settings-card-head">
-                <div class="settings-card-icon-wrap" aria-hidden="true"><img src="app://./assets/icons/pc.svg" alt="" /></div>
-                <div class="settings-card-head-text">
-                  <h3 class="settings-card-title" id="settings-card-print-host-title">Print host</h3>
-                  <p class="settings-card-lead">This PC can consume station tickets only while it is the branch print host.</p>
-                </div>
-              </div>
-              <div class="settings-card-body">
-                <div class="settings-callout" id="settings-host-status-line">Host status: —</div>
-                <div id="secure-storage-warning" role="alert" aria-live="polite">
-                  <strong>Secure storage unavailable.</strong>
-                  OS encryption (Electron safeStorage) is not available on this machine.
-                  The agent token and Rabbit password are kept in memory for this session only and are never written to disk.
-                  You will need to re-enter the pairing code after restart.
-                </div>
-                <div id="ack-outbox-corrupt-warning" role="alert" aria-live="assertive">
-                  <strong>Server ack outbox was corrupt.</strong>
-                  The damaged file was quarantined and a fresh outbox was started.
-                  Pending acknowledgements from the corrupt file were not recovered — check Print jobs and logs.
-                  <div class="field-hint" id="ack-outbox-corrupt-path" style="margin-top:6px"></div>
-                </div>
-                <div class="field">
-                  <label for="settings-agent-api-base">Agent API base URL</label>
-                  <input type="text" id="settings-agent-api-base" placeholder="https://api.example.com" autocomplete="off" />
-                  <div class="field-hint">Used for register, heartbeat, printer sync and job ack (<span class="mono">/api/v1/print-agent</span>).</div>
-                </div>
-                <div class="field">
-                  <label for="settings-device-label">Device label</label>
-                  <input type="text" id="settings-device-label" placeholder="Front counter PC" autocomplete="off" />
-                </div>
-                <div class="field">
-                  <label for="settings-pairing-code">Pairing code</label>
-                  <input type="password" id="settings-pairing-code" placeholder="From merchant / branch" autocomplete="new-password" />
-                  <div class="field-hint">Required to register. Exchanged for an agent token. Blank pairing codes are blocked.</div>
-                </div>
-                <div class="field-hint">App ID: <span class="mono" id="settings-app-id">—</span></div>
-                <div class="err-text" id="settings-agent-err"></div>
-                <div class="settings-card-actions settings-card-actions-split">
-                  <button type="button" class="btn-outline" id="settings-agent-retry">Retry as print host</button>
-                  <button type="button" class="btn-primary" id="settings-agent-save">Save &amp; register</button>
-                </div>
-              </div>
-            </section>
 
             <section class="settings-card" id="settings-section-printer-map" aria-labelledby="settings-card-printer-map-title">
               <div class="settings-card-head">
@@ -3924,15 +3934,30 @@
     }
     const status = document.getElementById('settings-host-status-line');
     if (status) {
+      const branchNote = (s && s.branchId) ? (' · branch ' + escHtml(String(s.branchId))) : '';
+      const rabbit = (s && s.rabbitmq) || '';
       if (!sp) {
-        status.textContent = 'Host status: —';
+        status.textContent = 'Status: Not connected';
       } else if (sp.hostConflict) {
-        status.innerHTML = '<span class="host-status-pill conflict">Conflict</span> Another device is print host. Rabbit stays idle.';
+        status.innerHTML = '<span class="host-status-pill conflict">Host already configured</span> Ask an admin to Change print host, then Retry.';
+      } else if (sp.isPrintHost && rabbit === 'connected') {
+        status.innerHTML = '<span class="host-status-pill on">Connected as print host</span> epoch ' + escHtml(String(sp.hostEpoch)) + branchNote;
+      } else if (sp.isPrintHost && rabbit === 'connecting') {
+        status.innerHTML = '<span class="host-status-pill on">Connected as print host</span> connecting to print queue…' + branchNote;
       } else if (sp.isPrintHost) {
-        status.innerHTML = '<span class="host-status-pill on">Print host</span> epoch ' + escHtml(String(sp.hostEpoch)) + ' — consuming station tickets.';
+        const q = rabbit === 'error' ? ' · queue offline' : (rabbit === 'idle' ? ' · queue idle' : '');
+        status.innerHTML = '<span class="host-status-pill on">Connected as print host</span> epoch ' + escHtml(String(sp.hostEpoch)) + branchNote + q;
+      } else if (sp.agentTokenConfigured) {
+        status.innerHTML = '<span class="host-status-pill off">Registered</span> Not print host — consumer idle.';
+      } else if (sp.needsPairing) {
+        status.innerHTML = '<span class="host-status-pill off">Offline</span> Enter a fresh pairing code, then Connect.';
       } else {
-        status.innerHTML = '<span class="host-status-pill off">Standby</span> Not print host — consumer idle.';
+        status.innerHTML = '<span class="host-status-pill off">Not connected</span> Enter server URL + pairing code, then Connect.';
       }
+    }
+    const saveLabel = document.getElementById('settings-agent-save-label');
+    if (saveLabel && !saveLabel.dataset.busy) {
+      saveLabel.textContent = (sp && sp.agentTokenConfigured) ? 'Reconnect' : 'Connect';
     }
     const appIdEl = document.getElementById('settings-app-id');
     if (appIdEl) appIdEl.textContent = (sp && sp.appId) || '—';
@@ -3978,6 +4003,27 @@
       if (re) re.value = s.rabbitExchange != null ? String(s.rabbitExchange) : '';
       if (rr) rr.value = s.rabbitRoutingKey != null ? String(s.rabbitRoutingKey) : '';
     }
+
+    const overrideEl = document.getElementById('settings-rabbit-manual-override');
+    const overrideHint = document.getElementById('settings-rabbit-override-hint');
+    const overrideOn = !!(s && s.rabbitManualOverride);
+    if (overrideEl && document.activeElement !== overrideEl) {
+      overrideEl.checked = overrideOn;
+    }
+    if (overrideHint) {
+      overrideHint.textContent = overrideOn
+        ? 'Override is on — values below are used and will not be replaced by Connect.'
+        : 'Override is off — Connect applies RabbitMQ from the server.';
+    }
+    ['settings-rabbit-host','settings-rabbit-port','settings-rabbit-username','settings-rabbit-exchange','settings-rabbit-routing-key','settings-rabbit-pw-change','settings-rabbit-pw-new','settings-rabbit-pw-clear','settings-rabbit-test','settings-rabbit-save'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (id === 'settings-rabbit-pw-new') {
+        el.disabled = !overrideOn || !(document.getElementById('settings-rabbit-pw-change') || {}).checked;
+      } else {
+        el.disabled = !overrideOn;
+      }
+    });
 
     const pwHint = document.getElementById('settings-rabbit-pw-hint');
     if (pwHint) {
@@ -4179,6 +4225,8 @@
   document.getElementById('settings-agent-save').addEventListener('click', async () => {
     const errEl = document.getElementById('settings-agent-err');
     if (errEl) errEl.textContent = '';
+    const btn = document.getElementById('settings-agent-save');
+    const saveLabel = document.getElementById('settings-agent-save-label');
     const apiBase = document.getElementById('settings-agent-api-base').value.trim();
     const deviceLabel = document.getElementById('settings-device-label').value.trim();
     const pairingCode = document.getElementById('settings-pairing-code').value;
@@ -4195,29 +4243,52 @@
     }
     const pairingInput = document.getElementById('settings-pairing-code');
     if (pairingInput) pairingInput.classList.remove('field-invalid');
-    const payload = { apiBase, deviceLabel, pairingCode: pairingCode.trim() };
-    const saveRes = await window.api.setAgentApiSettings(payload);
-    if (!saveRes || !saveRes.ok) {
-      const msg = (saveRes && saveRes.error) || 'Could not save agent settings.';
-      if (errEl) errEl.textContent = msg;
-      showToast(msg, 'error', 3400);
-      return;
+    if (btn) btn.disabled = true;
+    if (saveLabel) { saveLabel.dataset.busy = '1'; saveLabel.textContent = 'Connecting…'; }
+    try {
+      const payload = { apiBase, deviceLabel, pairingCode: pairingCode.trim() };
+      const saveRes = await window.api.setAgentApiSettings(payload);
+      if (!saveRes || !saveRes.ok) {
+        const msg = (saveRes && saveRes.error) || 'Could not save agent settings.';
+        if (errEl) errEl.textContent = msg;
+        showToast(msg, 'error', 3400);
+        return;
+      }
+      document.getElementById('settings-pairing-code').value = '';
+      const reg = await window.api.retryPrintHostRegister();
+      if (!reg || !reg.ok) {
+        const msg =
+          (reg && reg.pairingError && reg.pairingError.message) ||
+          (reg && reg.error) ||
+          'Connect failed.';
+        const code = reg && (reg.code || (reg.pairingError && reg.pairingError.code));
+        if (errEl) errEl.textContent = code ? `${code}: ${msg}` : msg;
+        showToast(msg, 'error', 3400);
+        return;
+      }
+      if (errEl) errEl.textContent = '';
+      showToast('Connected as print host.');
+    } finally {
+      if (btn) btn.disabled = false;
+      if (saveLabel) {
+        delete saveLabel.dataset.busy;
+        saveLabel.textContent = 'Reconnect';
+      }
     }
-    document.getElementById('settings-pairing-code').value = '';
-    const reg = await window.api.retryPrintHostRegister();
-    if (!reg || !reg.ok) {
-      const msg =
-        (reg && reg.pairingError && reg.pairingError.message) ||
-        (reg && reg.error) ||
-        'Saved, but register failed.';
-      const code = reg && (reg.code || (reg.pairingError && reg.pairingError.code));
-      if (errEl) errEl.textContent = code ? `${code}: ${msg}` : msg;
-      showToast(msg, 'error', 3400);
-      return;
-    }
-    if (errEl) errEl.textContent = '';
-    showToast('Print host settings saved.');
   });
+
+  const rabbitOverrideEl = document.getElementById('settings-rabbit-manual-override');
+  if (rabbitOverrideEl) {
+    rabbitOverrideEl.addEventListener('change', async () => {
+      const on = !!rabbitOverrideEl.checked;
+      const res = await window.api.setRabbitManualOverride(on);
+      if (!res || !res.ok) {
+        showToast((res && res.error) || 'Could not update override.', 'error', 3400);
+        return;
+      }
+      showToast(on ? 'Manual RabbitMQ override ON' : 'Manual RabbitMQ override OFF');
+    });
+  }
 
   const refreshPrintersBtn = document.getElementById('settings-printers-refresh');
   if (refreshPrintersBtn) {

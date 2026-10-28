@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld("api", {
   setPrintLayout: (opts) => ipcRenderer.invoke("set-print-layout", opts),
   setRetentionSettings: (opts) => ipcRenderer.invoke("set-retention-settings", opts),
   setRabbitSettings: (opts) => ipcRenderer.invoke("set-rabbit-settings", opts),
+  setRabbitManualOverride: (enabled) =>
+    ipcRenderer.invoke("set-rabbit-manual-override", enabled),
   retryPrintJob: (id) => ipcRenderer.invoke("retry-print-job", id),
   resendPrintJob: (id) => ipcRenderer.invoke("resend-print-job", id),
   testPrint: () => ipcRenderer.invoke("test-print"),

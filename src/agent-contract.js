@@ -523,8 +523,19 @@ function normalizeRabbitConfig(rabbit, branchId) {
   };
 }
 
-/** Config patch to persist rabbit from register into local settings. */
-function rabbitConfigToPersistPatch(rabbitConfig) {
+/** When false (default), register rabbit overwrites broker fields. */
+function shouldApplyBrokerCreds(manualOverride) {
+  return !manualOverride;
+}
+
+/**
+ * Config patch to persist rabbit from register into local settings.
+ * @param {object} rabbitConfig normalized rabbit
+ * @param {{ manualOverride?: boolean }} [opts]
+ *   When manualOverride is true, broker host/port/user/pass/exchange/routing
+ *   are left alone; queue declare options still follow the server.
+ */
+function rabbitConfigToPersistPatch(rabbitConfig, opts = {}) {
   if (!rabbitConfig || typeof rabbitConfig !== "object") return {};
   const patch = {
     rabbit_queue: rabbitConfig.queue || "",
@@ -536,8 +547,14 @@ function rabbitConfigToPersistPatch(rabbitConfig) {
     rabbit_prefetch:
       rabbitConfig.prefetch != null ? Number(rabbitConfig.prefetch) : 1,
     rabbit_exchange_type: rabbitConfig.exchange_type || "topic",
-    rabbit_vhost: rabbitConfig.vhost != null ? rabbitConfig.vhost : "/",
   };
+  // Always persist vhost from server when present (queue lives there).
+  if (rabbitConfig.vhost != null) {
+    patch.rabbit_vhost = rabbitConfig.vhost;
+  }
+  if (!shouldApplyBrokerCreds(Boolean(opts.manualOverride))) {
+    return patch;
+  }
   if (rabbitConfig.host) patch.rabbit_host = rabbitConfig.host;
   if (rabbitConfig.port != null) patch.rabbit_port = rabbitConfig.port;
   if (rabbitConfig.username) patch.rabbit_username = rabbitConfig.username;
@@ -547,6 +564,24 @@ function rabbitConfigToPersistPatch(rabbitConfig) {
   if (rabbitConfig.exchange) patch.rabbit_exchange = rabbitConfig.exchange;
   if (rabbitConfig.routing_key) patch.rabbit_routing_key = rabbitConfig.routing_key;
   return patch;
+}
+
+/** Fingerprint used to decide whether Rabbit must reconnect after register. */
+function rabbitConnectionFingerprint(cfg = {}) {
+  return [
+    cfg.rabbit_host || "",
+    cfg.rabbit_port != null ? String(cfg.rabbit_port) : "",
+    cfg.rabbit_vhost || "/",
+    cfg.rabbit_username || "",
+    cfg.rabbit_password || "",
+    cfg.rabbit_exchange || "",
+    cfg.rabbit_routing_key || "",
+    cfg.rabbit_queue || "",
+    cfg.rabbit_queue_durable != null ? String(cfg.rabbit_queue_durable) : "",
+    JSON.stringify(cfg.rabbit_queue_arguments || {}),
+    cfg.rabbit_prefetch != null ? String(cfg.rabbit_prefetch) : "",
+    cfg.branch_id != null ? String(cfg.branch_id) : "",
+  ].join("|");
 }
 
 /** Queue declare options from persisted config or defaults. */
@@ -746,6 +781,8 @@ module.exports = {
   parsePrintMessage,
   normalizeRabbitConfig,
   rabbitConfigToPersistPatch,
+  shouldApplyBrokerCreds,
+  rabbitConnectionFingerprint,
   resolveQueueDeclareOptions,
   resolveQueueName,
   parseAgentError,
