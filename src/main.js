@@ -22,6 +22,10 @@ const amqp = require("amqplib");
 const { watchWindowsPrintJob } = require("./print-job-tracker");
 const { createPrintJobsStore } = require("./print-jobs-store");
 const { createStationPrintingController } = require("./station-printing");
+const {
+  syncBranchIdFromServer,
+  shouldReconnectAfterBranchApply,
+} = require("./rabbit-branch-sync");
 const { ASSUMPTIONS: STATION_PRINT_ASSUMPTIONS, verifyPdfChecksum, classifyPdfUrlHttpStatus, ERROR_CODES: STATION_ERROR_CODES } = require("./agent-contract");
 const {
   buildPdfAxiosConfig,
@@ -2866,12 +2870,22 @@ async function startRabbit() {
       }
 
       // Sync Branch ID from register/heartbeat (server is source of truth on fresh Connect).
+      // H1 r10: never await applyBranchId here — it would re-enter rabbitStartChain and deadlock.
       {
         const cfgBranch = readUserConfig();
         const serverBranch =
           cfgBranch.branch_id != null ? String(cfgBranch.branch_id).trim() : "";
-        if (serverBranch && serverBranch !== String(state.branchId || "").trim()) {
-          await applyBranchId(serverBranch);
+        const synced = syncBranchIdFromServer(state, serverBranch, {
+          resolveRoutingKey,
+          getRoutingKeyTemplate,
+          saveUserConfig,
+        });
+        if (synced.changed) {
+          log(
+            `Branch ID set to ${synced.branchId} — listening on ${synced.channel || "(set routing key)"}`,
+            "📌"
+          );
+          pushState();
         }
       }
       if (!String(state.branchId || "").trim()) {
@@ -3087,9 +3101,15 @@ async function applyBranchId(id) {
   saveUserConfig({ branch_id: id });
   log(`Branch ID set to ${id} — listening on ${state.channel || "(set routing key)"}`, "📌");
   pushState();
+  // Nested call from startRabbit (or race while rabbitStarting): state already synced;
+  // do not await startRabbit — that re-enters rabbitStartChain and deadlocks (r10 H1).
+  if (!shouldReconnectAfterBranchApply(rabbitStarting)) {
+    return { ok: true, skippedReconnect: true };
+  }
   resetRabbitReconnectBackoff();
   await startRabbit();
   await pollPrinters();
+  return { ok: true };
 }
 
 async function handleMessage(channel, message) {
