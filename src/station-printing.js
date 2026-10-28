@@ -122,7 +122,7 @@ function createStationPrintingController(deps = {}) {
     writeConfig({ device_label: String(label || "").trim() });
   }
 
-  /** Drop broker connection creds. v1.8: explicit rabbit_version null, or 409/epoch. Missing key ≠ clear. */
+  /** Atomic wipe: rabbit_* + rabbit_version together (contract v1.8 §6). Never wipe creds but keep version. */
   function dropBrokerCredentialsPatch() {
     return {
       rabbit_host: "",
@@ -136,6 +136,16 @@ function createStationPrintingController(deps = {}) {
       rabbit_exchange: "",
       rabbit_routing_key: "",
     };
+  }
+
+  /** Contract §4: send rabbit_version only while host AND holding broker creds. */
+  function rabbitVersionToSendOnHeartbeat(cfg, isHost) {
+    if (!isHost) return undefined;
+    const hasBroker = Boolean(cfg.rabbit_host && String(cfg.rabbit_host).trim());
+    if (!hasBroker) return undefined;
+    const v = cfg.rabbit_version;
+    if (v == null || String(v).trim() === "") return undefined;
+    return String(v).trim();
   }
 
   function setPairingCode(code) {
@@ -332,13 +342,20 @@ function createStationPrintingController(deps = {}) {
     const manualOverride = Boolean(cfg.rabbit_manual_override);
     let rabbitConfig = null;
     const versionAction = result.rabbit_version_action || "keep";
-    if (versionAction === "clear") {
+    // §6: null version OR not print host → atomic wipe (version + rabbit together).
+    const wipeBroker = versionAction === "clear" || !result.is_print_host;
+    if (wipeBroker) {
       Object.assign(patch, dropBrokerCredentialsPatch());
-      log(
-        "Server cleared Rabbit credentials (rabbit_version: null) — not print host for broker.",
-        "ℹ️"
-      );
+      if (versionAction === "clear" || !result.is_print_host) {
+        log(
+          result.is_print_host
+            ? "Server cleared Rabbit credentials (rabbit_version: null)."
+            : "Not print host — wiped local Rabbit credentials and version (contract §6).",
+          "ℹ️"
+        );
+      }
     } else {
+      // §5: rabbit present → replace config; §2: persist version when set/host.
       if (result.rabbit && typeof result.rabbit === "object") {
         rabbitConfig = normalizeRabbitConfig(
           result.rabbit,
@@ -351,7 +368,7 @@ function createStationPrintingController(deps = {}) {
         );
         patch.last_server_rabbit = result.rabbit;
       }
-      if (versionAction === "set" && result.rabbit_version) {
+      if (result.rabbit_version) {
         patch.rabbit_version = String(result.rabbit_version).trim();
       }
     }
@@ -593,10 +610,10 @@ function createStationPrintingController(deps = {}) {
         appId,
         branchId: bid,
         printers: [],
-        rabbitVersion:
-          cfg.rabbit_version != null && String(cfg.rabbit_version).trim() !== ""
-            ? String(cfg.rabbit_version).trim()
-            : undefined,
+        rabbitVersion: rabbitVersionToSendOnHeartbeat(
+          cfg,
+          Boolean(cfg.is_print_host)
+        ),
       });
     } finally {
       livenessInFlight = false;
@@ -633,28 +650,30 @@ function createStationPrintingController(deps = {}) {
     });
     consumeEnabled = applied.shouldConsume;
     const versionAction = live.rabbit_version_action || "keep";
-    // v1.8: explicit rabbit_version null clears creds. Missing key keeps. Revoke also clears.
-    if (versionAction === "clear" || applied.revoked) {
+    // §6: null version OR not print host OR revoke → atomic wipe (version + rabbit + disconnect).
+    const wipeBroker =
+      versionAction === "clear" || !live.is_print_host || applied.revoked;
+    if (wipeBroker) {
       writeConfig(dropBrokerCredentialsPatch());
       consumeEnabled = false;
       if (versionAction === "clear") {
         log(
-          "Server sent rabbit_version: null — dropped local Rabbit credentials; consumer idle (non-host).",
+          "Server sent rabbit_version: null — dropped local Rabbit credentials and version; consumer idle.",
           "⚠️"
         );
-      } else {
+      } else if (!live.is_print_host || applied.revoked) {
         log(
-          `Print host revoked (epoch ${live.host_epoch}) — stopping consumer and dropped local Rabbit credentials.`,
+          `Not print host (epoch ${live.host_epoch}) — wiped Rabbit credentials and version; consumer idle.`,
           "⚠️"
         );
       }
     }
 
-    // Apply full rabbit only when not cleared; missing rabbit object never wipes.
+    // §5: rabbit present → replace config + version + reconnect. Never wipe on mere absence.
     let rabbitChanged = false;
     const hbPatch = {};
-    if (versionAction !== "clear" && !applied.revoked) {
-      if (versionAction === "set" && live.rabbit_version) {
+    if (!wipeBroker) {
+      if (live.rabbit_version) {
         hbPatch.rabbit_version = String(live.rabbit_version).trim();
       }
       if (live.rabbit && typeof live.rabbit === "object") {
@@ -696,7 +715,7 @@ function createStationPrintingController(deps = {}) {
       const hasBroker = Boolean(
         cfgNow.rabbit_host && String(cfgNow.rabbit_host).trim()
       );
-      if (versionAction === "clear" || applied.revoked) {
+      if (wipeBroker) {
         consumeEnabled = false;
       } else if (applied.shouldConsume && !hasBroker) {
         consumeEnabled = false;
@@ -732,8 +751,11 @@ function createStationPrintingController(deps = {}) {
                 printers: payload,
                 timeout: timeoutMs,
                 rabbitVersion: (() => {
-                  const v = readConfig().rabbit_version;
-                  return v != null && String(v).trim() !== "" ? String(v).trim() : undefined;
+                  const c = readConfig();
+                  return rabbitVersionToSendOnHeartbeat(
+                    c,
+                    Boolean(c.is_print_host)
+                  );
                 })(),
               });
               if (r && r.authError) {
@@ -773,7 +795,8 @@ function createStationPrintingController(deps = {}) {
     return {
       ok: true,
       shouldConsume: consumeEnabled,
-      revoked: applied.revoked || versionAction === "clear",
+      revoked: wipeBroker,
+      brokerWiped: wipeBroker,
       promoted: applied.promoted,
       pending_job_count: live.pending_job_count,
       flushPending,
