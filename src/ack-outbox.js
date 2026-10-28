@@ -2,6 +2,9 @@
  * Durable outbox for server job acks (printed / failed).
  * Mark job processed first (caller), enqueue here, Rabbit-ack after durable write.
  * Flush with backoff until 2xx or terminal 4xx. Server ack is idempotent per job_id.
+ *
+ * Corrupt outbox JSON: quarantine to outbox.corrupt-<ts>.json, surface warning,
+ * start a fresh empty outbox — never silently drop without a trace.
  */
 
 "use strict";
@@ -35,11 +38,48 @@ function nextBackoffMs(attempts) {
 function createAckOutbox(opts = {}) {
   const filePath = opts.filePath;
   const maxEntries = opts.maxEntries != null ? Number(opts.maxEntries) : DEFAULT_MAX;
+  const onCorrupt = typeof opts.onCorrupt === "function" ? opts.onCorrupt : null;
   /** @type {Map<string, object>} keyed by jobId (one pending ack per job) */
   let map = new Map();
+  /** @type {null | { quarantinedPath: string, at: string, error: string }} */
+  let corruptInfo = null;
+
+  function quarantineCorrupt(err) {
+    if (!filePath) return null;
+    const ts = Date.now();
+    const quarantinedPath = path.join(path.dirname(filePath), `outbox.corrupt-${ts}.json`);
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.renameSync(filePath, quarantinedPath);
+      }
+    } catch (renameErr) {
+      // If rename fails, try copy+unlink so we still clear the bad file
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.copyFileSync(filePath, quarantinedPath);
+          fs.unlinkSync(filePath);
+        }
+      } catch (_) {
+        return {
+          quarantinedPath: filePath,
+          at: new Date().toISOString(),
+          error: `${err && err.message ? err.message : String(err)}; quarantine failed: ${renameErr.message || renameErr}`,
+        };
+      }
+    }
+    return {
+      quarantinedPath,
+      at: new Date().toISOString(),
+      error: err && err.message ? String(err.message) : String(err),
+    };
+  }
 
   function load() {
     if (!filePath) return;
+    if (!fs.existsSync(filePath)) {
+      map = new Map();
+      return;
+    }
     try {
       const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
       const entries = Array.isArray(raw.entries) ? raw.entries : [];
@@ -47,8 +87,15 @@ function createAckOutbox(opts = {}) {
       for (const e of entries) {
         if (e && e.jobId != null) map.set(String(e.jobId), normalize(e));
       }
-    } catch {
+    } catch (err) {
       map = new Map();
+      corruptInfo = quarantineCorrupt(err);
+      if (corruptInfo && onCorrupt) {
+        try {
+          onCorrupt(corruptInfo);
+        } catch (_) {}
+      }
+      // Fresh outbox file on next persist; leave missing until enqueue
     }
   }
 
@@ -155,6 +202,14 @@ function createAckOutbox(opts = {}) {
     return map.size;
   }
 
+  function getCorruptInfo() {
+    return corruptInfo;
+  }
+
+  function clearCorruptInfo() {
+    corruptInfo = null;
+  }
+
   return {
     enqueue,
     has,
@@ -166,6 +221,8 @@ function createAckOutbox(opts = {}) {
     size,
     load,
     persist,
+    getCorruptInfo,
+    clearCorruptInfo,
     BACKOFF_MS,
   };
 }

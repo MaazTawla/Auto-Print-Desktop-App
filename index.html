@@ -602,6 +602,23 @@
       border-color: rgba(248, 113, 113, 0.4);
       color: #fecaca;
     }
+    #ack-outbox-corrupt-warning {
+      display: none;
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      color: #92400e;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    #ack-outbox-corrupt-warning.show { display: block; }
+    :root[data-theme="dark"] #ack-outbox-corrupt-warning {
+      background: rgba(251, 191, 36, 0.12);
+      border-color: rgba(251, 191, 36, 0.4);
+      color: #fde68a;
+    }
     #queue-precondition-banner code {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px;
@@ -2712,6 +2729,12 @@
                   The agent token and Rabbit password are kept in memory for this session only and are never written to disk.
                   You will need to re-enter the pairing code after restart.
                 </div>
+                <div id="ack-outbox-corrupt-warning" role="alert" aria-live="assertive">
+                  <strong>Server ack outbox was corrupt.</strong>
+                  The damaged file was quarantined and a fresh outbox was started.
+                  Pending acknowledgements from the corrupt file were not recovered — check Print jobs and logs.
+                  <div class="field-hint" id="ack-outbox-corrupt-path" style="margin-top:6px"></div>
+                </div>
                 <div class="field">
                   <label for="settings-agent-api-base">Agent API base URL</label>
                   <input type="text" id="settings-agent-api-base" placeholder="https://api.example.com" autocomplete="off" />
@@ -3881,6 +3904,22 @@
         secureWarn.classList.add('show');
       } else {
         secureWarn.classList.remove('show');
+      }
+    }
+    const outboxWarn = document.getElementById('ack-outbox-corrupt-warning');
+    const outboxPath = document.getElementById('ack-outbox-corrupt-path');
+    if (outboxWarn) {
+      const info = s && s.ackOutboxCorrupt;
+      if (info) {
+        outboxWarn.classList.add('show');
+        if (outboxPath) {
+          outboxPath.textContent = info.quarantinedPath
+            ? ('Quarantined file: ' + info.quarantinedPath)
+            : '';
+        }
+      } else {
+        outboxWarn.classList.remove('show');
+        if (outboxPath) outboxPath.textContent = '';
       }
     }
     const status = document.getElementById('settings-host-status-line');

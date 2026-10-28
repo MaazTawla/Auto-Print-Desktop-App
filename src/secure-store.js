@@ -215,6 +215,25 @@ function sealSecretsForPersist(partial) {
   return out;
 }
 
+
+/**
+ * Single sealed writer for config.json (and any same-shape file).
+ * Strips/seals agent_token and rabbit_password; never writes plaintext secrets.
+ * When safeStorage is unavailable, secrets stay session-only and disk fields are empty.
+ */
+function writeSealedConfigFile(configPath, data) {
+  const fs = require("fs");
+  const path = require("path");
+  if (!configPath) throw new Error("writeSealedConfigFile: configPath required");
+  const sealed = sealSecretsForPersist(data && typeof data === "object" ? data : {});
+  for (const key of SECRET_KEYS) {
+    sealed[key] = "";
+  }
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(sealed, null, 2), "utf8");
+  return sealed;
+}
+
 function getSessionSecret(key) {
   return sessionSecrets[key] || "";
 }
@@ -233,6 +252,7 @@ module.exports = {
   decryptSecret,
   migrateAndLoadSecrets,
   sealSecretsForPersist,
+  writeSealedConfigFile,
   buildPersistPatch,
   setSafeStorageOverride,
   clearSessionSecrets,

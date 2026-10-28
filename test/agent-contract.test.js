@@ -265,3 +265,9 @@ describe("ERROR_CODES.PRINT_INTERRUPTED", () => {
   });
 });
 
+describe("ERROR_CODES.INVALID_PDF", () => {
+  it("is defined for %PDF header fail-ack", () => {
+    assert.equal(ERROR_CODES.INVALID_PDF, "INVALID_PDF");
+  });
+});
+

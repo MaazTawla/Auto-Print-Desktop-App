@@ -30,7 +30,7 @@ const {
 } = require("./pdf-fetch-policy");
 const {
   migrateAndLoadSecrets,
-  sealSecretsForPersist,
+  writeSealedConfigFile,
   SECRET_KEYS,
   isEncryptionAvailable,
   getSessionSecret,
@@ -87,6 +87,27 @@ function getAckOutbox() {
   if (!ackOutboxStore) {
     ackOutboxStore = createAckOutbox({
       filePath: path.join(app.getPath("userData"), "ack-outbox.json"),
+      onCorrupt: (info) => {
+        try {
+          if (typeof log === "function") {
+            log(
+              `Ack outbox JSON is corrupt — quarantined to ${info.quarantinedPath}. ` +
+                `Starting a fresh outbox. Pending server acks from the corrupt file were NOT recovered ` +
+                `(parse error: ${info.error || "unknown"}).`,
+              "❌"
+            );
+          } else {
+            console.error(
+              "Ack outbox corrupt; quarantined to",
+              info.quarantinedPath,
+              info.error
+            );
+          }
+        } catch (_) {}
+        try {
+          if (typeof pushState === "function") pushState();
+        } catch (_) {}
+      },
     });
   }
   return ackOutboxStore;
@@ -367,10 +388,14 @@ async function saveIncomingPdfFromBase64(store, jobId, base64Raw, preferredName)
     throw new Error("Invalid pdf_base64 encoding: " + (err.message || String(err)));
   }
   if (!buf.length) throw new Error("Decoded pdf_base64 is empty");
-  // PDF files start with %PDF
+  // PDF files start with %PDF — terminal INVALID_PDF (not free text / retryable)
   const header = buf.slice(0, 4).toString("latin1");
   if (header !== "%PDF") {
-    throw new Error("Decoded pdf_base64 is not a PDF (missing %PDF header)");
+    const invalid = new Error(
+      STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF"
+    );
+    invalid.code = STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF";
+    throw invalid;
   }
 
   const rawBase = preferredName || `order-${Date.now()}.pdf`;
@@ -1050,8 +1075,8 @@ function tryApplyStagedInstallConfig(configPath) {
       try { fs.unlinkSync(staged); } catch (_) {}
       return;
     }
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(merged, null, 2), "utf8");
+    // Always seal — never rewrite legacy plaintext secrets as-is (I1/M1)
+    writeSealedConfigFile(configPath, merged);
     fs.unlinkSync(staged);
   } catch (err) {
     console.error("Failed to apply staged install config:", err.message);
@@ -1117,16 +1142,8 @@ function readUserConfig() {
       migrateAndLoadSecrets(raw);
     if (persistPatch) {
       try {
-        const sealed = { ...raw, ...persistPatch };
-        for (const key of Object.keys(persistPatch)) {
-          sealed[key] = persistPatch[key];
-        }
-        // Never leave plaintext secrets on disk
-        for (const key of SECRET_KEYS) {
-          sealed[key] = "";
-        }
-        fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(sealed, null, 2), "utf8");
+        // Single sealing writer — strips/encrypts secrets; never plaintext
+        writeSealedConfigFile(CONFIG_PATH, { ...raw, ...persistPatch, ...cfg });
         try {
           if (typeof log === "function") {
             if (migrated) {
@@ -1176,13 +1193,11 @@ function saveUserConfig(partial) {
   if ("queue_precondition_hint" in partial && !partial.queue_precondition_hint) {
     delete next.queue_precondition_hint;
   }
-  // Encrypt when available; never write plaintext. Memory-only when unavailable.
-  const sealed = sealSecretsForPersist(next);
-  for (const key of SECRET_KEYS) {
-    sealed[key] = "";
+  if ("log_retention_days" in partial || "job_retention_days" in partial) {
+    delete next.retention_days;
   }
-  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(sealed, null, 2), "utf8");
+  // Single sealing writer — encrypt when available; never plaintext; session-only otherwise.
+  writeSealedConfigFile(CONFIG_PATH, next);
 }
 
 const RABBITMQ_HEARTBEAT_SECONDS = 15;
@@ -1694,6 +1709,13 @@ function getPublicState() {
         return null;
       }
     })(),
+    ackOutboxCorrupt: (() => {
+      try {
+        return getAckOutbox().getCorruptInfo();
+      } catch (_) {
+        return null;
+      }
+    })(),
   };
 }
 
@@ -1811,15 +1833,11 @@ ipcMain.handle("set-retention-settings", async (_e, opts) => {
   }
   state.logRetentionDays = clampRetentionDays(logParsed, 7);
   state.jobRetentionDays = clampRetentionDays(jobParsed, 7);
-  const cur = readUserConfig();
-  const next = {
-    ...cur,
+  // M1/N3: never write readUserConfig() raw — always seal via saveUserConfig
+  saveUserConfig({
     log_retention_days: state.logRetentionDays,
     job_retention_days: state.jobRetentionDays,
-  };
-  delete next.retention_days;
-  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf8");
+  });
   log(
     `Retention saved: logs older than ${state.logRetentionDays} day(s), job files older than ${state.jobRetentionDays} day(s).`,
     "⚙️"
@@ -3146,7 +3164,9 @@ async function handleMessage(channel, message) {
             ? "PDF_TOO_LARGE"
             : err && err.code === "PDF_HOST_NOT_ALLOWED"
               ? "PDF_HOST_NOT_ALLOWED"
-              : err.message || "save_failed";
+              : err && err.code === (STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF")
+                ? STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF"
+                : err.message || "save_failed";
       log("Could not save PDF: " + failReason, "❌");
       store.upsert({
         id: jobId,

@@ -71,3 +71,30 @@ describe("ack-outbox", () => {
     assert.equal(dueLater.length, 1);
   });
 });
+
+describe("ack-outbox corrupt JSON (L1)", () => {
+  it("quarantines to outbox.corrupt-<ts>.json, starts fresh, surfaces info", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ack-corrupt-"));
+    const filePath = path.join(dir, "ack-outbox.json");
+    fs.writeFileSync(filePath, "{not-json", "utf8");
+    const events = [];
+    const box = createAckOutbox({
+      filePath,
+      onCorrupt: (info) => events.push(info),
+    });
+    assert.equal(events.length, 1);
+    assert.ok(events[0].quarantinedPath.includes("outbox.corrupt-"));
+    assert.equal(fs.existsSync(events[0].quarantinedPath), true);
+    assert.equal(fs.existsSync(filePath), false);
+    assert.equal(box.size(), 0);
+    assert.ok(box.getCorruptInfo());
+    assert.equal(box.getCorruptInfo().quarantinedPath, events[0].quarantinedPath);
+    // Fresh outbox still works
+    box.enqueue({ jobId: "j-new", status: "failed", reason: "PRINT_INTERRUPTED" });
+    assert.equal(box.has("j-new"), true);
+    assert.equal(fs.existsSync(filePath), true);
+    const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    assert.equal(raw.entries.length, 1);
+  });
+});
+
