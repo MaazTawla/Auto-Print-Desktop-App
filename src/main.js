@@ -178,7 +178,9 @@ function moveJobToDlq(jobId, errMsg) {
     const j = getJobsStore().findById(jobId);
     if (j && j.serverJobId) {
       getStationPrinting()
-        .ackFailed(j.serverJobId, errMsg || "print_failed")
+        .ackFailed(j.serverJobId, errMsg || "print_failed", {
+          printerExternalId: j.printerExternalId || null,
+        })
         .catch(() => {});
     }
   } catch (_) {}
@@ -630,7 +632,11 @@ async function runPrintAttempt(jobId) {
     pushState();
     log(`Job ${job.file}: no default printer — cannot print.`, "❌");
     if (job.serverJobId) {
-      try { getStationPrinting().ackFailed(job.serverJobId, "no_printer"); } catch (_) {}
+      try {
+        getStationPrinting().ackFailed(job.serverJobId, "no_printer", {
+          printerExternalId: job.printerExternalId || null,
+        });
+      } catch (_) {}
     }
     return;
   }
@@ -703,7 +709,9 @@ async function runPrintAttempt(jobId) {
       log(`Print completed: ${j.file}`, "🖨️");
       if (j.serverJobId) {
         getStationPrinting()
-          .ackPrinted(j.serverJobId)
+          .ackPrinted(j.serverJobId, {
+            printerExternalId: j.printerExternalId || null,
+          })
           .catch((err) => log("Ack printed failed: " + (err.message || String(err)), "⚠️"));
       }
       syncJobsToState();
@@ -2376,6 +2384,10 @@ async function startRabbit() {
       );
       wireRabbitChannel(liveChannel);
 
+      // Contract: exclusive=false, prefetch=1 (channel.prefetch above). SAC is on the queue declare.
+      const consumeOpts = getStationPrinting().rabbitConsumeOptions
+        ? getStationPrinting().rabbitConsumeOptions()
+        : { exclusive: false, noAck: false };
       const consumed = await liveChannel.consume(queueName, async (msg) => {
         if (!msg) {
           if (liveChannel === rabbitChannel && !app.isQuiting) {
@@ -2394,7 +2406,7 @@ async function startRabbit() {
         } catch (_) {
           // Channel may close between message handling and ack/nack.
         }
-      });
+      }, consumeOpts);
       rabbitConsumerTag = consumed.consumerTag;
 
       let queueInfo = { messageCount: "?", consumerCount: "?" };
@@ -2524,10 +2536,17 @@ async function handleMessage(channel, message) {
     };
     pushState();
 
-    const pdfBase64 = parsed.pdf_base64;
-    const filePath = parsed.file_path;
-    if (!pdfBase64 && !filePath) {
-      log("Missing pdf_base64 and file_path in message.", "❌");
+    // Contract v1.0: pdf_url by default; pdf_base64 opt-in; dual-run file_path.
+    const pdfUrl = parsed.pdf_url || "";
+    const pdfBase64 = parsed.pdf_base64 || "";
+    const filePath = parsed.file_path || "";
+    const remoteUrl =
+      pdfUrl ||
+      (filePath.startsWith("http://") || filePath.startsWith("https://") ? filePath : "");
+    const localFilePath =
+      !remoteUrl && filePath && !filePath.startsWith("http") ? filePath : "";
+    if (!pdfUrl && !pdfBase64 && !filePath) {
+      log("Missing pdf_url / pdf_base64 / file_path in message.", "❌");
       if (serverJobId) {
         sp.ackFailed(serverJobId, "missing_pdf").catch(() => {});
       }
@@ -2535,41 +2554,78 @@ async function handleMessage(channel, message) {
     }
 
     const route = evaluated.route;
+    const printerExternalId =
+      (route && route.printer && route.printer.external_id) ||
+      parsed.printer_external_id ||
+      null;
     const printerName =
       (route && route.printer && (route.printer.windows_name || route.printer.name)) ||
       state.defaultPrinter;
     if (!printerName) {
       log("No printer available for this job.", "❌");
-      if (serverJobId) sp.ackFailed(serverJobId, "no_printer").catch(() => {});
+      if (serverJobId) {
+        sp.ackFailed(serverJobId, "no_printer", {
+          printerExternalId,
+        }).catch(() => {});
+      }
       return "reject";
     }
 
     const jobId = crypto.randomBytes(8).toString("hex");
     const store = getJobsStore();
-    const isUrl = filePath.startsWith("http://") || filePath.startsWith("https://");
-    const preferredName = filePath
-      ? derivePdfBasename(filePath, isUrl)
-      : `order-${Date.now()}.pdf`;
+    const preferredName = remoteUrl
+      ? derivePdfBasename(remoteUrl, true)
+      : localFilePath
+        ? derivePdfBasename(localFilePath, false)
+        : `order-${Date.now()}.pdf`;
 
     let localPath;
     let saveSource = null;
     try {
-      if (pdfBase64) {
+      // Prefer signed pdf_url (default delivery), then base64, then legacy file_path.
+      if (remoteUrl) {
+        try {
+          localPath = await saveIncomingPdf(store, jobId, remoteUrl, true);
+          saveSource = pdfUrl ? "pdf_url" : "file_path_url";
+        } catch (urlErr) {
+          if (!pdfBase64) throw urlErr;
+          log(
+            `pdf_url download failed (${urlErr.message || String(urlErr)}) — falling back to pdf_base64.`,
+            "⚠️"
+          );
+          localPath = await saveIncomingPdfFromBase64(store, jobId, pdfBase64, preferredName);
+          saveSource = "pdf_base64";
+        }
+      } else if (pdfBase64) {
         try {
           localPath = await saveIncomingPdfFromBase64(store, jobId, pdfBase64, preferredName);
           saveSource = "pdf_base64";
         } catch (b64Err) {
-          if (!filePath) throw b64Err;
+          if (!localFilePath) throw b64Err;
           log(
             `pdf_base64 failed (${b64Err.message || String(b64Err)}) — falling back to file_path.`,
             "⚠️"
           );
-          localPath = await saveIncomingPdf(store, jobId, filePath, isUrl);
+          localPath = await saveIncomingPdf(store, jobId, localFilePath, false);
           saveSource = "file_path";
         }
       } else {
-        localPath = await saveIncomingPdf(store, jobId, filePath, isUrl);
+        localPath = await saveIncomingPdf(store, jobId, localFilePath, false);
         saveSource = "file_path";
+      }
+      // Best-effort sha256 check when server provided one
+      if (parsed.pdf_sha256 && localPath) {
+        try {
+          const cryptoNode = require("crypto");
+          const buf = fs.readFileSync(localPath);
+          const digest = cryptoNode.createHash("sha256").update(buf).digest("hex");
+          if (digest.toLowerCase() !== String(parsed.pdf_sha256).toLowerCase()) {
+            log(
+              `pdf_sha256 mismatch (got ${digest.slice(0, 12)}… expected ${String(parsed.pdf_sha256).slice(0, 12)}…) — printing anyway.`,
+              "⚠️"
+            );
+          }
+        } catch (_) {}
       }
     } catch (err) {
       log("Could not save PDF: " + err.message, "❌");
@@ -2579,6 +2635,7 @@ async function handleMessage(channel, message) {
         orderId,
         serverJobId,
         printerName,
+        printerExternalId,
         delayed: !!parsed.delayed,
         ticketType: parsed.ticket_type,
         status: "failed-setup",
@@ -2590,7 +2647,11 @@ async function handleMessage(channel, message) {
       });
       syncJobsToState();
       pushState();
-      if (serverJobId) sp.ackFailed(serverJobId, err.message || "save_failed").catch(() => {});
+      if (serverJobId) {
+        sp.ackFailed(serverJobId, err.message || "save_failed", {
+          printerExternalId,
+        }).catch(() => {});
+      }
       return "reject";
     }
 

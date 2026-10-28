@@ -1,6 +1,6 @@
 /**
  * Print-agent HTTP client: register / heartbeat / deregister / printers-sync / ack / status.
- * Uses axios when available; injectable `request` for tests.
+ * Contract v1.0 — flat success bodies; register uses pairing_code (no bearer).
  */
 
 "use strict";
@@ -15,6 +15,7 @@ const {
   parseHeartbeatResponse,
   buildAckRequest,
   buildPrintersSyncRequest,
+  parsePrintersSyncResponse,
   resolveApiUrl,
   ERROR_CODES,
 } = require("./agent-contract");
@@ -51,8 +52,12 @@ function createAgentApi(options = {}) {
       "Content-Type": "application/json",
       ...(opts.headers || {}),
     };
-    const bearer = opts.token != null ? opts.token : token;
-    if (bearer) headers.Authorization = `Bearer ${bearer}`;
+    if (opts.noAuth) {
+      // register: pairing_code in body only
+    } else {
+      const bearer = opts.token != null ? opts.token : token;
+      if (bearer) headers.Authorization = `Bearer ${bearer}`;
+    }
 
     const res = await request({
       method,
@@ -63,15 +68,18 @@ function createAgentApi(options = {}) {
       validateStatus: () => true,
     });
 
-    const status = res.status;
-    const data = res.data;
-    return { status, data, headers: res.headers || {} };
+    return {
+      status: res.status,
+      data: res.data,
+      headers: res.headers || {},
+    };
   }
 
   async function register(fields) {
     const body = buildRegisterRequest(fields);
+    // No bearer on register (contract §2.1)
     const { status, data } = await call("POST", ENDPOINTS.register, body, {
-      token: fields.pairingToken || token || undefined,
+      noAuth: true,
     });
     if (status === 409) {
       const conflict = parseHostConflictError(data, status);
@@ -80,7 +88,8 @@ function createAgentApi(options = {}) {
         status,
         conflict: conflict || {
           code: ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED,
-          message: "Another device is already configured as print host for this branch.",
+          message:
+            "Another device is already configured as print host for this branch.",
           current_host: null,
         },
       };
@@ -130,10 +139,10 @@ function createAgentApi(options = {}) {
   }
 
   async function deregister(fields = {}) {
-    const body = {
-      app_id: fields.appId != null ? String(fields.appId) : undefined,
-      branch_id: fields.branchId != null ? String(fields.branchId) : undefined,
-    };
+    const body =
+      fields.reason != null
+        ? { reason: String(fields.reason) }
+        : {};
     const { status, data } = await call("POST", ENDPOINTS.deregister, body);
     return { ok: status >= 200 && status < 300, status, data };
   }
@@ -141,11 +150,14 @@ function createAgentApi(options = {}) {
   async function syncPrinters(fields) {
     const body = buildPrintersSyncRequest(fields);
     const { status, data } = await call("POST", ENDPOINTS.printersSync, body);
-    return { ok: status >= 200 && status < 300, status, data };
+    if (status < 200 || status >= 300) {
+      return { ok: false, status, data, ...parsePrintersSyncResponse({}) };
+    }
+    return { ok: true, status, ...parsePrintersSyncResponse(data), raw: data };
   }
 
-  async function ackJob(jobId, { status: jobStatus, reason, printedAt }) {
-    const body = buildAckRequest({ status: jobStatus, reason, printedAt });
+  async function ackJob(jobId, opts) {
+    const body = buildAckRequest(opts || {});
     const { status, data } = await call(
       "POST",
       ENDPOINTS.jobAck(jobId),
@@ -155,9 +167,13 @@ function createAgentApi(options = {}) {
   }
 
   async function reportPrinterStatus(printerId, payload) {
+    const pathId =
+      printerId != null && String(printerId).trim() !== ""
+        ? printerId
+        : "0";
     const { status, data } = await call(
       "POST",
-      ENDPOINTS.printerStatus(printerId),
+      ENDPOINTS.printerStatus(pathId),
       payload || {}
     );
     return { ok: status >= 200 && status < 300, status, data };

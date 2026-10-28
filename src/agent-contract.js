@@ -1,9 +1,10 @@
 /**
  * Print-agent API contract (station printing Option A).
- * Endpoints and DTO shapes live here until Backend finalizes them.
- * Base path: /api/v1/print-agent
+ * Aligned to Backend contract v1.0:
+ * /workspace/station-printing-web/docs/printing/station-printing-contract.md
  *
- * Assumptions Backend must confirm are listed in ASSUMPTIONS below.
+ * Base path: /api/v1/print-agent
+ * Agent success bodies are flat JSON at the root.
  */
 
 "use strict";
@@ -12,6 +13,11 @@ const PLATFORM = "desktop";
 
 const ERROR_CODES = Object.freeze({
   PRINT_HOST_ALREADY_CONFIGURED: "PRINT_HOST_ALREADY_CONFIGURED",
+  PAIRING_CODE_INVALID: "PAIRING_CODE_INVALID",
+  PAIRING_CODE_EXPIRED: "PAIRING_CODE_EXPIRED",
+  NOT_PRINT_HOST: "NOT_PRINT_HOST",
+  HOST_EPOCH_MISMATCH: "HOST_EPOCH_MISMATCH",
+  BRANCH_MISMATCH: "BRANCH_MISMATCH",
 });
 
 /** Relative paths under /api/v1/print-agent */
@@ -26,23 +32,41 @@ const ENDPOINTS = Object.freeze({
 });
 
 /**
- * Backend confirmation needed:
- * - Exact base URL path (/api/v1/print-agent vs merchant-scoped).
- * - Pairing: body field `pairing_code` vs header; token field name (`token` vs `access_token`).
- * - Register body: `role: "print_host"` vs auto-claim when none set.
- * - Heartbeat interval (plan suggests 45–90s online expiry) — client uses 30s.
- * - Rabbit consume: prefer `x-single-active-consumer` (we declare SAC); confirm Backend will not recreate without SAC.
- * - v2 message field names: printer_external_id, job_id, host_epoch, delayed, ticket_type.
- * - Ack body: { status: "printed"|"failed", reason?, printed_at? }.
- * - printers/sync body shape and whether server assigns printer ids.
+ * Contract v1.0 — confirmed (was ASSUMPTIONS; kept name for call sites).
+ * Remaining gaps (non-blocking) listed in REMAINING_GAPS.
  */
 const ASSUMPTIONS = Object.freeze({
+  contractVersion: "1.0",
   apiBasePath: "/api/v1/print-agent",
+  /** Client heartbeat interval — server advertises heartbeat_interval_seconds: 30 */
   heartbeatIntervalMs: 30000,
+  /** Server marks host offline after this many ms without heartbeat */
+  heartbeatTtlMs: 90000,
   registerRole: "print_host",
+  /** pairing_code + role are required on register; no server auto-claim */
+  pairingCodeRequired: true,
+  deviceLabelRequired: true,
+  /** Success token field is `token` (flat root). Envelope data.token still tolerated. */
+  tokenField: "token",
+  agentResponsesFlat: true,
   rabbitSingleActiveConsumer: true,
+  /** Agents keep active declare with identical SAC args; never exclusive=true */
+  consumeExclusive: false,
+  prefetch: 1,
   messageSchemaVersion: 2,
+  /** Default PDF delivery is pdf_url; pdf_base64 is opt-in on server */
+  pdfDelivery: "url_or_base64",
+  /** printers/sync keyed by external_id; server assigns numeric id */
+  printersSyncKey: "external_id",
+  printersServerAssignsId: true,
 });
+
+/** Open / deferred items from contract §11 that Desktop does not fully own. */
+const REMAINING_GAPS = Object.freeze([
+  "Optional apply of register.rabbit credentials into local Rabbit settings (fields present; UI/ops may still configure manually).",
+  "pdf_sha256 verification on download is best-effort; failure still attempts print with a warning.",
+  "Deregister clears branch host on server — product confirmation is with Work Planner, not Desktop.",
+]);
 
 function buildRegisterRequest({
   appId,
@@ -51,48 +75,69 @@ function buildRegisterRequest({
   deviceLabel,
   pairingCode,
   role = ASSUMPTIONS.registerRole,
-  hostEpoch,
+  agentVersion,
 }) {
-  const body = {
-    app_id: String(appId || "").trim(),
-    branch_id: String(branchId || "").trim(),
-    platform,
-    device_label: String(deviceLabel || "").trim() || undefined,
-    role,
-  };
-  if (pairingCode != null && String(pairingCode).trim() !== "") {
-    body.pairing_code = String(pairingCode).trim();
+  const code = pairingCode != null ? String(pairingCode).trim() : "";
+  const label = deviceLabel != null ? String(deviceLabel).trim() : "";
+  if (!code) {
+    const err = new Error("pairing_code is required");
+    err.code = "VALIDATION_ERROR";
+    throw err;
   }
-  if (hostEpoch != null && Number.isFinite(Number(hostEpoch))) {
-    body.host_epoch = Number(hostEpoch);
+  if (!label) {
+    const err = new Error("device_label is required");
+    err.code = "VALIDATION_ERROR";
+    throw err;
+  }
+  const body = {
+    pairing_code: code,
+    app_id: String(appId || "").trim(),
+    platform,
+    device_label: label,
+    role: role || ASSUMPTIONS.registerRole,
+  };
+  if (branchId != null && String(branchId).trim() !== "") {
+    body.branch_id = String(branchId).trim();
+  }
+  if (agentVersion != null && String(agentVersion).trim() !== "") {
+    body.agent_version = String(agentVersion).trim();
   }
   return body;
 }
 
+/**
+ * Flat agent success body. Tolerates legacy `{ data: { token } }` envelope only.
+ * Does not read access_token.
+ */
 function parseRegisterResponse(data) {
   if (!data || typeof data !== "object") {
     return { ok: false, error: { code: "BAD_RESPONSE", message: "Empty register response" } };
   }
-  const token =
-    data.token ?? data.access_token ?? data.agent_token ?? (data.data && data.data.token);
-  const isPrintHost = Boolean(
-    data.is_print_host ?? data.isPrintHost ?? (data.data && data.data.is_print_host)
-  );
-  const hostEpoch = Number(
-    data.host_epoch ?? data.hostEpoch ?? (data.data && data.data.host_epoch) ?? 1
-  );
+  const src =
+    data.token == null && data.data && typeof data.data === "object" && data.data.token != null
+      ? data.data
+      : data;
+  const token = src.token != null ? String(src.token) : "";
+  const isPrintHost = Boolean(src.is_print_host ?? src.isPrintHost);
+  const hostEpoch = Number(src.host_epoch ?? src.hostEpoch ?? 1);
   return {
     ok: true,
-    token: token != null ? String(token) : "",
+    token,
+    token_type: src.token_type != null ? String(src.token_type) : "Bearer",
     is_print_host: isPrintHost,
     host_epoch: Number.isFinite(hostEpoch) ? hostEpoch : 1,
-    app_id: data.app_id != null ? String(data.app_id) : null,
+    app_id: src.app_id != null ? String(src.app_id) : null,
+    branch_id: src.branch_id != null ? src.branch_id : null,
+    heartbeat_interval_seconds: Number(src.heartbeat_interval_seconds) || 30,
+    heartbeat_ttl_seconds: Number(src.heartbeat_ttl_seconds) || 90,
+    station_printing_enabled: src.station_printing_enabled,
+    rabbit: src.rabbit && typeof src.rabbit === "object" ? src.rabbit : null,
     raw: data,
   };
 }
 
 /**
- * Parse 409 PRINT_HOST_ALREADY_CONFIGURED body (plan §4.2).
+ * Parse 409 PRINT_HOST_ALREADY_CONFIGURED (contract §2.1).
  */
 function parseHostConflictError(payload, httpStatus) {
   const root = payload && typeof payload === "object" ? payload : {};
@@ -123,34 +168,53 @@ function parseHostConflictError(payload, httpStatus) {
               : current.lastHeartbeatAt != null
                 ? String(current.lastHeartbeatAt)
                 : null,
-          is_online: Boolean(
-            current.is_online ?? current.isOnline ?? false
-          ),
+          is_online: Boolean(current.is_online ?? current.isOnline ?? false),
         }
       : null,
   };
 }
 
-function buildHeartbeatRequest({
-  appId,
-  branchId,
-  hostEpoch,
-  printers = [],
-  isOnline = true,
-}) {
-  return {
-    app_id: String(appId || "").trim(),
-    branch_id: String(branchId || "").trim(),
-    host_epoch: Number.isFinite(Number(hostEpoch)) ? Number(hostEpoch) : undefined,
-    is_online: !!isOnline,
-    printers: (printers || []).map((p) => ({
-      external_id: String(p.external_id || p.externalId || "").trim(),
-      name: String(p.name || "").trim(),
-      connection: p.connection || p.connection_type || "lan",
-      status: p.status || "online",
-      is_default: Boolean(p.is_default ?? p.isDefault),
-    })),
+function mapPrinterForApi(p) {
+  const connectionType = p.connection_type || p.connection || "lan";
+  const statusRaw = p.status || "online";
+  // Contract enum: online | offline | error
+  let status = statusRaw;
+  let statusDetail = p.status_detail != null ? String(p.status_detail) : null;
+  if (statusRaw === "out_of_paper") {
+    status = "error";
+    statusDetail = statusDetail || "Out of paper";
+  }
+  const row = {
+    external_id: String(p.external_id || p.externalId || "").trim(),
+    name: String(p.name || "").trim(),
+    connection_type: connectionType,
+    // Desktop alias accepted by server
+    connection: connectionType,
+    status,
+    status_detail: statusDetail,
+    is_default: Boolean(p.is_default ?? p.isDefault),
   };
+  if (p.model != null && String(p.model).trim() !== "") {
+    row.model = String(p.model).trim();
+  }
+  if (p.ip_address != null && String(p.ip_address).trim() !== "") {
+    row.ip_address = String(p.ip_address).trim();
+  }
+  return row;
+}
+
+function buildHeartbeatRequest({ appId, branchId, printers = [] }) {
+  const body = {
+    printers: (printers || []).map(mapPrinterForApi),
+  };
+  // Optional; when present must match token branch (§Desktop assumptions)
+  if (appId != null && String(appId).trim() !== "") {
+    body.app_id = String(appId).trim();
+  }
+  if (branchId != null && String(branchId).trim() !== "") {
+    body.branch_id = String(branchId).trim();
+  }
+  return body;
 }
 
 function parseHeartbeatResponse(data) {
@@ -161,17 +225,30 @@ function parseHeartbeatResponse(data) {
       pending_job_count: 0,
     };
   }
-  const src = data.data && typeof data.data === "object" ? data.data : data;
+  // Flat root; tolerate accidental data wrapper
+  const src =
+    data.is_print_host == null && data.data && typeof data.data === "object"
+      ? data.data
+      : data;
   const epoch = Number(src.host_epoch ?? src.hostEpoch ?? 1);
   return {
     is_print_host: Boolean(src.is_print_host ?? src.isPrintHost),
     host_epoch: Number.isFinite(epoch) ? epoch : 1,
     pending_job_count: Number(src.pending_job_count ?? src.pendingJobCount ?? 0) || 0,
+    station_printing_enabled: src.station_printing_enabled,
+    server_time: src.server_time || null,
     raw: data,
   };
 }
 
-function buildAckRequest({ status, reason, printedAt }) {
+function buildAckRequest({
+  status,
+  reason,
+  printedAt,
+  printerExternalId,
+  hostEpoch,
+  retryable,
+}) {
   const body = {
     status: status === "printed" ? "printed" : "failed",
   };
@@ -181,27 +258,71 @@ function buildAckRequest({ status, reason, printedAt }) {
   if (printedAt) {
     body.printed_at = printedAt;
   }
+  if (printerExternalId != null && String(printerExternalId).trim() !== "") {
+    body.printer_external_id = String(printerExternalId).trim();
+  }
+  if (hostEpoch != null && Number.isFinite(Number(hostEpoch))) {
+    body.host_epoch = Number(hostEpoch);
+  }
+  if (retryable != null) {
+    body.retryable = Boolean(retryable);
+  }
   return body;
 }
 
 function buildPrintersSyncRequest({ appId, branchId, printers }) {
+  const body = {
+    printers: (printers || []).map(mapPrinterForApi),
+  };
+  if (appId != null && String(appId).trim() !== "") {
+    body.app_id = String(appId).trim();
+  }
+  if (branchId != null && String(branchId).trim() !== "") {
+    body.branch_id = String(branchId).trim();
+  }
+  return body;
+}
+
+/**
+ * Flat sync response: { accepted, printers: [{ id, external_id, … }] }
+ */
+function parsePrintersSyncResponse(data) {
+  if (!data || typeof data !== "object") {
+    return { accepted: 0, printers: [] };
+  }
+  const src =
+    data.accepted == null && data.data && typeof data.data === "object"
+      ? data.data
+      : data;
+  const printers = Array.isArray(src.printers) ? src.printers : [];
   return {
-    app_id: String(appId || "").trim(),
-    branch_id: String(branchId || "").trim(),
-    printers: (printers || []).map((p) => ({
-      external_id: String(p.external_id || p.externalId || "").trim(),
-      name: String(p.name || "").trim(),
-      connection: p.connection || "lan",
-      status: p.status || "online",
-      is_default: Boolean(p.is_default ?? p.isDefault),
+    accepted: Number(src.accepted) || printers.length,
+    printers: printers.map((p) => ({
+      id: p.id != null ? Number(p.id) : null,
+      external_id: String(p.external_id || "").trim(),
+      name: p.name != null ? String(p.name) : "",
       model: p.model != null ? String(p.model) : undefined,
+      connection_type: p.connection_type || p.connection || "lan",
+      ip_address: p.ip_address != null ? String(p.ip_address) : null,
+      is_default: Boolean(p.is_default),
+      status: p.status || "online",
+      status_detail: p.status_detail != null ? String(p.status_detail) : null,
     })),
   };
 }
 
+function firstNonEmpty(...vals) {
+  for (const v of vals) {
+    if (v == null) continue;
+    const s = typeof v === "string" ? v.trim() : String(v).trim();
+    if (s !== "" && s !== "null") return s;
+  }
+  return "";
+}
+
 /**
- * Parse Rabbit v2 print message (plan §7).
- * Supports legacy v1 (pdf_base64 / file_path only) for dual-run.
+ * Parse Rabbit v2 print message (contract §6).
+ * PDF: prefer pdf_url (default), else pdf_base64; dual-run file_path.
  */
 function parsePrintMessage(raw) {
   let data = raw;
@@ -216,17 +337,23 @@ function parsePrintMessage(raw) {
     return { ok: false, error: "empty" };
   }
 
+  const nestedPdf = data.pdf && typeof data.pdf === "object" ? data.pdf : null;
+  const nestedPrinter =
+    data.printer && typeof data.printer === "object" ? data.printer : null;
+  const nestedStation =
+    data.station && typeof data.station === "object" ? data.station : null;
+
   const schemaVersion = Number(data.schema_version ?? data.schemaVersion ?? data.v ?? 1);
   const jobId =
     data.job_id ?? data.jobId ?? data.print_job_id ?? data.printJobId ?? null;
   const orderId =
     data.order_id ?? data.orderId ?? data.OrderID ?? data.order_number ?? null;
-  const printerExternalId =
-    data.printer_external_id ??
-    data.printerExternalId ??
-    data.external_printer_id ??
-    data.printer_id ??
-    null;
+  const printerExternalId = firstNonEmpty(
+    data.printer_external_id,
+    data.printerExternalId,
+    nestedPrinter && nestedPrinter.external_id,
+    data.external_printer_id
+  );
   const hostEpochRaw = data.host_epoch ?? data.hostEpoch;
   const hostEpoch =
     hostEpochRaw != null && Number.isFinite(Number(hostEpochRaw))
@@ -235,43 +362,69 @@ function parsePrintMessage(raw) {
   const delayed = Boolean(data.delayed ?? data.is_delayed ?? data.isDelayed);
   const ticketType =
     data.ticket_type ?? data.ticketType ?? data.type ?? null;
-  const stationIndex = data.station_index ?? data.stationIndex ?? null;
-  const stationCount = data.station_count ?? data.stationCount ?? null;
-  const stationName = data.station_name ?? data.stationName ?? null;
+  const stationIndex =
+    data.station_index ??
+    data.stationIndex ??
+    (nestedStation && nestedStation.index) ??
+    null;
+  const stationCount =
+    data.station_count ??
+    data.stationCount ??
+    (nestedStation && nestedStation.count) ??
+    null;
+  const stationName =
+    data.station_name ??
+    data.stationName ??
+    (nestedStation && nestedStation.name) ??
+    null;
 
-  const pdfBase64 =
-    data.pdf_base64 ??
-    data.pdfBase64 ??
-    data.file_base64 ??
-    data.fileBase64 ??
-    data.base64_pdf ??
-    "";
-  const filePath =
-    data.file_path ??
-    data.filePath ??
-    data.pdf_path ??
-    data.pdfPath ??
-    data.pdf_url ??
-    data.pdfUrl ??
-    "";
+  const pdfUrl = firstNonEmpty(
+    data.pdf_url,
+    data.pdfUrl,
+    nestedPdf && nestedPdf.url
+  );
+  let pdfBase64 = firstNonEmpty(
+    data.pdf_base64,
+    data.pdfBase64,
+    data.file_base64,
+    data.fileBase64,
+    data.base64_pdf,
+    nestedPdf && nestedPdf.base64
+  );
+  // Null JSON becomes string "null" via firstNonEmpty guard — already filtered
+  if (pdfBase64 === "null") pdfBase64 = "";
+
+  const filePath = firstNonEmpty(
+    data.file_path,
+    data.filePath,
+    data.pdf_path,
+    data.pdfPath
+  );
+  const pdfSha256 = firstNonEmpty(
+    data.pdf_sha256,
+    data.pdfSha256,
+    nestedPdf && nestedPdf.sha256
+  );
 
   return {
     ok: true,
     schema_version: Number.isFinite(schemaVersion) ? schemaVersion : 1,
     job_id: jobId != null ? String(jobId).trim() : null,
-    order_id: orderId != null && String(orderId).trim() !== "" ? String(orderId).trim() : null,
-    printer_external_id:
-      printerExternalId != null && String(printerExternalId).trim() !== ""
-        ? String(printerExternalId).trim()
+    order_id:
+      orderId != null && String(orderId).trim() !== ""
+        ? String(orderId).trim()
         : null,
+    printer_external_id: printerExternalId || null,
     host_epoch: hostEpoch,
     delayed,
     ticket_type: ticketType != null ? String(ticketType) : null,
     station_index: stationIndex != null ? Number(stationIndex) : null,
     station_count: stationCount != null ? Number(stationCount) : null,
     station_name: stationName != null ? String(stationName) : null,
-    pdf_base64: typeof pdfBase64 === "string" ? pdfBase64.trim() : String(pdfBase64 || "").trim(),
-    file_path: typeof filePath === "string" ? filePath.trim() : String(filePath || "").trim(),
+    pdf_url: pdfUrl || null,
+    pdf_base64: pdfBase64 || "",
+    pdf_sha256: pdfSha256 || null,
+    file_path: filePath || "",
     raw: data,
   };
 }
@@ -285,7 +438,6 @@ function resolveApiUrl(apiBase, path) {
   if (/^https?:\/\//i.test(p)) return p;
   const prefix = ASSUMPTIONS.apiBasePath.replace(/\/+$/, "");
   if (p.startsWith(prefix) || p.startsWith("/api/")) {
-    // apiBase may already include /api/v1 or be origin only
     try {
       const u = new URL(base);
       if (u.pathname && u.pathname !== "/" && p.startsWith(u.pathname)) {
@@ -305,6 +457,7 @@ module.exports = {
   ERROR_CODES,
   ENDPOINTS,
   ASSUMPTIONS,
+  REMAINING_GAPS,
   buildRegisterRequest,
   parseRegisterResponse,
   parseHostConflictError,
@@ -312,6 +465,8 @@ module.exports = {
   parseHeartbeatResponse,
   buildAckRequest,
   buildPrintersSyncRequest,
+  parsePrintersSyncResponse,
   parsePrintMessage,
   resolveApiUrl,
+  mapPrinterForApi,
 };

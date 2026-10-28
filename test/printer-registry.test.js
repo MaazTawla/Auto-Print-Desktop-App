@@ -46,14 +46,27 @@ describe("printer-registry", () => {
     assert.equal(hit.reason, "unknown_printer_external_id");
   });
 
-  it("serialize/hydrate round-trip", () => {
+  it("applyServerSync stores server-assigned ids by external_id", () => {
+    const reg = createPrinterRegistry();
+    reg.syncFromWindowsList([{ name: "Kitchen" }, { name: "Bar" }]);
+    reg.applyServerSync([
+      { id: 42, external_id: "Kitchen", name: "Kitchen", connection_type: "usb" },
+      { id: 43, external_id: "Bar", name: "Bar", connection_type: "lan" },
+    ]);
+    assert.equal(reg.get("Kitchen").server_id, 42);
+    assert.equal(reg.getByServerId(43).external_id, "Bar");
+  });
+
+  it("serialize/hydrate round-trip keeps server_id", () => {
     const reg = createPrinterRegistry();
     reg.syncFromWindowsList([{ name: "X", portName: "USB001" }]);
+    reg.applyServerSync([{ id: 99, external_id: "X", name: "X" }]);
     reg.setDefault("X");
     const data = reg.serialize();
     const reg2 = createPrinterRegistry();
     reg2.hydrate(data);
     assert.equal(reg2.list().length, 1);
     assert.equal(reg2.getDefault().external_id, "X");
+    assert.equal(reg2.get("X").server_id, 99);
   });
 });

@@ -1,6 +1,7 @@
 /**
  * Station printing (Option A) facade used by main.js.
  * Keeps HostOnlyPolicy, agent API, app_id, and printer routing in one place.
+ * Aligned to Backend contract v1.0.
  */
 
 "use strict";
@@ -12,6 +13,7 @@ const { createPrinterRegistry } = require("./printer-registry");
 const { createAgentApi } = require("./agent-api");
 const {
   ASSUMPTIONS,
+  REMAINING_GAPS,
   parsePrintMessage,
   ERROR_CODES,
   PLATFORM,
@@ -22,6 +24,7 @@ function createStationPrintingController(deps = {}) {
   const writeConfig = deps.writeConfig || (() => {});
   const log = deps.log || ((msg) => console.log(msg));
   const onStateChange = deps.onStateChange || (() => {});
+  const agentVersion = deps.agentVersion || null;
 
   const appId = getOrCreateAppId({ readConfig, writeConfig });
   const policy = createHostOnlyPolicy({
@@ -71,6 +74,7 @@ function createStationPrintingController(deps = {}) {
       agentApiBase: String(readConfig().agent_api_base || ""),
       deviceLabel: String(readConfig().device_label || defaultDeviceLabel()),
       pairingCodeConfigured: Boolean(String(readConfig().pairing_code || "").trim()),
+      contractVersion: ASSUMPTIONS.contractVersion,
     };
   }
 
@@ -101,20 +105,40 @@ function createStationPrintingController(deps = {}) {
   }
 
   /**
-   * Register as print host. On 409, Rabbit must stay idle.
+   * Register as print host. pairing_code + role print_host required (contract §2.1).
+   * On 409, Rabbit must stay idle.
    */
   async function registerAsHost({ branchId } = {}) {
     const cfg = readConfig();
     api.setApiBase(cfg.agent_api_base || "");
-    if (cfg.agent_token) api.setToken(cfg.agent_token);
+    // Register never sends bearer — pairing_code only
+    api.setToken("");
 
-    const result = await api.register({
-      appId,
-      branchId: branchId || cfg.branch_id,
-      deviceLabel: cfg.device_label || defaultDeviceLabel(),
-      pairingCode: cfg.pairing_code || "",
-      hostEpoch: policy.hostEpoch,
-    });
+    let result;
+    try {
+      result = await api.register({
+        appId,
+        branchId: branchId || cfg.branch_id,
+        deviceLabel: cfg.device_label || defaultDeviceLabel(),
+        pairingCode: cfg.pairing_code || "",
+        role: ASSUMPTIONS.registerRole,
+        agentVersion:
+          agentVersion ||
+          cfg.agent_version ||
+          null,
+      });
+    } catch (err) {
+      if (err && err.code === "VALIDATION_ERROR") {
+        log(`Register validation: ${err.message}`, "❌");
+        onStateChange(publicHostState());
+        return {
+          ok: false,
+          error: { code: "VALIDATION_ERROR", message: err.message },
+          shouldConsume: false,
+        };
+      }
+      throw err;
+    }
 
     if (!result.ok && result.conflict) {
       hostConflict = result.conflict;
@@ -122,15 +146,15 @@ function createStationPrintingController(deps = {}) {
       consumeEnabled = false;
       persistHostFlags();
       onStateChange(publicHostState());
-      log(
-        `Print host conflict: ${result.conflict.message}`,
-        "⚠️"
-      );
+      log(`Print host conflict: ${result.conflict.message}`, "⚠️");
       return { ok: false, conflict: result.conflict, shouldConsume: false };
     }
 
     if (!result.ok) {
-      log(`Register failed: ${(result.error && result.error.message) || "unknown"}`, "❌");
+      log(
+        `Register failed: ${(result.error && result.error.message) || "unknown"}`,
+        "❌"
+      );
       onStateChange(publicHostState());
       return { ok: false, error: result.error, shouldConsume: false };
     }
@@ -139,6 +163,12 @@ function createStationPrintingController(deps = {}) {
     if (result.token) {
       writeConfig({ agent_token: result.token });
       api.setToken(result.token);
+    }
+    if (result.heartbeat_interval_seconds) {
+      writeConfig({
+        heartbeat_interval_seconds: result.heartbeat_interval_seconds,
+        heartbeat_ttl_seconds: result.heartbeat_ttl_seconds || 90,
+      });
     }
     const applied = policy.applyServerState({
       is_print_host: result.is_print_host,
@@ -159,6 +189,7 @@ function createStationPrintingController(deps = {}) {
       shouldConsume: consumeEnabled,
       promoted: applied.promoted,
       revoked: applied.revoked,
+      rabbit: result.rabbit || null,
     };
   }
 
@@ -171,7 +202,6 @@ function createStationPrintingController(deps = {}) {
     const result = await api.heartbeat({
       appId,
       branchId: branchId || cfg.branch_id,
-      hostEpoch: policy.hostEpoch,
       printers: printers.toSyncPayload(),
     });
     lastHeartbeatAt = new Date().toISOString();
@@ -206,9 +236,8 @@ function createStationPrintingController(deps = {}) {
   }
 
   async function deregister() {
-    const cfg = readConfig();
     try {
-      await api.deregister({ appId, branchId: cfg.branch_id });
+      await api.deregister({});
     } catch (_) {}
     policy.revoke("deregister");
     consumeEnabled = false;
@@ -219,11 +248,17 @@ function createStationPrintingController(deps = {}) {
   async function syncPrintersToServer({ branchId } = {}) {
     const cfg = readConfig();
     if (!api.getToken()) return { ok: false, skipped: true };
-    return api.syncPrinters({
+    const result = await api.syncPrinters({
       appId,
       branchId: branchId || cfg.branch_id,
       printers: printers.toSyncPayload(),
     });
+    if (result.ok && Array.isArray(result.printers) && result.printers.length) {
+      printers.applyServerSync(result.printers);
+      persistHostFlags();
+      onStateChange(publicHostState());
+    }
+    return result;
   }
 
   function syncWindowsPrinters(windowsList) {
@@ -237,7 +272,6 @@ function createStationPrintingController(deps = {}) {
     const id = String(externalIdOrName || "").trim();
     if (!id) return false;
     if (!printers.setDefault(id)) {
-      // try by windows name
       const row = printers.list().find(
         (p) => p.windows_name === id || p.name === id
       );
@@ -285,17 +319,32 @@ function createStationPrintingController(deps = {}) {
     return api.ackJob(jobId, {
       status: "printed",
       printedAt: extra.printedAt || new Date().toISOString(),
+      printerExternalId: extra.printerExternalId || extra.printer_external_id,
+      hostEpoch: extra.hostEpoch != null ? extra.hostEpoch : policy.hostEpoch,
     });
   }
 
-  async function ackFailed(jobId, reason) {
+  async function ackFailed(jobId, reason, extra = {}) {
     if (!jobId || !api.getToken()) return { ok: false, skipped: true };
-    return api.ackJob(jobId, { status: "failed", reason: reason || "print_failed" });
+    return api.ackJob(jobId, {
+      status: "failed",
+      reason: reason || "print_failed",
+      printerExternalId: extra.printerExternalId || extra.printer_external_id,
+      hostEpoch: extra.hostEpoch != null ? extra.hostEpoch : policy.hostEpoch,
+      retryable: extra.retryable,
+    });
   }
 
   async function reportStatus(printerExternalId, payload) {
     if (!printerExternalId || !api.getToken()) return { ok: false, skipped: true };
-    return api.reportPrinterStatus(printerExternalId, payload);
+    const row = printers.get(printerExternalId);
+    const pathId =
+      (row && row.server_id != null ? String(row.server_id) : null) ||
+      printerExternalId;
+    return api.reportPrinterStatus(pathId, {
+      ...(payload || {}),
+      external_id: printerExternalId,
+    });
   }
 
   function markFlushDone() {
@@ -314,10 +363,19 @@ function createStationPrintingController(deps = {}) {
       : {};
   }
 
+  /** Consume options: exclusive must be false; prefetch is set on the channel. */
+  function rabbitConsumeOptions() {
+    return {
+      exclusive: ASSUMPTIONS.consumeExclusive === true,
+      noAck: false,
+    };
+  }
+
   return {
     appId,
     ERROR_CODES,
     ASSUMPTIONS,
+    REMAINING_GAPS,
     policy,
     printers,
     api,
@@ -339,6 +397,7 @@ function createStationPrintingController(deps = {}) {
     markFlushDone,
     shouldConsume,
     rabbitConsumeArgs,
+    rabbitConsumeOptions,
     get flushPending() {
       return flushPending;
     },
