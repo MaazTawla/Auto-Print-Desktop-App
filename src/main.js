@@ -951,6 +951,8 @@ async function runPrintAttempt(jobId) {
       };
       log(`Print completed: ${j.file}`, "🖨️");
       if (j.serverJobId) {
+        // Mark processed immediately so a crash before outbox write cannot double-print.
+        getProcessedJobs().mark(j.serverJobId);
         finalizeServerAck({
           serverJobId: j.serverJobId,
           status: "printed",
@@ -2976,6 +2978,27 @@ async function handleMessage(channel, message) {
       scheduleAckOutboxFlush(0);
       return "ack";
     }
+    // Crash window: printing marker set but not processed → do not auto-print again.
+    // Fail-ack PRINT_INTERRUPTED so staff can reprint from Print jobs.
+    if (serverJobId && getProcessedJobs().isPrinting(serverJobId)) {
+      const printerExternalIdEarly =
+        (evaluated.route &&
+          evaluated.route.printer &&
+          evaluated.route.printer.external_id) ||
+        parsed.printer_external_id ||
+        null;
+      log(
+        `job_id=${serverJobId} has durable printing marker (interrupted) — fail-ack PRINT_INTERRUPTED, no reprint.`,
+        "⚠️"
+      );
+      finalizeServerAck({
+        serverJobId,
+        status: "failed",
+        reason: STATION_ERROR_CODES.PRINT_INTERRUPTED || "PRINT_INTERRUPTED",
+        printerExternalId: printerExternalIdEarly,
+      });
+      return "ack";
+    }
     state.lastOrder = {
       timestamp: new Date().toISOString(),
       channel,
@@ -3183,7 +3206,11 @@ async function handleMessage(channel, message) {
       );
     }
 
-    // N2: print first; mark processed + durable outbox inside finalizeServerAck;
+    // Persist printing marker BEFORE spooling so a crash cannot double-print on redelivery.
+    if (serverJobId) {
+      getProcessedJobs().markPrinting(serverJobId);
+    }
+    // N2: print; mark processed + durable outbox inside finalizeServerAck;
     // Rabbit ack only after outbox entry is written (never reprint on redelivery).
     await runPrintAttempt(jobId);
     if (serverJobId && !getProcessedJobs().has(serverJobId)) {

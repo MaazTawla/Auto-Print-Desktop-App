@@ -258,3 +258,10 @@ describe("agent-contract v1.0", () => {
     assert.equal(body.printers[0].external_id, "e1");
   });
 });
+
+describe("ERROR_CODES.PRINT_INTERRUPTED", () => {
+  it("is defined for crash-window fail-ack", () => {
+    assert.equal(ERROR_CODES.PRINT_INTERRUPTED, "PRINT_INTERRUPTED");
+  });
+});
+
