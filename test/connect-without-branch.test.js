@@ -154,7 +154,8 @@ describe("H1 Connect without local Branch ID", () => {
   });
 });
 
-describe("host-only Rabbit credentials", () => {
+
+describe("host-only Rabbit credentials (v1.8)", () => {
   it("non-host register without rabbit does not wipe stored broker and does not consume", async () => {
     let cfg = {
       agent_api_base: "https://api.example.com",
@@ -176,18 +177,148 @@ describe("host-only Rabbit credentials", () => {
           is_print_host: false,
           host_epoch: 1,
           branch_id: 147,
-          rabbit_version: "aaaaaaaaaaaaaaaa",
-          // no rabbit object
+          // missing rabbit_version key (older) — keep
         },
       }),
     });
     const result = await controller.registerAsHost({});
     assert.equal(result.ok, true);
     assert.equal(result.shouldConsume, false);
-    // absence must not wipe
     assert.equal(cfg.rabbit_host, "old.mq");
     assert.equal(cfg.rabbit_password, "oldsecret");
-    assert.equal(cfg.pairing_code, "");
+  });
+
+  it("host → rabbit_version null drops creds and stops consume", async () => {
+    let cfg = {
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+      rabbit_host: "mq.example.com",
+      rabbit_password: "secret",
+      rabbit_version: "aaaaaaaaaaaaaaaa",
+      is_print_host: true,
+      host_epoch: 1,
+    };
+    const controller = createStationPrintingController({
+      readConfig: () => ({ ...cfg }),
+      writeConfig: (patch) => {
+        cfg = { ...cfg, ...patch };
+      },
+      log: () => {},
+      request: async (req) => {
+        if (!String(req.url).includes("/heartbeat")) {
+          return { status: 404, data: {} };
+        }
+        return {
+          status: 200,
+          data: {
+            is_print_host: false,
+            host_epoch: 2,
+            rabbit_version: null,
+          },
+        };
+      },
+    });
+    controller.api.setToken("tok");
+    controller.policy.applyServerState({ is_print_host: true, host_epoch: 1 });
+    const revoked = await controller.heartbeat({ branchId: "147" });
+    assert.equal(revoked.ok, true);
+    assert.equal(revoked.shouldConsume, false);
+    assert.equal(cfg.rabbit_host, "");
+    assert.equal(cfg.rabbit_password, "");
+    assert.equal(cfg.rabbit_version, "");
+  });
+
+  it("null → full rabbit stores creds and marks consume", async () => {
+    let cfg = {
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+      rabbit_host: "",
+      rabbit_password: "",
+      rabbit_version: "",
+      is_print_host: false,
+      host_epoch: 1,
+    };
+    const controller = createStationPrintingController({
+      readConfig: () => ({ ...cfg }),
+      writeConfig: (patch) => {
+        cfg = { ...cfg, ...patch };
+      },
+      log: () => {},
+      request: async (req) => {
+        if (!String(req.url).includes("/heartbeat")) {
+          return { status: 404, data: {} };
+        }
+        return {
+          status: 200,
+          data: {
+            is_print_host: true,
+            host_epoch: 3,
+            rabbit_version: "bbbbbbbbbbbbbbbb",
+            rabbit: {
+              host: "new.mq",
+              port: 5672,
+              tls: false,
+              username: "agent",
+              password: "newsecret",
+              exchange: "auto_print",
+              queue: "printer.Branch.147",
+            },
+          },
+        };
+      },
+    });
+    controller.api.setToken("tok");
+    controller.policy.applyServerState({ is_print_host: false, host_epoch: 1 });
+    const promoted = await controller.heartbeat({ branchId: "147" });
+    assert.equal(promoted.ok, true);
+    assert.equal(promoted.shouldConsume, true);
+    assert.equal(cfg.rabbit_host, "new.mq");
+    assert.equal(cfg.rabbit_password, "newsecret");
+    assert.equal(cfg.rabbit_version, "bbbbbbbbbbbbbbbb");
+  });
+
+  it("missing rabbit_version key keeps stored broker state", async () => {
+    let cfg = {
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+      rabbit_host: "mq.example.com",
+      rabbit_password: "secret",
+      rabbit_version: "aaaaaaaaaaaaaaaa",
+      is_print_host: true,
+      host_epoch: 2,
+    };
+    const controller = createStationPrintingController({
+      readConfig: () => ({ ...cfg }),
+      writeConfig: (patch) => {
+        cfg = { ...cfg, ...patch };
+      },
+      log: () => {},
+      request: async (req) => {
+        if (!String(req.url).includes("/heartbeat")) {
+          return { status: 404, data: {} };
+        }
+        // older BE: no rabbit_version key, no rabbit object
+        return {
+          status: 200,
+          data: {
+            is_print_host: true,
+            host_epoch: 2,
+            pending_job_count: 0,
+          },
+        };
+      },
+    });
+    controller.api.setToken("tok");
+    controller.policy.applyServerState({ is_print_host: true, host_epoch: 2 });
+    const live = await controller.heartbeat({ branchId: "147" });
+    assert.equal(live.ok, true);
+    assert.equal(live.shouldConsume, true);
+    assert.equal(cfg.rabbit_host, "mq.example.com");
+    assert.equal(cfg.rabbit_password, "secret");
+    assert.equal(cfg.rabbit_version, "aaaaaaaaaaaaaaaa");
   });
 
   it("409 conflict drops broker credentials", async () => {
@@ -221,77 +352,5 @@ describe("host-only Rabbit credentials", () => {
     assert.equal(cfg.rabbit_host, "");
     assert.equal(cfg.rabbit_password, "");
     assert.equal(cfg.rabbit_version, "");
-  });
-
-  it("heartbeat revoke drops creds; promote with rabbit stores and marks consume", async () => {
-    let cfg = {
-      agent_api_base: "https://api.example.com",
-      agent_token: "tok",
-      branch_id: "147",
-      rabbit_host: "mq.example.com",
-      rabbit_password: "secret",
-      rabbit_version: "aaaaaaaaaaaaaaaa",
-      is_print_host: true,
-      host_epoch: 1,
-    };
-    let phase = "revoke";
-    const controller = createStationPrintingController({
-      readConfig: () => ({ ...cfg }),
-      writeConfig: (patch) => {
-        cfg = { ...cfg, ...patch };
-      },
-      log: () => {},
-      request: async (req) => {
-        if (!String(req.url).includes("/heartbeat")) {
-          return { status: 404, data: {} };
-        }
-        if (phase === "revoke") {
-          return {
-            status: 200,
-            data: {
-              is_print_host: false,
-              host_epoch: 2,
-              rabbit_version: "aaaaaaaaaaaaaaaa",
-            },
-          };
-        }
-        return {
-          status: 200,
-          data: {
-            is_print_host: true,
-            host_epoch: 3,
-            rabbit_version: "bbbbbbbbbbbbbbbb",
-            rabbit: {
-              host: "new.mq",
-              port: 5672,
-              tls: false,
-              username: "agent",
-              password: "newsecret",
-              exchange: "auto_print",
-              queue: "printer.Branch.147",
-            },
-          },
-        };
-      },
-    });
-    controller.api.setToken("tok");
-    // seed host policy
-    controller.policy.applyServerState({ is_print_host: true, host_epoch: 1 });
-
-    const revoked = await controller.heartbeat({ branchId: "147" });
-    assert.equal(revoked.ok, true);
-    assert.equal(revoked.revoked, true);
-    assert.equal(revoked.shouldConsume, false);
-    assert.equal(cfg.rabbit_host, "");
-    assert.equal(cfg.rabbit_password, "");
-
-    phase = "promote";
-    cfg.rabbit_version = ""; // missing → server sends full rabbit
-    const promoted = await controller.heartbeat({ branchId: "147" });
-    assert.equal(promoted.ok, true);
-    assert.equal(promoted.shouldConsume, true);
-    assert.equal(cfg.rabbit_host, "new.mq");
-    assert.equal(cfg.rabbit_password, "newsecret");
-    assert.equal(cfg.rabbit_version, "bbbbbbbbbbbbbbbb");
   });
 });

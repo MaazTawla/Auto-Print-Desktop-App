@@ -1418,6 +1418,7 @@ const {
 // ─── Station printing (Option A — single print host) ───────────────────────────
 let stationPrinting = null;
 let agentHeartbeatTimer = null;
+let agentHeartbeatSoonTimer = null;
 const AGENT_HEARTBEAT_MS = STATION_PRINT_ASSUMPTIONS.heartbeatIntervalMs || 30000;
 
 function getStationPrinting() {
@@ -2618,6 +2619,10 @@ function stopAgentHeartbeatLoop() {
     clearInterval(agentHeartbeatTimer);
     agentHeartbeatTimer = null;
   }
+  if (agentHeartbeatSoonTimer) {
+    clearTimeout(agentHeartbeatSoonTimer);
+    agentHeartbeatSoonTimer = null;
+  }
 }
 
 function startAgentHeartbeatLoop() {
@@ -2662,6 +2667,21 @@ async function runAgentHeartbeat() {
     }
     resetRabbitReconnectBackoff();
     await startRabbit();
+    return;
+  }
+  // v1.8: admin claim / promote may omit rabbit — poll soon for credentials (not an error).
+  if (result.ok && result.waitingForRabbitCreds) {
+    log(
+      "Print host — waiting for Rabbit credentials from server (heartbeat again shortly).",
+      "ℹ️"
+    );
+    state.rabbitmq = "idle";
+    pushState();
+    if (agentHeartbeatSoonTimer) clearTimeout(agentHeartbeatSoonTimer);
+    agentHeartbeatSoonTimer = setTimeout(() => {
+      agentHeartbeatSoonTimer = null;
+      runAgentHeartbeat().catch(() => {});
+    }, 2500);
     return;
   }
   if (result.ok && result.shouldConsume && sp.flushPending) {

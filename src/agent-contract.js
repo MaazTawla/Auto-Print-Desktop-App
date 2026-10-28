@@ -131,6 +131,31 @@ function buildRegisterRequest({
  * Flat agent success body. Tolerates legacy `{ data: { token } }` envelope only.
  * Does not read access_token.
  */
+
+/**
+ * v1.8 rabbit_version signal:
+ * - key absent (older BE) → keep stored broker state
+ * - key present and null/empty → clear stored version + broker creds
+ * - key present and non-empty string → set version (full rabbit may accompany)
+ */
+function parseRabbitVersionSignal(src) {
+  if (!src || typeof src !== "object") {
+    return { action: "keep", version: null };
+  }
+  if (!Object.prototype.hasOwnProperty.call(src, "rabbit_version")) {
+    return { action: "keep", version: null };
+  }
+  const v = src.rabbit_version;
+  if (v === null || v === undefined) {
+    return { action: "clear", version: null };
+  }
+  const s = String(v).trim();
+  if (s === "") {
+    return { action: "clear", version: null };
+  }
+  return { action: "set", version: s };
+}
+
 function parseRegisterResponse(data) {
   if (!data || typeof data !== "object") {
     return { ok: false, error: { code: "BAD_RESPONSE", message: "Empty register response" } };
@@ -161,10 +186,13 @@ function parseRegisterResponse(data) {
     station_printing_enabled: src.station_printing_enabled,
     rabbit: rabbitRaw,
     rabbitConfig: normalizeRabbitConfig(rabbitRaw, branchId),
-    rabbit_version:
-      src.rabbit_version != null && String(src.rabbit_version).trim() !== ""
-        ? String(src.rabbit_version).trim()
-        : null,
+    ...(() => {
+      const sig = parseRabbitVersionSignal(src);
+      return {
+        rabbit_version_action: sig.action,
+        rabbit_version: sig.version,
+      };
+    })(),
     pdf_host: pdfHost,
     raw: data,
   };
@@ -278,17 +306,15 @@ function parseHeartbeatResponse(data) {
   const epoch = Number(src.host_epoch ?? src.hostEpoch ?? 1);
   const rabbitRaw =
     src.rabbit && typeof src.rabbit === "object" ? src.rabbit : null;
-  const rabbitVersion =
-    src.rabbit_version != null && String(src.rabbit_version).trim() !== ""
-      ? String(src.rabbit_version).trim()
-      : null;
+  const rabbitVersionSignal = parseRabbitVersionSignal(src);
   return {
     is_print_host: Boolean(src.is_print_host ?? src.isPrintHost),
     host_epoch: Number.isFinite(epoch) ? epoch : 1,
     pending_job_count: Number(src.pending_job_count ?? src.pendingJobCount ?? 0) || 0,
     station_printing_enabled: src.station_printing_enabled,
     server_time: src.server_time || null,
-    rabbit_version: rabbitVersion,
+    rabbit_version_action: rabbitVersionSignal.action,
+    rabbit_version: rabbitVersionSignal.version,
     rabbit: rabbitRaw,
     rabbitConfig: rabbitRaw
       ? normalizeRabbitConfig(rabbitRaw, src.branch_id ?? null)
@@ -889,6 +915,7 @@ module.exports = {
   syncConflictBackoffMs,
   buildHeartbeatRequest,
   parseHeartbeatResponse,
+  parseRabbitVersionSignal,
   buildAckRequest,
   buildPrintersSyncRequest,
   parsePrintersSyncResponse,

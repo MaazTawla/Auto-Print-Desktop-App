@@ -97,6 +97,10 @@ function createStationPrintingController(deps = {}) {
       secretsEncryptionUnavailable: Boolean(
         readConfig().secrets_encryption_unavailable
       ),
+      waitingForRabbitCreds: Boolean(
+        policy.isPrintHost &&
+          !(readConfig().rabbit_host && String(readConfig().rabbit_host).trim())
+      ),
     };
   }
 
@@ -118,7 +122,7 @@ function createStationPrintingController(deps = {}) {
     writeConfig({ device_label: String(label || "").trim() });
   }
 
-  /** Drop broker connection creds when host role is lost (409 / epoch). Absence of rabbit ≠ clear. */
+  /** Drop broker connection creds. v1.8: explicit rabbit_version null, or 409/epoch. Missing key ≠ clear. */
   function dropBrokerCredentialsPatch() {
     return {
       rabbit_host: "",
@@ -322,24 +326,34 @@ function createStationPrintingController(deps = {}) {
     if (result.pdf_host) {
       patch.pdf_host = result.pdf_host;
     }
-    // Persist rabbit only when present (host-only). Absence must NOT wipe stored creds.
+    // v1.8: rabbit_version null → drop creds; missing key → keep; set → store.
+    // Full rabbit only when present (never treat absence of rabbit as wipe).
     const beforeFp = rabbitConnectionFingerprint(cfg);
     const manualOverride = Boolean(cfg.rabbit_manual_override);
     let rabbitConfig = null;
-    if (result.rabbit && typeof result.rabbit === "object") {
-      rabbitConfig = normalizeRabbitConfig(
-        result.rabbit,
-        result.branch_id || branchId || cfg.branch_id,
-        { apiBaseUrl: cfg.agent_api_base || "", manualOverride }
+    const versionAction = result.rabbit_version_action || "keep";
+    if (versionAction === "clear") {
+      Object.assign(patch, dropBrokerCredentialsPatch());
+      log(
+        "Server cleared Rabbit credentials (rabbit_version: null) — not print host for broker.",
+        "ℹ️"
       );
-      Object.assign(
-        patch,
-        rabbitConfigToPersistPatch(rabbitConfig, { manualOverride })
-      );
-      patch.last_server_rabbit = result.rabbit;
-    }
-    if (result.rabbit_version != null && String(result.rabbit_version).trim() !== "") {
-      patch.rabbit_version = String(result.rabbit_version).trim();
+    } else {
+      if (result.rabbit && typeof result.rabbit === "object") {
+        rabbitConfig = normalizeRabbitConfig(
+          result.rabbit,
+          result.branch_id || branchId || cfg.branch_id,
+          { apiBaseUrl: cfg.agent_api_base || "", manualOverride }
+        );
+        Object.assign(
+          patch,
+          rabbitConfigToPersistPatch(rabbitConfig, { manualOverride })
+        );
+        patch.last_server_rabbit = result.rabbit;
+      }
+      if (versionAction === "set" && result.rabbit_version) {
+        patch.rabbit_version = String(result.rabbit_version).trim();
+      }
     }
     // L2: never leave pairing code on disk after a successful register.
     patch.pairing_code = "";
@@ -373,14 +387,15 @@ function createStationPrintingController(deps = {}) {
     const hasBroker =
       Boolean(afterCfg.rabbit_host && String(afterCfg.rabbit_host).trim()) ||
       Boolean(rabbitConfig && rabbitConfig.hasBrokerCreds);
-    if (result.is_print_host && !hasBroker) {
+    const waitingForCreds = Boolean(result.is_print_host && !hasBroker);
+    if (waitingForCreds) {
       consumeEnabled = false;
       log(
-        "Print host confirmed, but server sent no Rabbit credentials yet — consumer idle.",
+        "Print host confirmed — waiting for Rabbit credentials from server (next heartbeat).",
         "ℹ️"
       );
     } else {
-      consumeEnabled = applied.shouldConsume && hasBroker;
+      consumeEnabled = applied.shouldConsume && hasBroker && versionAction !== "clear";
     }
     if (applied.promoted && consumeEnabled) flushPending = true;
     if (!result.is_print_host) {
@@ -405,6 +420,7 @@ function createStationPrintingController(deps = {}) {
       rabbit: result.rabbit || null,
       rabbitConfig,
       rabbitChanged: Boolean(rabbitChanged),
+      waitingForRabbitCreds: waitingForCreds,
       branch_id: result.branch_id != null ? String(result.branch_id) : afterCfg.branch_id || null,
     };
   }
@@ -616,75 +632,83 @@ function createStationPrintingController(deps = {}) {
       host_epoch: live.host_epoch,
     });
     consumeEnabled = applied.shouldConsume;
-    if (applied.revoked) {
+    const versionAction = live.rabbit_version_action || "keep";
+    // v1.8: explicit rabbit_version null clears creds. Missing key keeps. Revoke also clears.
+    if (versionAction === "clear" || applied.revoked) {
       writeConfig(dropBrokerCredentialsPatch());
-      log(
-        `Print host revoked (epoch ${live.host_epoch}) — stopping consumer and dropped local Rabbit credentials.`,
-        "⚠️"
-      );
+      consumeEnabled = false;
+      if (versionAction === "clear") {
+        log(
+          "Server sent rabbit_version: null — dropped local Rabbit credentials; consumer idle (non-host).",
+          "⚠️"
+        );
+      } else {
+        log(
+          `Print host revoked (epoch ${live.host_epoch}) — stopping consumer and dropped local Rabbit credentials.`,
+          "⚠️"
+        );
+      }
     }
 
-    // v1.7: rabbit_version always; full rabbit only when ours missing/stale.
-    // Host-only: never apply rabbit after revoke / when not print host (absence ≠ wipe; presence on non-host ignored).
+    // Apply full rabbit only when not cleared; missing rabbit object never wipes.
     let rabbitChanged = false;
     const hbPatch = {};
-    if (live.rabbit_version) {
-      hbPatch.rabbit_version = String(live.rabbit_version).trim();
-    }
-    if (
-      live.is_print_host &&
-      !applied.revoked &&
-      live.rabbit &&
-      typeof live.rabbit === "object"
-    ) {
-      const beforeFp = rabbitConnectionFingerprint(cfg);
-      const manualOverride = Boolean(cfg.rabbit_manual_override);
-      const rabbitConfig = normalizeRabbitConfig(live.rabbit, bid || cfg.branch_id, {
-        apiBaseUrl: cfg.agent_api_base || "",
-        manualOverride,
-      });
-      Object.assign(hbPatch, rabbitConfigToPersistPatch(rabbitConfig, { manualOverride }));
-      hbPatch.last_server_rabbit = live.rabbit;
-      if (rabbitConfig.hostRewriteNote) {
-        log(rabbitConfig.hostRewriteNote, "ℹ️");
+    if (versionAction !== "clear" && !applied.revoked) {
+      if (versionAction === "set" && live.rabbit_version) {
+        hbPatch.rabbit_version = String(live.rabbit_version).trim();
       }
-      if (!manualOverride) {
-        log(
-          `Applied Rabbit settings from heartbeat (${rabbitConfig.host || "host?"}:${rabbitConfig.port || "?"}).`,
-          "⚙️"
-        );
+      if (live.rabbit && typeof live.rabbit === "object") {
+        const beforeFp = rabbitConnectionFingerprint(cfg);
+        const manualOverride = Boolean(cfg.rabbit_manual_override);
+        const rabbitConfig = normalizeRabbitConfig(live.rabbit, bid || cfg.branch_id, {
+          apiBaseUrl: cfg.agent_api_base || "",
+          manualOverride,
+        });
+        Object.assign(hbPatch, rabbitConfigToPersistPatch(rabbitConfig, { manualOverride }));
+        hbPatch.last_server_rabbit = live.rabbit;
+        if (rabbitConfig.hostRewriteNote) {
+          log(rabbitConfig.hostRewriteNote, "ℹ️");
+        }
+        if (!manualOverride) {
+          log(
+            `Applied Rabbit settings from heartbeat (${rabbitConfig.host || "host?"}:${rabbitConfig.port || "?"}).`,
+            "⚙️"
+          );
+        }
+        writeConfig(hbPatch);
+        const afterFp = rabbitConnectionFingerprint(readConfig());
+        rabbitChanged = beforeFp !== afterFp;
+        if (rabbitChanged) {
+          log(
+            "Rabbit broker config changed — reconnecting consumer (finish in-flight, no double ack).",
+            "🔄"
+          );
+        }
+      } else if (Object.keys(hbPatch).length) {
+        writeConfig(hbPatch);
       }
-      writeConfig(hbPatch);
-      const afterFp = rabbitConnectionFingerprint(readConfig());
-      rabbitChanged = beforeFp !== afterFp;
-      if (rabbitChanged) {
-        log(
-          "Rabbit broker config changed — reconnecting consumer (finish in-flight, no double ack).",
-          "🔄"
-        );
-      }
-    } else if (Object.keys(hbPatch).length && !applied.revoked) {
-      writeConfig(hbPatch);
     }
 
-    // Host-only: need broker creds to consume. Absence of rabbit does not wipe prior creds.
+    // Host-only consume: need broker. Missing rabbit key does not wipe prior creds.
+    let waitingForCreds = false;
     {
       const cfgNow = readConfig();
       const hasBroker = Boolean(
         cfgNow.rabbit_host && String(cfgNow.rabbit_host).trim()
       );
-      if (applied.shouldConsume && !hasBroker) {
+      if (versionAction === "clear" || applied.revoked) {
         consumeEnabled = false;
-        if (live.is_print_host) {
+      } else if (applied.shouldConsume && !hasBroker) {
+        consumeEnabled = false;
+        waitingForCreds = Boolean(live.is_print_host);
+        if (waitingForCreds) {
           log(
-            "Print host active, but no Rabbit credentials yet — waiting for server payload.",
+            "Print host active — waiting for Rabbit credentials from server (next heartbeat).",
             "ℹ️"
           );
         }
-      } else if (!applied.revoked) {
-        consumeEnabled = applied.shouldConsume && hasBroker;
       } else {
-        consumeEnabled = false;
+        consumeEnabled = applied.shouldConsume && hasBroker;
       }
       if (applied.promoted && consumeEnabled) flushPending = true;
     }
@@ -749,11 +773,12 @@ function createStationPrintingController(deps = {}) {
     return {
       ok: true,
       shouldConsume: consumeEnabled,
-      revoked: applied.revoked,
+      revoked: applied.revoked || versionAction === "clear",
       promoted: applied.promoted,
       pending_job_count: live.pending_job_count,
       flushPending,
       rabbitChanged: Boolean(rabbitChanged),
+      waitingForRabbitCreds: waitingForCreds,
       printerUpsert,
       syncConflict: Boolean(printerUpsert && printerUpsert.syncConflict),
       retriesExhausted: Boolean(printerUpsert && printerUpsert.retriesExhausted),

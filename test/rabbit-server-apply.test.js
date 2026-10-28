@@ -15,6 +15,7 @@ const {
   parseHeartbeatResponse,
   buildHeartbeatRequest,
   parseRegisterResponse,
+  parseRabbitVersionSignal,
 } = require("../src/agent-contract");
 
 describe("rabbit server apply / manual override", () => {
@@ -197,5 +198,36 @@ describe("normalizeAgentApiBase / resolveApiUrl (M1)", () => {
       resolveApiUrl("https://api.example.com", "/register"),
       "https://api.example.com/api/v1/print-agent/register"
     );
+  });
+});
+
+describe("v1.8 parseRabbitVersionSignal", () => {
+  it("missing key → keep", () => {
+    const s = parseRabbitVersionSignal({ is_print_host: true });
+    assert.equal(s.action, "keep");
+    assert.equal(s.version, null);
+  });
+  it("explicit null → clear", () => {
+    const s = parseRabbitVersionSignal({ rabbit_version: null });
+    assert.equal(s.action, "clear");
+    assert.equal(s.version, null);
+  });
+  it("string → set", () => {
+    const s = parseRabbitVersionSignal({ rabbit_version: "abcdef0123456789" });
+    assert.equal(s.action, "set");
+    assert.equal(s.version, "abcdef0123456789");
+  });
+  it("heartbeat parse exposes action", () => {
+    const clear = parseHeartbeatResponse({
+      is_print_host: false,
+      host_epoch: 2,
+      rabbit_version: null,
+    });
+    assert.equal(clear.rabbit_version_action, "clear");
+    const keep = parseHeartbeatResponse({
+      is_print_host: true,
+      host_epoch: 2,
+    });
+    assert.equal(keep.rabbit_version_action, "keep");
   });
 });

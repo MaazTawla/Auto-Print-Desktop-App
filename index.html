@@ -3942,6 +3942,8 @@
         status.innerHTML = '<span class="host-status-pill conflict">Host already configured</span> Ask an admin to Change print host, then Retry.';
       } else if (sp.isPrintHost && rabbit === 'connected') {
         status.innerHTML = '<span class="host-status-pill on">Connected as print host</span> epoch ' + escHtml(String(sp.hostEpoch)) + branchNote;
+      } else if (sp.isPrintHost && sp.waitingForRabbitCreds) {
+        status.innerHTML = '<span class="host-status-pill on">Print host</span> waiting for Rabbit credentials…' + branchNote;
       } else if (sp.isPrintHost && rabbit === 'connecting') {
         status.innerHTML = '<span class="host-status-pill on">Connected as print host</span> connecting to print queue…' + branchNote;
       } else if (sp.isPrintHost) {
