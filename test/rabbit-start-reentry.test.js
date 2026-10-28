@@ -11,6 +11,7 @@ const assert = require("node:assert/strict");
 const {
   syncBranchIdFromServer,
   shouldReconnectAfterBranchApply,
+  shouldFlushPendingBranchReconnect,
   createRabbitStartSerializer,
 } = require("../src/rabbit-branch-sync");
 const { createStationPrintingController } = require("../src/station-printing");
@@ -56,6 +57,44 @@ describe("rabbit-branch-sync helpers", () => {
   it("shouldReconnectAfterBranchApply is false while rabbitStarting", () => {
     assert.equal(shouldReconnectAfterBranchApply(true), false);
     assert.equal(shouldReconnectAfterBranchApply(false), true);
+  });
+
+  it("shouldFlushPendingBranchReconnect when pending flag set", () => {
+    assert.equal(
+      shouldFlushPendingBranchReconnect({
+        pending: true,
+        desiredBranch: "147",
+        boundBranch: "147",
+      }),
+      true
+    );
+  });
+
+  it("shouldFlushPendingBranchReconnect on bound vs desired mismatch", () => {
+    assert.equal(
+      shouldFlushPendingBranchReconnect({
+        pending: false,
+        desiredBranch: "200",
+        boundBranch: "147",
+      }),
+      true
+    );
+    assert.equal(
+      shouldFlushPendingBranchReconnect({
+        pending: false,
+        desiredBranch: "147",
+        boundBranch: "147",
+      }),
+      false
+    );
+    assert.equal(
+      shouldFlushPendingBranchReconnect({
+        pending: false,
+        desiredBranch: "",
+        boundBranch: "147",
+      }),
+      false
+    );
   });
 });
 
@@ -284,5 +323,83 @@ describe("E2E fresh Connect empty branch → Connected as print host", () => {
     });
     await Promise.race([p, new Promise((r) => setTimeout(r, 200))]);
     assert.equal(settled, false);
+  });
+});
+
+describe("r11 M1 pending reconnect after skipped applyBranchId", () => {
+  /**
+   * Mid-start branch change: applyBranchId skips reconnect while rabbitStarting,
+   * sets pending; startRabbit finally flushes an outer start so the consumer
+   * ends bound to the new branch routing key.
+   */
+  it("flushes outer startRabbit after skip so consumer binds new branch", async () => {
+    const ser = createRabbitStartSerializer();
+    let pendingBranchReconnect = false;
+    const state = { branchId: "147", channel: "orders.147" };
+    const binds = [];
+    let startCount = 0;
+
+    async function startRabbit() {
+      return ser.runExclusive(async () => {
+        startCount += 1;
+        let boundForThisStart = "";
+        try {
+          // Capture routing early (old branch) — the bad window from r11 M1
+          boundForThisStart = String(state.branchId || "").trim();
+          const routingKey = `orders.${boundForThisStart}`;
+          binds.push({ start: startCount, branch: boundForThisStart, routingKey });
+
+          // Simulate slow broker declare while Advanced changes branch
+          await new Promise((r) => setTimeout(r, 40));
+          return { bound: boundForThisStart, routingKey };
+        } finally {
+          // Mirror main.js: clear starting then flush pending via outer call
+          // (serializer clears starting in its own finally after this returns;
+          // we emulate the product order by scheduling after the exclusive run.)
+          const desired = String(state.branchId || "").trim();
+          const shouldFlush = shouldFlushPendingBranchReconnect({
+            pending: pendingBranchReconnect,
+            desiredBranch: desired,
+            boundBranch: boundForThisStart,
+          });
+          if (shouldFlush) {
+            pendingBranchReconnect = false;
+            queueMicrotask(() => {
+              startRabbit().catch(() => {});
+            });
+          }
+        }
+      });
+    }
+
+    async function applyBranchId(id) {
+      const next = String(id || "").trim();
+      state.branchId = next;
+      state.channel = `orders.${next}`;
+      if (!shouldReconnectAfterBranchApply(ser.starting)) {
+        pendingBranchReconnect = true;
+        return { ok: true, skippedReconnect: true };
+      }
+      await startRabbit();
+      return { ok: true };
+    }
+
+    const first = startRabbit();
+    // Wait until exclusive run has started (starting=true)
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(ser.starting, true);
+    const applied = await applyBranchId("200");
+    assert.equal(applied.skippedReconnect, true);
+    assert.equal(pendingBranchReconnect, true);
+
+    await first;
+    // Allow microtask + second exclusive start to finish
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.ok(startCount >= 2, `expected follow-up start, got ${startCount}`);
+    const last = binds[binds.length - 1];
+    assert.equal(last.branch, "200");
+    assert.equal(last.routingKey, "orders.200");
+    assert.equal(state.branchId, "200");
   });
 });

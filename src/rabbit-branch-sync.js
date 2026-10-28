@@ -36,6 +36,17 @@ function shouldReconnectAfterBranchApply(rabbitStarting) {
 }
 
 /**
+ * After startRabbit clears rabbitStarting, decide whether to queue a follow-up
+ * start (branch changed while starting — see Desktop r11 M1).
+ */
+function shouldFlushPendingBranchReconnect({ pending, desiredBranch, boundBranch }) {
+  if (pending) return true;
+  const desired = String(desiredBranch || "").trim();
+  const bound = String(boundBranch || "").trim();
+  return Boolean(desired && bound && desired !== bound);
+}
+
+/**
  * Minimal serializer matching main.js rabbitStartChain semantics.
  * Nested runExclusive from inside an active run never settles if awaited —
  * callers must sync state instead of re-entering.
@@ -66,5 +77,6 @@ function createRabbitStartSerializer() {
 module.exports = {
   syncBranchIdFromServer,
   shouldReconnectAfterBranchApply,
+  shouldFlushPendingBranchReconnect,
   createRabbitStartSerializer,
 };

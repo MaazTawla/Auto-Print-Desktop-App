@@ -25,6 +25,7 @@ const { createStationPrintingController } = require("./station-printing");
 const {
   syncBranchIdFromServer,
   shouldReconnectAfterBranchApply,
+  shouldFlushPendingBranchReconnect,
 } = require("./rabbit-branch-sync");
 const { ASSUMPTIONS: STATION_PRINT_ASSUMPTIONS, verifyPdfChecksum, classifyPdfUrlHttpStatus, ERROR_CODES: STATION_ERROR_CODES } = require("./agent-contract");
 const {
@@ -1511,6 +1512,11 @@ let rabbitHealthTimer = null;
 let rabbitReconnectAttempt = 0;
 /** Suppress reconnect handlers while startRabbit is declaring / migrating the queue. */
 let rabbitStarting = false;
+/**
+ * Set when applyBranchId skips reconnect while rabbitStarting (r11 M1).
+ * Flushed from startRabbit's finally via an outer startRabbit (no nested await).
+ */
+let pendingBranchReconnect = false;
 /** Serialize startRabbit so Settings save + reconnect don't race-migrate. */
 let rabbitStartChain = Promise.resolve();
 let networkMonitorTimer = null;
@@ -2726,6 +2732,8 @@ async function stopRabbit() {
 
 async function startRabbit() {
   const run = async () => {
+    /** Branch id captured when this start binds its routing key (r11 M1). */
+    let boundForThisStart = "";
     await stopRabbit();
     let rabbitOpts = buildRabbitOptions();
     const cfgEarly = readUserConfig();
@@ -2909,6 +2917,7 @@ async function startRabbit() {
       const routed = getRoutingForBranch(state.branchId);
       const liveRoutingKey = routed.routingKey;
       const liveQueueName = routed.queueName;
+      boundForThisStart = String(state.branchId || "").trim();
       if (!liveRoutingKey || !liveQueueName) {
         state.rabbitmq = "idle";
         state.channel = liveRoutingKey || "";
@@ -3041,6 +3050,27 @@ async function startRabbit() {
       scheduleRabbitReconnect();
     } finally {
       rabbitStarting = false;
+      // r11 M1: if applyBranchId skipped reconnect (or branch changed after bind capture),
+      // queue an outer startRabbit — never await here (would re-enter the chain).
+      const desired = String(state.branchId || "").trim();
+      if (
+        shouldFlushPendingBranchReconnect({
+          pending: pendingBranchReconnect,
+          desiredBranch: desired,
+          boundBranch: boundForThisStart,
+        })
+      ) {
+        pendingBranchReconnect = false;
+        queueMicrotask(() => {
+          startRabbit().catch((err) =>
+            log(
+              "Pending branch reconnect failed: " +
+                (err && err.message ? err.message : String(err)),
+              "❌"
+            )
+          );
+        });
+      }
     }
   };
 
@@ -3104,6 +3134,7 @@ async function applyBranchId(id) {
   // Nested call from startRabbit (or race while rabbitStarting): state already synced;
   // do not await startRabbit — that re-enters rabbitStartChain and deadlocks (r10 H1).
   if (!shouldReconnectAfterBranchApply(rabbitStarting)) {
+    pendingBranchReconnect = true;
     return { ok: true, skippedReconnect: true };
   }
   resetRabbitReconnectBackoff();
