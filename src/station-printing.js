@@ -91,6 +91,9 @@ function createStationPrintingController(deps = {}) {
       rabbitQueue: resolveQueueName(readConfig(), readConfig().branch_id),
       pdfHost: String(readConfig().pdf_host || "").trim() || null,
       queuePreconditionHint: readConfig().queue_precondition_hint || null,
+      secretsEncryptionUnavailable: Boolean(
+        readConfig().secrets_encryption_unavailable
+      ),
     };
   }
 

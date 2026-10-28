@@ -32,8 +32,11 @@ const {
   migrateAndLoadSecrets,
   sealSecretsForPersist,
   SECRET_KEYS,
+  isEncryptionAvailable,
+  getSessionSecret,
 } = require("./secure-store");
 const { createProcessedJobsStore } = require("./processed-jobs");
+const { createAckOutbox } = require("./ack-outbox");
 
 /** Delays after failed attempts 1, 2, 3 before attempts 2, 3, 4 (exponential-style backoff). */
 const RETRY_DELAYS_MS = [5000, 30000, 60000];
@@ -57,6 +60,9 @@ function clampRetentionDays(raw, fallback) {
 
 let jobsStore = null;
 let processedJobsStore = null;
+let ackOutboxStore = null;
+let ackOutboxFlushTimer = null;
+let ackOutboxFlushInFlight = false;
 const pendingRetries = new Map();
 /** Warn when free space below this or below DISK_WARN_PERCENT_FREE. */
 const DISK_WARN_BYTES = 500 * 1024 * 1024;
@@ -75,6 +81,115 @@ function getProcessedJobs() {
     });
   }
   return processedJobsStore;
+}
+
+function getAckOutbox() {
+  if (!ackOutboxStore) {
+    ackOutboxStore = createAckOutbox({
+      filePath: path.join(app.getPath("userData"), "ack-outbox.json"),
+    });
+  }
+  return ackOutboxStore;
+}
+
+/**
+ * N2: mark processed (never reprint), durable-enqueue server ack, then Rabbit may ack.
+ * HTTP delivery is retried by flushAckOutbox.
+ */
+function finalizeServerAck({ serverJobId, status, reason, printerExternalId }) {
+  if (!serverJobId) return null;
+  getProcessedJobs().mark(serverJobId);
+  const entry = getAckOutbox().enqueue({
+    jobId: serverJobId,
+    status: status === "printed" ? "printed" : "failed",
+    reason: reason || null,
+    printerExternalId: printerExternalId || null,
+  });
+  scheduleAckOutboxFlush(0);
+  return entry;
+}
+
+function scheduleAckOutboxFlush(delayMs) {
+  const delay = delayMs != null ? Number(delayMs) : 0;
+  if (ackOutboxFlushTimer) clearTimeout(ackOutboxFlushTimer);
+  ackOutboxFlushTimer = setTimeout(() => {
+    ackOutboxFlushTimer = null;
+    flushAckOutbox().catch((err) => {
+      try {
+        log("Ack outbox flush error: " + (err.message || String(err)), "⚠️");
+      } catch (_) {}
+    });
+  }, Number.isFinite(delay) && delay > 0 ? delay : 0);
+}
+
+async function flushAckOutbox() {
+  if (ackOutboxFlushInFlight) return { skipped: true };
+  ackOutboxFlushInFlight = true;
+  let flushed = 0;
+  let deferred = 0;
+  try {
+    const outbox = getAckOutbox();
+    const due = outbox.listDue(Date.now());
+    if (!due.length) return { flushed: 0, deferred: 0 };
+    const sp = getStationPrinting();
+    for (const entry of due) {
+      let result;
+      try {
+        if (entry.status === "printed") {
+          result = await sp.ackPrinted(entry.jobId, {
+            printerExternalId: entry.printerExternalId,
+          });
+        } else {
+          result = await sp.ackFailed(entry.jobId, entry.reason || "print_failed", {
+            printerExternalId: entry.printerExternalId,
+          });
+        }
+      } catch (err) {
+        result = {
+          ok: false,
+          status: null,
+          error: { message: err.message || String(err) },
+        };
+      }
+      if (result && result.skipped) {
+        // No token yet — defer
+        outbox.markAttempt(entry.jobId, {
+          ok: false,
+          status: null,
+          error: "skipped_no_token",
+        });
+        deferred += 1;
+        continue;
+      }
+      const outcome = outbox.markAttempt(entry.jobId, {
+        ok: Boolean(result && result.ok),
+        status: result && result.status,
+        error:
+          (result && result.message) ||
+          (result && result.error && result.error.message) ||
+          null,
+      });
+      if (outcome && outcome.removed) {
+        flushed += 1;
+        log(
+          `Server ack outbox delivered job_id=${entry.jobId} status=${entry.status}`,
+          "✅"
+        );
+      } else {
+        deferred += 1;
+      }
+    }
+    // Schedule next due
+    const remaining = outbox.listAll();
+    if (remaining.length) {
+      const nextAt = Math.min(...remaining.map((e) => e.nextAttemptAt || 0));
+      const wait = Math.max(250, nextAt - Date.now());
+      scheduleAckOutboxFlush(wait);
+    }
+    return { flushed, deferred };
+  } finally {
+    ackOutboxFlushInFlight = false;
+  }
 }
 
 function syncJobsToState() {
@@ -108,14 +223,31 @@ async function fetchPdfUrl(url, authToken, opts = {}) {
     }
   } catch (_) {}
   const pdfHost = opts.pdfHost || cfg.pdf_host || null;
-  const built = buildPdfAxiosConfig({
-    pdfUrl: url,
-    authToken,
-    pdfHost,
-    apiBase,
-    allowedPdfHosts: opts.allowedPdfHosts,
-    maxBytes: opts.maxBytes != null ? opts.maxBytes : DEFAULT_MAX_PDF_BYTES,
-  });
+  let built;
+  try {
+    built = buildPdfAxiosConfig({
+      pdfUrl: url,
+      authToken,
+      pdfHost,
+      apiBase,
+      allowedPdfHosts: opts.allowedPdfHosts,
+      maxBytes: opts.maxBytes != null ? opts.maxBytes : DEFAULT_MAX_PDF_BYTES,
+    });
+  } catch (err) {
+    if (err && err.code === "PDF_HOST_NOT_ALLOWED") {
+      log(
+        `PDF fetch refused: host not allowed (${err.origin || "unknown"}). No GET; ack PDF_HOST_NOT_ALLOWED.`,
+        "🔒"
+      );
+      const denied = new Error(STATION_ERROR_CODES.PDF_HOST_NOT_ALLOWED || "PDF_HOST_NOT_ALLOWED");
+      denied.code = STATION_ERROR_CODES.PDF_HOST_NOT_ALLOWED || "PDF_HOST_NOT_ALLOWED";
+      denied.retryable = false;
+      denied.origin = err.origin;
+      throw denied;
+    }
+    throw err;
+  }
+  // buildPdfAxiosConfig asserts allowlist — host_not_allowed throws PDF_HOST_NOT_ALLOWED (no GET)
   if (built.sendAuth) {
     log(
       `PDF fetch: Bearer attached (host ${built.decision.origin} matches pdf_host allowlist).`,
@@ -123,13 +255,14 @@ async function fetchPdfUrl(url, authToken, opts = {}) {
     );
   } else {
     log(
-      `PDF fetch: Bearer withheld (${built.decision.reason}${built.decision.origin ? "; origin=" + built.decision.origin : ""}).`,
+      `PDF fetch: host allowed but Bearer withheld (${built.decision.reason}).`,
       "🔒"
     );
   }
   try {
     return await axios.get(built.url, built.axiosConfig);
   } catch (err) {
+    if (err && err.code === "PDF_HOST_NOT_ALLOWED") throw err;
     if (isPdfTooLargeError(err)) {
       const tooLarge = new Error(STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE");
       tooLarge.code = STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE";
@@ -178,6 +311,8 @@ async function saveIncomingPdf(store, jobId, filePath, isUrl, opts = {}) {
     }
   } catch (err) {
     if (err && err.code === "PDF_URL_EXPIRED") throw err;
+    if (err && err.code === "PDF_HOST_NOT_ALLOWED") throw err;
+    if (err && err.code === "PDF_TOO_LARGE") throw err;
     if (isNoSpaceError(err)) {
       await emergencyDiskCleanup();
       await refreshDiskSpaceStatus({ silent: true });
@@ -277,11 +412,12 @@ async function moveJobToDlq(jobId, errMsg) {
   if (!job) return "dlq";
   clearRetryTimer(jobId);
   if (job.serverJobId) {
-    try {
-      await getStationPrinting().ackFailed(job.serverJobId, errMsg || "print_failed", {
-        printerExternalId: job.printerExternalId || null,
-      });
-    } catch (_) {}
+    finalizeServerAck({
+      serverJobId: job.serverJobId,
+      status: "failed",
+      reason: errMsg || "print_failed",
+      printerExternalId: job.printerExternalId || null,
+    });
   }
   const dlqName = `${job.id}_${job.file}`;
   const dest = store.moveFileToDlq(job.localPath, dlqName);
@@ -731,11 +867,12 @@ async function runPrintAttempt(jobId) {
     pushState();
     log(`Job ${job.file}: no default printer — cannot print.`, "❌");
     if (job.serverJobId) {
-      try {
-        await getStationPrinting().ackFailed(job.serverJobId, "no_printer", {
-          printerExternalId: job.printerExternalId || null,
-        });
-      } catch (_) {}
+      finalizeServerAck({
+        serverJobId: job.serverJobId,
+        status: "failed",
+        reason: "no_printer",
+        printerExternalId: job.printerExternalId || null,
+      });
     }
     return "failed-setup";
   }
@@ -754,13 +891,12 @@ async function runPrintAttempt(jobId) {
     pushState();
     log(`Job ${job.file}: printing is only supported on Windows.`, "❌");
     if (job.serverJobId) {
-      try {
-        await getStationPrinting().ackFailed(
-          job.serverJobId,
-          "print_requires_windows",
-          { printerExternalId: job.printerExternalId || null }
-        );
-      } catch (_) {}
+      finalizeServerAck({
+        serverJobId: job.serverJobId,
+        status: "failed",
+        reason: "print_requires_windows",
+        printerExternalId: job.printerExternalId || null,
+      });
     }
     return "failed-setup";
   }
@@ -815,13 +951,11 @@ async function runPrintAttempt(jobId) {
       };
       log(`Print completed: ${j.file}`, "🖨️");
       if (j.serverJobId) {
-        try {
-          await getStationPrinting().ackPrinted(j.serverJobId, {
-            printerExternalId: j.printerExternalId || null,
-          });
-        } catch (err) {
-          log("Ack printed failed: " + (err.message || String(err)), "⚠️");
-        }
+        finalizeServerAck({
+          serverJobId: j.serverJobId,
+          status: "printed",
+          printerExternalId: j.printerExternalId || null,
+        });
       }
       syncJobsToState();
       pushState();
@@ -977,27 +1111,54 @@ function loadConfig() {
 function readUserConfig() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-    const { cfg, migrated, persistPatch } = migrateAndLoadSecrets(raw);
-    if (migrated && persistPatch) {
+    const { cfg, migrated, wipedPlaintext, encryptionAvailable, persistPatch } =
+      migrateAndLoadSecrets(raw);
+    if (persistPatch) {
       try {
         const sealed = { ...raw, ...persistPatch };
+        for (const key of Object.keys(persistPatch)) {
+          sealed[key] = persistPatch[key];
+        }
+        // Never leave plaintext secrets on disk
         for (const key of SECRET_KEYS) {
-          if (Object.prototype.hasOwnProperty.call(persistPatch, key)) {
-            sealed[key] = persistPatch[key];
-          }
+          sealed[key] = "";
         }
         fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(sealed, null, 2), "utf8");
         try {
           if (typeof log === "function") {
-            log("Migrated agent_token / rabbit_password into Electron safeStorage.", "🔒");
+            if (migrated) {
+              log("Migrated agent_token / rabbit_password into Electron safeStorage.", "🔒");
+            }
+            if (wipedPlaintext && !encryptionAvailable) {
+              log(
+                "Secure storage unavailable — removed plaintext secrets from disk; keeping them in memory for this session only. Re-pair required after restart.",
+                "⚠️"
+              );
+            } else if (wipedPlaintext) {
+              log("Removed legacy plaintext secrets from disk after migration.", "🔒");
+            }
+            if (!encryptionAvailable) {
+              log(
+                "OS secure storage (safeStorage) unavailable — secrets will not be persisted; app will re-pair on restart.",
+                "⚠️"
+              );
+            }
           }
         } catch (_) {}
       } catch (_) {}
     }
+    // Ensure in-memory session secrets are visible on the config object
+    for (const key of SECRET_KEYS) {
+      if (!cfg[key]) {
+        const s = getSessionSecret(key);
+        if (s) cfg[key] = s;
+      }
+    }
+    cfg.secrets_encryption_unavailable = !isEncryptionAvailable();
     return cfg;
   } catch (_) {
-    return {};
+    return { secrets_encryption_unavailable: !isEncryptionAvailable() };
   }
 }
 
@@ -1013,8 +1174,11 @@ function saveUserConfig(partial) {
   if ("queue_precondition_hint" in partial && !partial.queue_precondition_hint) {
     delete next.queue_precondition_hint;
   }
-  // Drop decrypted companion noise; sealSecrets writes *_enc and clears plaintext
+  // Encrypt when available; never write plaintext. Memory-only when unavailable.
   const sealed = sealSecretsForPersist(next);
+  for (const key of SECRET_KEYS) {
+    sealed[key] = "";
+  }
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(sealed, null, 2), "utf8");
 }
@@ -2696,6 +2860,8 @@ async function startRabbit() {
         "📡"
       );
       startAgentHeartbeatLoop();
+      // N2: flush durable server-ack outbox after reconnect
+      scheduleAckOutboxFlush(0);
       try {
         const sp2 = getStationPrinting();
         if (sp2.flushPending) {
@@ -2807,6 +2973,7 @@ async function handleMessage(channel, message) {
         `job_id=${serverJobId} already processed locally — acking Rabbit without reprint.`,
         "✅"
       );
+      scheduleAckOutboxFlush(0);
       return "ack";
     }
     state.lastOrder = {
@@ -2828,10 +2995,11 @@ async function handleMessage(channel, message) {
     if (!pdfUrl && !pdfBase64 && !filePath) {
       log("Missing pdf_url / pdf_base64 / file_path in message.", "❌");
       if (serverJobId) {
-        try {
-          await sp.ackFailed(serverJobId, "missing_pdf");
-        } catch (_) {}
-        getProcessedJobs().mark(serverJobId);
+        finalizeServerAck({
+          serverJobId,
+          status: "failed",
+          reason: "missing_pdf",
+        });
       }
       return "ack";
     }
@@ -2847,10 +3015,12 @@ async function handleMessage(channel, message) {
     if (!printerName) {
       log("No printer available for this job.", "❌");
       if (serverJobId) {
-        try {
-          await sp.ackFailed(serverJobId, "no_printer", { printerExternalId });
-        } catch (_) {}
-        getProcessedJobs().mark(serverJobId);
+        finalizeServerAck({
+          serverJobId,
+          status: "failed",
+          reason: "no_printer",
+          printerExternalId,
+        });
       }
       return "ack";
     }
@@ -2879,6 +3049,8 @@ async function handleMessage(channel, message) {
           saveSource = pdfUrl ? "pdf_url" : "file_path_url";
         } catch (urlErr) {
           if (urlErr && urlErr.code === "PDF_URL_EXPIRED") throw urlErr;
+          if (urlErr && urlErr.code === "PDF_HOST_NOT_ALLOWED") throw urlErr;
+          if (urlErr && urlErr.code === "PDF_TOO_LARGE") throw urlErr;
           if (!pdfBase64) throw urlErr;
           log(
             `pdf_url download failed (${urlErr.message || String(urlErr)}) — falling back to pdf_base64.`,
@@ -2933,10 +3105,12 @@ async function handleMessage(channel, message) {
           syncJobsToState();
           pushState();
           if (serverJobId) {
-            try {
-              await sp.ackFailed(serverJobId, reason, { printerExternalId });
-            } catch (_) {}
-            getProcessedJobs().mark(serverJobId);
+            finalizeServerAck({
+              serverJobId,
+              status: "failed",
+              reason,
+              printerExternalId,
+            });
           }
           return "ack";
         }
@@ -2947,7 +3121,9 @@ async function handleMessage(channel, message) {
           ? "PDF_URL_EXPIRED"
           : err && err.code === "PDF_TOO_LARGE"
             ? "PDF_TOO_LARGE"
-            : err.message || "save_failed";
+            : err && err.code === "PDF_HOST_NOT_ALLOWED"
+              ? "PDF_HOST_NOT_ALLOWED"
+              : err.message || "save_failed";
       log("Could not save PDF: " + failReason, "❌");
       store.upsert({
         id: jobId,
@@ -2968,16 +3144,12 @@ async function handleMessage(channel, message) {
       syncJobsToState();
       pushState();
       if (serverJobId) {
-        try {
-          await sp.ackFailed(serverJobId, failReason, {
-            printerExternalId,
-            retryable:
-              failReason === "PDF_URL_EXPIRED" || failReason === "PDF_TOO_LARGE"
-                ? false
-                : undefined,
-          });
-        } catch (_) {}
-        getProcessedJobs().mark(serverJobId);
+        finalizeServerAck({
+          serverJobId,
+          status: "failed",
+          reason: failReason,
+          printerExternalId,
+        });
       }
       return "ack";
     }
@@ -3011,9 +3183,13 @@ async function handleMessage(channel, message) {
       );
     }
 
-    // M3: ack Rabbit only after print success or server failure ack; dedupe job_id locally.
+    // N2: print first; mark processed + durable outbox inside finalizeServerAck;
+    // Rabbit ack only after outbox entry is written (never reprint on redelivery).
     await runPrintAttempt(jobId);
-    if (serverJobId) getProcessedJobs().mark(serverJobId);
+    if (serverJobId && !getProcessedJobs().has(serverJobId)) {
+      // Safety: print path without server ack (shouldn't happen) — still mark
+      getProcessedJobs().mark(serverJobId);
+    }
     return "ack";
   } catch (err) {
     log("Order handling error: " + err.message, "❌");
@@ -3256,12 +3432,23 @@ if (!gotSingleInstanceLock) {
     showWindow();
 
     log("Tawla Print Agent started.", "🚀");
+    try {
+      const cfg0 = readUserConfig();
+      if (cfg0.secrets_encryption_unavailable) {
+        log(
+          "Secure storage unavailable — agent token / Rabbit password are session-only and will not survive restart. Re-pair after restart.",
+          "⚠️"
+        );
+      }
+    } catch (_) {}
     if (state.branchId) {
       log(`Branch ID: ${state.branchId} — listening on ${state.channel || "(set routing key)"}`, "📌");
     } else {
       log("Branch ID not set — configure Branch and RabbitMQ in Settings.", "📌");
     }
     await startRabbit();
+    // N2: flush any pending server acks left from prior session
+    scheduleAckOutboxFlush(0);
     await pollPrinters();
     // Some USB/network printers appear a moment after app start/login.
     setTimeout(() => {

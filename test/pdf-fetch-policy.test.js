@@ -7,6 +7,7 @@ const axios = require("axios");
 const {
   shouldSendBearerForPdfUrl,
   buildPdfAxiosConfig,
+  assertPdfUrlAllowed,
   parseOrigin,
   DEFAULT_MAX_PDF_BYTES,
 } = require("../src/pdf-fetch-policy");
@@ -43,7 +44,40 @@ describe("pdf-fetch-policy", () => {
     assert.equal(bad.sendAuth, false);
   });
 
-  it("foreign-host probe: Authorization must not leak", async () => {
+  it("N1: host_not_allowed throws PDF_HOST_NOT_ALLOWED and must not GET", async () => {
+    let hits = 0;
+    const server = http.createServer((_req, res) => {
+      hits += 1;
+      res.writeHead(200);
+      res.end("%PDF");
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = server.address();
+    const url = `http://127.0.0.1:${port}/evil.pdf`;
+    assert.throws(
+      () =>
+        assertPdfUrlAllowed(url, {
+          pdfHost: "https://api.tawla.io",
+          apiBase: "https://api.tawla.io",
+        }),
+      (err) => err && err.code === "PDF_HOST_NOT_ALLOWED"
+    );
+    assert.throws(
+      () =>
+        buildPdfAxiosConfig({
+          pdfUrl: url,
+          authToken: "super-secret-token",
+          pdfHost: "https://api.tawla.io",
+          apiBase: "https://api.tawla.io",
+        }),
+      (err) => err && err.code === "PDF_HOST_NOT_ALLOWED"
+    );
+    // Confirm no accidental GET was issued by the policy helpers
+    assert.equal(hits, 0);
+    await new Promise((r) => server.close(r));
+  });
+
+  it("foreign-host with skipAllowCheck still withholds Bearer (probe)", async () => {
     let sawAuth = null;
     const server = http.createServer((req, res) => {
       sawAuth = req.headers.authorization || null;
@@ -58,6 +92,7 @@ describe("pdf-fetch-policy", () => {
       authToken: "super-secret-token",
       pdfHost: "https://api.tawla.io",
       apiBase: "https://api.tawla.io",
+      skipAllowCheck: true,
     });
     assert.equal(built.sendAuth, false);
     assert.equal(built.headers.Authorization, undefined);

@@ -2,6 +2,7 @@
  * PDF download policy: Bearer allowlist + size cap + no-auth redirects.
  * Bearer only when pdf_url scheme+host equals register.pdf_host (exact),
  * or API base scheme+host when pdf_host is missing.
+ * Disallowed hosts: do not GET — fail with PDF_HOST_NOT_ALLOWED.
  */
 
 "use strict";
@@ -69,20 +70,34 @@ function shouldSendBearerForPdfUrl(pdfUrl, opts = {}) {
 }
 
 /**
- * Axios config for PDF download.
- * When sending auth: maxRedirects 0 (never follow with Authorization).
- * Always cap maxContentLength / maxBodyLength.
+ * Fail closed when pdf_url origin is not on the allowlist.
+ * Caller must not perform the GET when this throws.
  */
-function buildPdfAxiosConfig({ pdfUrl, authToken, pdfHost, apiBase, allowedPdfHosts, maxBytes }) {
+function assertPdfUrlAllowed(pdfUrl, opts = {}) {
+  const decision = shouldSendBearerForPdfUrl(pdfUrl, opts);
+  if (decision.reason === "host_allowed") return decision;
+  const err = new Error("PDF_HOST_NOT_ALLOWED");
+  err.code = "PDF_HOST_NOT_ALLOWED";
+  err.reason = decision.reason;
+  err.origin = decision.origin || null;
+  err.allowed = decision.allowed || [];
+  err.retryable = false;
+  throw err;
+}
+
+/**
+ * Axios config for PDF download.
+ * Asserts allowlist unless skipAllowCheck (tests only).
+ * When sending auth: maxRedirects 0. Always cap body size.
+ */
+function buildPdfAxiosConfig({ pdfUrl, authToken, pdfHost, apiBase, allowedPdfHosts, maxBytes, skipAllowCheck }) {
   const cap =
     maxBytes != null && Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0
       ? Number(maxBytes)
       : DEFAULT_MAX_PDF_BYTES;
-  const decision = shouldSendBearerForPdfUrl(pdfUrl, {
-    pdfHost,
-    apiBase,
-    allowedPdfHosts,
-  });
+  const decision = skipAllowCheck
+    ? shouldSendBearerForPdfUrl(pdfUrl, { pdfHost, apiBase, allowedPdfHosts })
+    : assertPdfUrlAllowed(pdfUrl, { pdfHost, apiBase, allowedPdfHosts });
   const headers = {};
   if (decision.sendAuth && authToken) {
     headers.Authorization = `Bearer ${authToken}`;
@@ -120,6 +135,7 @@ module.exports = {
   parseOrigin,
   resolvePdfHostAllowOrigin,
   shouldSendBearerForPdfUrl,
+  assertPdfUrlAllowed,
   buildPdfAxiosConfig,
   isPdfTooLargeError,
 };

@@ -585,6 +585,23 @@
       line-height: 1.4;
     }
     #queue-precondition-banner.show { display: block; }
+    #secure-storage-warning {
+      display: none;
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(220, 38, 38, 0.1);
+      border: 1px solid rgba(220, 38, 38, 0.35);
+      color: #b91c1c;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    #secure-storage-warning.show { display: block; }
+    :root[data-theme="dark"] #secure-storage-warning {
+      background: rgba(248, 113, 113, 0.12);
+      border-color: rgba(248, 113, 113, 0.4);
+      color: #fecaca;
+    }
     #queue-precondition-banner code {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px;
@@ -2689,6 +2706,12 @@
               </div>
               <div class="settings-card-body">
                 <div class="settings-callout" id="settings-host-status-line">Host status: —</div>
+                <div id="secure-storage-warning" role="alert" aria-live="polite">
+                  <strong>Secure storage unavailable.</strong>
+                  OS encryption (Electron safeStorage) is not available on this machine.
+                  The agent token and Rabbit password are kept in memory for this session only and are never written to disk.
+                  You will need to re-enter the pairing code after restart.
+                </div>
                 <div class="field">
                   <label for="settings-agent-api-base">Agent API base URL</label>
                   <input type="text" id="settings-agent-api-base" placeholder="https://api.example.com" autocomplete="off" />
@@ -3852,6 +3875,14 @@
 
   function applyPrintHostForm(s) {
     const sp = s && s.stationPrinting;
+    const secureWarn = document.getElementById('secure-storage-warning');
+    if (secureWarn) {
+      if (sp && sp.secretsEncryptionUnavailable) {
+        secureWarn.classList.add('show');
+      } else {
+        secureWarn.classList.remove('show');
+      }
+    }
     const status = document.getElementById('settings-host-status-line');
     if (status) {
       if (!sp) {
