@@ -252,4 +252,103 @@ describe("station-printing controller", () => {
     });
     assert.equal(ev.action, "nack");
   });
+
+  it("syncPrintersToServer retries SYNC_CONFLICT then succeeds", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    let calls = 0;
+    const sleeps = [];
+    const request = async () => {
+      calls += 1;
+      if (calls < 3) {
+        return {
+          status: 409,
+          data: { error: { code: "SYNC_CONFLICT", message: "lock wait" } },
+          headers: {},
+        };
+      }
+      return {
+        status: 200,
+        data: {
+          accepted: 1,
+          printers: [{ id: 77, external_id: "win:Kitchen Printer 1", name: "Kitchen Printer 1" }],
+        },
+        headers: {},
+      };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
+    const res = await ctrl.syncPrintersToServer({ branchId: "147" });
+    assert.equal(res.ok, true);
+    assert.equal(calls, 3);
+    assert.equal(sleeps.length, 2);
+    assert.ok(sleeps[0] >= 200 && sleeps[0] < 500);
+    assert.equal(ctrl.printers.get("win:Kitchen Printer 1").server_id, 77);
+  });
+
+  it("syncPrintersToServer exhausts SYNC_CONFLICT then falls back (no host conflict)", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      return {
+        status: 409,
+        data: { error: { code: "SYNC_CONFLICT", message: "still locked" } },
+        headers: {},
+      };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async () => {},
+    });
+    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
+    const res = await ctrl.syncPrintersToServer({ branchId: "147" });
+    assert.equal(res.ok, false);
+    assert.equal(res.syncConflict, true);
+    assert.equal(res.retriesExhausted, true);
+    assert.equal(res.code, "SYNC_CONFLICT");
+    assert.equal(calls, 3);
+    // Must not be treated as PRINT_HOST_ALREADY_CONFIGURED
+    assert.equal(ctrl.hostConflict, null);
+  });
+
+  it("register 409 PRINT_HOST_ALREADY_CONFIGURED is not confused with SYNC_CONFLICT", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      branch_id: "147",
+      pairing_code: "X",
+      device_label: "Desk",
+    });
+    const request = async () => ({
+      status: 409,
+      data: {
+        error: {
+          code: "PRINT_HOST_ALREADY_CONFIGURED",
+          message: "taken",
+          current_host: { app_id: "other", device_label: "Old", is_online: false },
+        },
+      },
+      headers: {},
+    });
+    const ctrl = createStationPrintingController({ ...store, request, log: () => {} });
+    const res = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(res.ok, false);
+    assert.equal(ctrl.hostConflict.code, "PRINT_HOST_ALREADY_CONFIGURED");
+  });
 });

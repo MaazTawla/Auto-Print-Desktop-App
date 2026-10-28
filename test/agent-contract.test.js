@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const crypto = require("crypto");
 const {
   parseHostConflictError,
+  parseSyncConflictError,
+  syncConflictBackoffMs,
   parsePrintMessage,
   parseRegisterResponse,
   parseHeartbeatResponse,
@@ -268,6 +270,54 @@ describe("ERROR_CODES.PRINT_INTERRUPTED", () => {
 describe("ERROR_CODES.INVALID_PDF", () => {
   it("is defined for %PDF header fail-ack", () => {
     assert.equal(ERROR_CODES.INVALID_PDF, "INVALID_PDF");
+  });
+});
+
+describe("SYNC_CONFLICT vs PRINT_HOST_ALREADY_CONFIGURED", () => {
+  it("ERROR_CODES.SYNC_CONFLICT is defined", () => {
+    assert.equal(ERROR_CODES.SYNC_CONFLICT, "SYNC_CONFLICT");
+  });
+
+  it("parseSyncConflictError reads error.code SYNC_CONFLICT", () => {
+    const c = parseSyncConflictError(
+      { error: { code: "SYNC_CONFLICT", message: "deadlock retry exhausted" } },
+      409
+    );
+    assert.ok(c);
+    assert.equal(c.code, ERROR_CODES.SYNC_CONFLICT);
+    assert.match(c.message, /deadlock/i);
+  });
+
+  it("parseHostConflictError returns null for SYNC_CONFLICT", () => {
+    const h = parseHostConflictError(
+      { error: { code: "SYNC_CONFLICT", message: "x" } },
+      409
+    );
+    assert.equal(h, null);
+  });
+
+  it("parseHostConflictError still parses PRINT_HOST_ALREADY_CONFIGURED", () => {
+    const h = parseHostConflictError(
+      {
+        error: {
+          code: "PRINT_HOST_ALREADY_CONFIGURED",
+          message: "taken",
+          current_host: { app_id: "other", device_label: "Old", is_online: true },
+        },
+      },
+      409
+    );
+    assert.equal(h.code, ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED);
+    assert.equal(h.current_host.app_id, "other");
+  });
+
+  it("syncConflictBackoffMs is short and jittered", () => {
+    const a = syncConflictBackoffMs(1, () => 0);
+    const b = syncConflictBackoffMs(1, () => 0.999);
+    assert.equal(a, 200);
+    assert.ok(b >= 200 && b < 400);
+    const c = syncConflictBackoffMs(2, () => 0);
+    assert.equal(c, 500);
   });
 });
 

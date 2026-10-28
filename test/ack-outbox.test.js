@@ -7,6 +7,7 @@ const os = require("os");
 const path = require("path");
 const {
   createAckOutbox,
+  pruneCorruptQuarantines,
   isTerminalAckStatus,
   isSuccessAckStatus,
   nextBackoffMs,
@@ -95,6 +96,41 @@ describe("ack-outbox corrupt JSON (L1)", () => {
     assert.equal(fs.existsSync(filePath), true);
     const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
     assert.equal(raw.entries.length, 1);
+  });
+});
+
+describe("ack-outbox quarantine cap (r4 L)", () => {
+  it("keeps newest 10 outbox.corrupt-* and deletes older", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ack-prune-"));
+    const filePath = path.join(dir, "ack-outbox.json");
+    // Seed 12 quarantine files with increasing timestamps
+    for (let i = 1; i <= 12; i++) {
+      fs.writeFileSync(path.join(dir, `outbox.corrupt-${1000 + i}.json`), `{${i}`, "utf8");
+    }
+    // Trigger quarantine of current corrupt outbox → 13th file then prune to 10
+    fs.writeFileSync(filePath, "NOT_JSON", "utf8");
+    const box = createAckOutbox({ filePath, corruptKeep: 10 });
+    const left = fs.readdirSync(dir).filter((n) => n.startsWith("outbox.corrupt-"));
+    assert.equal(left.length, 10);
+    assert.ok(box.getCorruptInfo());
+    // Newest timestamps kept (includes the just-quarantined file with Date.now() ts)
+    const ts = left
+      .map((n) => Number((n.match(/outbox\.corrupt-(\d+)/) || [])[1]))
+      .sort((a, b) => b - a);
+    assert.ok(ts[0] >= ts[9]);
+    assert.ok(!left.includes("outbox.corrupt-1001.json")); // oldest pruned
+    assert.ok(!left.includes("outbox.corrupt-1002.json"));
+  });
+
+  it("pruneCorruptQuarantines helper deletes beyond keep", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ack-prune2-"));
+    for (let i = 0; i < 5; i++) {
+      fs.writeFileSync(path.join(dir, `outbox.corrupt-${i}.json`), "x", "utf8");
+    }
+    const r = pruneCorruptQuarantines(dir, 2);
+    assert.equal(r.kept, 2);
+    assert.equal(r.deleted.length, 3);
+    assert.equal(fs.readdirSync(dir).filter((n) => n.startsWith("outbox.corrupt-")).length, 2);
   });
 });
 

@@ -17,6 +17,7 @@ const {
   parsePrintMessage,
   ERROR_CODES,
   PLATFORM,
+  syncConflictBackoffMs,
   rabbitConfigToPersistPatch,
   resolveQueueDeclareOptions,
   resolveQueueName,
@@ -398,23 +399,72 @@ function createStationPrintingController(deps = {}) {
     return { ...reg, resumed: false };
   }
 
+  const sleep =
+    typeof deps.sleep === "function"
+      ? deps.sleep
+      : (ms) => new Promise((r) => setTimeout(r, ms));
+  const SYNC_CONFLICT_MAX_ATTEMPTS = 3;
+
+  /**
+   * Upsert printers. On 409 SYNC_CONFLICT (v1.4), retry ~3 times with short
+   * jittered backoff, then fall through so the next poll/heartbeat can retry.
+   * Distinguished from PRINT_HOST_ALREADY_CONFIGURED by error.code.
+   */
   async function syncPrintersToServer({ branchId } = {}) {
     const cfg = readConfig();
     if (!api.getToken()) return { ok: false, skipped: true };
-    const result = await api.syncPrinters({
-      appId,
-      branchId: branchId || cfg.branch_id,
-      printers: printers.toSyncPayload(),
-    });
-    if (handleAuthFailure(result, "sync_unauthorized")) {
-      return { ok: false, authError: true, needsPairing: true, error: lastRegisterError };
+    let last = null;
+    for (let attempt = 1; attempt <= SYNC_CONFLICT_MAX_ATTEMPTS; attempt++) {
+      const result = await api.syncPrinters({
+        appId,
+        branchId: branchId || cfg.branch_id,
+        printers: printers.toSyncPayload(),
+      });
+      last = result;
+      if (handleAuthFailure(result, "sync_unauthorized")) {
+        return {
+          ok: false,
+          authError: true,
+          needsPairing: true,
+          error: lastRegisterError,
+        };
+      }
+      if (result.ok) {
+        if (Array.isArray(result.printers) && result.printers.length) {
+          printers.applyServerSync(result.printers);
+          persistHostFlags();
+          onStateChange(publicHostState());
+        }
+        return result;
+      }
+      const isSyncConflict =
+        result.syncConflict === true ||
+        result.code === ERROR_CODES.SYNC_CONFLICT;
+      if (!isSyncConflict) return result;
+      if (attempt >= SYNC_CONFLICT_MAX_ATTEMPTS) {
+        try {
+          log(
+            `Printers sync SYNC_CONFLICT after ${attempt} attempts — will retry on next poll/heartbeat.`,
+            "⚠️"
+          );
+        } catch (_) {}
+        return {
+          ...result,
+          syncConflict: true,
+          retriesExhausted: true,
+          attempts: attempt,
+        };
+      }
+      const delay = syncConflictBackoffMs(attempt);
+      try {
+        log(
+          `Printers sync SYNC_CONFLICT (attempt ${attempt}/${SYNC_CONFLICT_MAX_ATTEMPTS}) — retry in ${delay}ms.`,
+          "⚠️"
+        );
+      } catch (_) {}
+      await sleep(delay);
     }
-    if (result.ok && Array.isArray(result.printers) && result.printers.length) {
-      printers.applyServerSync(result.printers);
-      persistHostFlags();
-      onStateChange(publicHostState());
-    }
-    return result;
+    return last || { ok: false, syncConflict: true, retriesExhausted: true };
   }
 
   function syncWindowsPrinters(windowsList) {

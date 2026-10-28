@@ -13,6 +13,7 @@ const PLATFORM = "desktop";
 
 const ERROR_CODES = Object.freeze({
   PRINT_HOST_ALREADY_CONFIGURED: "PRINT_HOST_ALREADY_CONFIGURED",
+  SYNC_CONFLICT: "SYNC_CONFLICT",
   PAIRING_CODE_INVALID: "PAIRING_CODE_INVALID",
   PAIRING_CODE_EXPIRED: "PAIRING_CODE_EXPIRED",
   PAIRING_CODE_REQUIRED: "PAIRING_CODE_REQUIRED",
@@ -167,14 +168,18 @@ function parseRegisterResponse(data) {
 
 /**
  * Parse 409 PRINT_HOST_ALREADY_CONFIGURED (contract §2.1).
+ * Distinguishes from printers/sync 409 SYNC_CONFLICT by error.code (v1.4).
  */
 function parseHostConflictError(payload, httpStatus) {
   const root = payload && typeof payload === "object" ? payload : {};
   const err = root.error && typeof root.error === "object" ? root.error : root;
   const code = err.code != null ? String(err.code) : "";
-  const isConflict =
-    httpStatus === 409 || code === ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED;
-  if (!isConflict) return null;
+  // printers/sync M5 — not a host-assignment conflict
+  if (code === ERROR_CODES.SYNC_CONFLICT) return null;
+  const isHostConflict =
+    code === ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED ||
+    (httpStatus === 409 && !code);
+  if (!isHostConflict) return null;
 
   const current = err.current_host || err.currentHost || null;
   return {
@@ -692,6 +697,36 @@ function resolveApiUrl(apiBase, path) {
   return `${base}${prefix}${p.startsWith("/") ? p : "/" + p}`;
 }
 
+
+/**
+ * Parse printers/sync 409 SYNC_CONFLICT (contract v1.4 §2.4 M5).
+ * Distinguished from PRINT_HOST_ALREADY_CONFIGURED by error.code.
+ */
+function parseSyncConflictError(payload, _httpStatus) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const err = root.error && typeof root.error === "object" ? root.error : root;
+  const code = err.code != null ? String(err.code) : "";
+  if (code !== ERROR_CODES.SYNC_CONFLICT) return null;
+  return {
+    code: ERROR_CODES.SYNC_CONFLICT,
+    message:
+      (err.message != null && String(err.message).trim()) ||
+      "Printer sync conflict — retry shortly.",
+  };
+}
+
+/**
+ * Short jittered backoff between SYNC_CONFLICT retries (ms).
+ * attempt 1 → ~200–400ms, attempt 2 → ~500–1000ms.
+ */
+function syncConflictBackoffMs(attempt, randomFn = Math.random) {
+  const a = Math.max(1, Number(attempt) || 1);
+  const base = a <= 1 ? 200 : a === 2 ? 500 : 1000;
+  const rnd = typeof randomFn === "function" ? randomFn() : Math.random();
+  const jitter = Math.floor(Number(rnd) * base);
+  return base + jitter;
+}
+
 module.exports = {
   PLATFORM,
   ERROR_CODES,
@@ -701,6 +736,8 @@ module.exports = {
   buildRegisterRequest,
   parseRegisterResponse,
   parseHostConflictError,
+  parseSyncConflictError,
+  syncConflictBackoffMs,
   buildHeartbeatRequest,
   parseHeartbeatResponse,
   buildAckRequest,

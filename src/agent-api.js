@@ -11,6 +11,7 @@ const {
   buildRegisterRequest,
   parseRegisterResponse,
   parseHostConflictError,
+  parseSyncConflictError,
   buildHeartbeatRequest,
   parseHeartbeatResponse,
   buildAckRequest,
@@ -162,6 +163,32 @@ function createAgentApi(options = {}) {
         error: parseAgentError(data, status),
         code: parseAgentError(data, status).code,
         message: parseAgentError(data, status).message,
+        ...parsePrintersSyncResponse({}),
+      };
+    }
+    // v1.4 M5: 409 SYNC_CONFLICT — retryable; not PRINT_HOST_ALREADY_CONFIGURED
+    if (status === 409) {
+      const syncConflict = parseSyncConflictError(data, status);
+      if (syncConflict) {
+        return {
+          ok: false,
+          status,
+          syncConflict: true,
+          code: ERROR_CODES.SYNC_CONFLICT,
+          error: syncConflict,
+          message: syncConflict.message,
+          data,
+          ...parsePrintersSyncResponse({}),
+        };
+      }
+      const error = parseAgentError(data, status);
+      return {
+        ok: false,
+        status,
+        error,
+        code: error.code,
+        message: error.message,
+        data,
         ...parsePrintersSyncResponse({}),
       };
     }

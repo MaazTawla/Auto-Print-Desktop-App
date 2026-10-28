@@ -13,7 +13,9 @@ const fs = require("fs");
 const path = require("path");
 
 const DEFAULT_MAX = 2000;
+const DEFAULT_CORRUPT_KEEP = 10;
 const BACKOFF_MS = [1000, 5000, 15000, 30000, 60000, 120000];
+const CORRUPT_NAME_RE = /^outbox\.corrupt-(\d+)\.json$/;
 
 function isTerminalAckStatus(status) {
   if (status == null || !Number.isFinite(Number(status))) return false;
@@ -33,6 +35,35 @@ function isSuccessAckStatus(status) {
 function nextBackoffMs(attempts) {
   const i = Math.min(Math.max(0, attempts - 1), BACKOFF_MS.length - 1);
   return BACKOFF_MS[i];
+}
+
+
+/**
+ * Keep the newest `keep` outbox.corrupt-* files in dir; delete older ones (QA r4 L).
+ */
+function pruneCorruptQuarantines(dir, keep = DEFAULT_CORRUPT_KEEP) {
+  if (!dir) return { kept: 0, deleted: [] };
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((n) => CORRUPT_NAME_RE.test(n));
+  } catch {
+    return { kept: 0, deleted: [] };
+  }
+  names.sort((a, b) => {
+    const ta = Number((a.match(CORRUPT_NAME_RE) || [])[1]) || 0;
+    const tb = Number((b.match(CORRUPT_NAME_RE) || [])[1]) || 0;
+    return tb - ta; // newest first
+  });
+  const limit = Math.max(0, Number(keep) || DEFAULT_CORRUPT_KEEP);
+  const deleted = [];
+  for (const name of names.slice(limit)) {
+    const full = path.join(dir, name);
+    try {
+      fs.unlinkSync(full);
+      deleted.push(full);
+    } catch (_) {}
+  }
+  return { kept: Math.min(names.length, limit), deleted };
 }
 
 function createAckOutbox(opts = {}) {
@@ -67,11 +98,15 @@ function createAckOutbox(opts = {}) {
         };
       }
     }
-    return {
+    const info = {
       quarantinedPath,
       at: new Date().toISOString(),
       error: err && err.message ? String(err.message) : String(err),
     };
+    try {
+      pruneCorruptQuarantines(path.dirname(filePath), opts.corruptKeep != null ? opts.corruptKeep : DEFAULT_CORRUPT_KEEP);
+    } catch (_) {}
+    return info;
   }
 
   function load() {
@@ -229,9 +264,11 @@ function createAckOutbox(opts = {}) {
 
 module.exports = {
   createAckOutbox,
+  pruneCorruptQuarantines,
   isTerminalAckStatus,
   isSuccessAckStatus,
   nextBackoffMs,
   BACKOFF_MS,
   DEFAULT_MAX,
+  DEFAULT_CORRUPT_KEEP,
 };
