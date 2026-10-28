@@ -119,7 +119,14 @@ function createAgentApi(options = {}) {
 
   async function heartbeat(fields) {
     const body = buildHeartbeatRequest(fields);
-    const { status, data } = await call("POST", ENDPOINTS.heartbeat, body);
+    const callOpts = {};
+    if (fields && fields.timeout != null) callOpts.timeout = fields.timeout;
+    const { status, data } = await call(
+      "POST",
+      ENDPOINTS.heartbeat,
+      body,
+      callOpts
+    );
     if (status === 401 || status === 403) {
       return {
         ok: false,
@@ -171,7 +178,14 @@ function createAgentApi(options = {}) {
 
   async function syncPrinters(fields) {
     const body = buildPrintersSyncRequest(fields);
-    const { status, data } = await call("POST", ENDPOINTS.printersSync, body);
+    const callOpts = {};
+    if (fields && fields.timeout != null) callOpts.timeout = fields.timeout;
+    const { status, data } = await call(
+      "POST",
+      ENDPOINTS.printersSync,
+      body,
+      callOpts
+    );
     if (status === 401 || status === 403) {
       return {
         ok: false,

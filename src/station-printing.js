@@ -297,11 +297,14 @@ function createStationPrintingController(deps = {}) {
     typeof deps.sleep === "function"
       ? deps.sleep
       : (ms) => new Promise((r) => setTimeout(r, ms));
+  const nowFn = typeof deps.now === "function" ? deps.now : () => Date.now();
   const SYNC_CONFLICT_MAX_ATTEMPTS = 3;
+  /** Cap gated printer-upsert retries+backoff well under 60s (and under 90s offline TTL). */
+  const PRINTER_SYNC_BUDGET_MS = 45000;
 
   /**
-   * Single-flight gate so printers/sync and heartbeat printer upsert never overlap
-   * (Rabbit connect starts HB before awaiting sync). Callers serialize on this chain.
+   * Single-flight gate so printers/sync and heartbeat *printer upsert* never overlap
+   * (Rabbit connect starts HB before awaiting sync). Liveness pings stay outside this gate.
    */
   let printerSyncGate = Promise.resolve();
   let printerSyncInFlight = 0;
@@ -345,12 +348,34 @@ function createStationPrintingController(deps = {}) {
 
   /**
    * Shared SYNC_CONFLICT retry (contract v1.4 / Android SyncConflictPolicy):
-   * ~3 jittered attempts, then defer to next poll/heartbeat.
+   * ~3 jittered attempts, then defer. Total time (attempts + backoff) capped by budgetMs.
+   * attemptFn(attempt, { timeoutMs, remainingMs })
    */
-  async function withSyncConflictRetries(label, attemptFn) {
+  async function withSyncConflictRetries(label, attemptFn, opts = {}) {
+    const budgetMs =
+      opts.budgetMs != null ? Number(opts.budgetMs) : PRINTER_SYNC_BUDGET_MS;
+    const t0 = nowFn();
     let last = null;
     for (let attempt = 1; attempt <= SYNC_CONFLICT_MAX_ATTEMPTS; attempt++) {
-      const result = await attemptFn(attempt);
+      const elapsed = Math.max(0, nowFn() - t0);
+      const remaining = Math.max(0, budgetMs - elapsed);
+      if (remaining < 50) {
+        try {
+          log(
+            `${label} SYNC_CONFLICT budget exhausted after ${attempt - 1} attempt(s) — defer.`,
+            "⚠️"
+          );
+        } catch (_) {}
+        return {
+          ...(last || { ok: false, syncConflict: true }),
+          syncConflict: true,
+          retriesExhausted: true,
+          budgetExceeded: true,
+          attempts: Math.max(0, attempt - 1),
+        };
+      }
+      const timeoutMs = Math.min(20000, remaining);
+      const result = await attemptFn(attempt, { timeoutMs, remainingMs: remaining });
       last = result;
       if (!result || result.ok || !isSyncConflictResult(result)) {
         return result;
@@ -370,6 +395,21 @@ function createStationPrintingController(deps = {}) {
         };
       }
       const delay = syncConflictBackoffMs(attempt);
+      if (nowFn() - t0 + delay >= budgetMs) {
+        try {
+          log(
+            `${label} SYNC_CONFLICT — backoff would exceed budget; defer.`,
+            "⚠️"
+          );
+        } catch (_) {}
+        return {
+          ...result,
+          syncConflict: true,
+          retriesExhausted: true,
+          budgetExceeded: true,
+          attempts: attempt,
+        };
+      }
       try {
         log(
           `${label} SYNC_CONFLICT (attempt ${attempt}/${SYNC_CONFLICT_MAX_ATTEMPTS}) — retry in ${delay}ms.`,
@@ -381,28 +421,31 @@ function createStationPrintingController(deps = {}) {
     return last || { ok: false, syncConflict: true, retriesExhausted: true };
   }
 
+  /**
+   * Heartbeat split (r6 M1):
+   * 1) Ungated liveness ping with printers: [] (contract: empty OK if unchanged) —
+   *    never waits on the sync gate or sync retries, so 30s ticks beat the 90s offline TTL.
+   * 2) Gated full printer upsert (preferred snapshot) with SYNC_CONFLICT retries,
+   *    serialized with printers/sync and bounded by PRINTER_SYNC_BUDGET_MS.
+   */
   async function heartbeat({ branchId } = {}) {
     const cfg = readConfig();
     if (!api.getToken() || !(cfg.agent_api_base || "").trim()) {
       return { ok: false, skipped: true, shouldConsume: consumeEnabled };
     }
     api.setApiBase(cfg.agent_api_base || "");
+    const bid = branchId || cfg.branch_id;
 
-    // Single-flight with printers/sync; retry SYNC_CONFLICT like dedicated sync.
-    const result = await withPrinterSyncSingleFlight(() =>
-      withSyncConflictRetries("Heartbeat", async () => {
-        const r = await api.heartbeat({
-          appId,
-          branchId: branchId || cfg.branch_id,
-          printers: printers.toSyncPayload(),
-        });
-        return r;
-      })
-    );
+    // 1) Ungated liveness — outside the printer-sync gate.
+    const live = await api.heartbeat({
+      appId,
+      branchId: bid,
+      printers: [],
+    });
     lastHeartbeatAt = new Date().toISOString();
 
-    if (!result || !result.ok) {
-      if (result && handleAuthFailure(result, "heartbeat_unauthorized")) {
+    if (!live || !live.ok) {
+      if (live && handleAuthFailure(live, "heartbeat_unauthorized")) {
         return {
           ok: false,
           authError: true,
@@ -414,34 +457,66 @@ function createStationPrintingController(deps = {}) {
       onStateChange(publicHostState());
       return {
         ok: false,
-        error: (result && result.error) || { code: "HEARTBEAT_FAILED", message: "Heartbeat failed" },
-        syncConflict: Boolean(result && result.syncConflict),
-        retriesExhausted: Boolean(result && result.retriesExhausted),
+        error:
+          (live && live.error) || {
+            code: "HEARTBEAT_FAILED",
+            message: "Heartbeat failed",
+          },
+        syncConflict: Boolean(live && live.syncConflict),
+        retriesExhausted: Boolean(live && live.retriesExhausted),
         shouldConsume: consumeEnabled,
       };
     }
 
     const applied = policy.applyServerState({
-      is_print_host: result.is_print_host,
-      host_epoch: result.host_epoch,
+      is_print_host: live.is_print_host,
+      host_epoch: live.host_epoch,
     });
     consumeEnabled = applied.shouldConsume;
     if (applied.promoted) flushPending = true;
     if (applied.revoked) {
       log(
-        `Print host revoked (epoch ${result.host_epoch}) — stopping consumer.`,
+        `Print host revoked (epoch ${live.host_epoch}) — stopping consumer.`,
         "⚠️"
       );
     }
     persistHostFlags();
     onStateChange(publicHostState());
+
+    // 2) Gated printer upsert — may wait behind sync; liveness already refreshed.
+    let printerUpsert = null;
+    const payload = printers.toSyncPayload();
+    if (payload.length > 0) {
+      printerUpsert = await withPrinterSyncSingleFlight(() =>
+        withSyncConflictRetries(
+          "Heartbeat printers",
+          async (_attempt, { timeoutMs }) => {
+            const r = await api.heartbeat({
+              appId,
+              branchId: bid,
+              printers: payload,
+              timeout: timeoutMs,
+            });
+            if (r && r.authError) {
+              handleAuthFailure(r, "heartbeat_unauthorized");
+            }
+            return r;
+          },
+          { budgetMs: PRINTER_SYNC_BUDGET_MS }
+        )
+      );
+    }
+
     return {
       ok: true,
       shouldConsume: consumeEnabled,
       revoked: applied.revoked,
       promoted: applied.promoted,
-      pending_job_count: result.pending_job_count,
+      pending_job_count: live.pending_job_count,
       flushPending,
+      printerUpsert,
+      syncConflict: Boolean(printerUpsert && printerUpsert.syncConflict),
+      retriesExhausted: Boolean(printerUpsert && printerUpsert.retriesExhausted),
     };
   }
 
@@ -509,11 +584,12 @@ function createStationPrintingController(deps = {}) {
     const cfg = readConfig();
     if (!api.getToken()) return { ok: false, skipped: true };
     return withPrinterSyncSingleFlight(() =>
-      withSyncConflictRetries("Printers sync", async () => {
+      withSyncConflictRetries("Printers sync", async (_attempt, { timeoutMs }) => {
         const result = await api.syncPrinters({
           appId,
           branchId: branchId || cfg.branch_id,
           printers: printers.toSyncPayload(),
+          timeout: timeoutMs,
         });
         if (handleAuthFailure(result, "sync_unauthorized")) {
           return {
