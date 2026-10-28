@@ -161,6 +161,10 @@ function parseRegisterResponse(data) {
     station_printing_enabled: src.station_printing_enabled,
     rabbit: rabbitRaw,
     rabbitConfig: normalizeRabbitConfig(rabbitRaw, branchId),
+    rabbit_version:
+      src.rabbit_version != null && String(src.rabbit_version).trim() !== ""
+        ? String(src.rabbit_version).trim()
+        : null,
     pdf_host: pdfHost,
     raw: data,
   };
@@ -240,7 +244,7 @@ function mapPrinterForApi(p) {
   return row;
 }
 
-function buildHeartbeatRequest({ appId, branchId, printers = [] }) {
+function buildHeartbeatRequest({ appId, branchId, printers = [], rabbitVersion } = {}) {
   const body = {
     printers: (printers || []).map(mapPrinterForApi),
   };
@@ -250,6 +254,10 @@ function buildHeartbeatRequest({ appId, branchId, printers = [] }) {
   }
   if (branchId != null && String(branchId).trim() !== "") {
     body.branch_id = String(branchId).trim();
+  }
+  // v1.7: opaque 16-hex; omit when unknown (older BE tolerant)
+  if (rabbitVersion != null && String(rabbitVersion).trim() !== "") {
+    body.rabbit_version = String(rabbitVersion).trim();
   }
   return body;
 }
@@ -268,12 +276,23 @@ function parseHeartbeatResponse(data) {
       ? data.data
       : data;
   const epoch = Number(src.host_epoch ?? src.hostEpoch ?? 1);
+  const rabbitRaw =
+    src.rabbit && typeof src.rabbit === "object" ? src.rabbit : null;
+  const rabbitVersion =
+    src.rabbit_version != null && String(src.rabbit_version).trim() !== ""
+      ? String(src.rabbit_version).trim()
+      : null;
   return {
     is_print_host: Boolean(src.is_print_host ?? src.isPrintHost),
     host_epoch: Number.isFinite(epoch) ? epoch : 1,
     pending_job_count: Number(src.pending_job_count ?? src.pendingJobCount ?? 0) || 0,
     station_printing_enabled: src.station_printing_enabled,
     server_time: src.server_time || null,
+    rabbit_version: rabbitVersion,
+    rabbit: rabbitRaw,
+    rabbitConfig: rabbitRaw
+      ? normalizeRabbitConfig(rabbitRaw, src.branch_id ?? null)
+      : null,
     raw: data,
   };
 }
@@ -466,10 +485,75 @@ function parsePrintMessage(raw) {
   };
 }
 
+
+/** True for 127.0.0.0/8, ::1, localhost, 0.0.0.0 / :: (unspecified). */
+function isLoopbackOrUnspecifiedHost(host) {
+  const raw = String(host || "").trim().toLowerCase();
+  if (!raw) return false;
+  const bare = raw.replace(/^\[/, "").replace(/\]$/, "");
+  if (
+    bare === "localhost" ||
+    bare === "::1" ||
+    bare === "0.0.0.0" ||
+    bare === "::" ||
+    bare === "0:0:0:0:0:0:0:0" ||
+    bare === "0:0:0:0:0:0:0:1"
+  ) {
+    return true;
+  }
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(bare);
+  if (m) {
+    return m.slice(1).every((p) => {
+      const n = Number(p);
+      return Number.isFinite(n) && n >= 0 && n <= 255;
+    });
+  }
+  return false;
+}
+
+function hostFromServerUrl(apiBaseUrl) {
+  const raw = String(apiBaseUrl || "").trim();
+  if (!raw) return null;
+  try {
+    const withScheme = /:\/\//.test(raw) ? raw : `http://${raw}`;
+    const u = new URL(withScheme);
+    const h = (u.hostname || "").trim();
+    return h || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * If server rabbit host is loopback/unspecified and Server URL host is not,
+ * use the Server URL host. Skip when manualOverride. When both loopback (same
+ * machine), keep loopback.
+ * @returns {{ host: string, rewriteNote: string|null }}
+ */
+function resolveBrokerHost(serverHost, apiBaseUrl, manualOverride) {
+  const host = String(serverHost || "").trim();
+  if (!host) return { host: "", rewriteNote: null };
+  if (manualOverride || !isLoopbackOrUnspecifiedHost(host)) {
+    return { host, rewriteNote: null };
+  }
+  const apiHost = hostFromServerUrl(apiBaseUrl);
+  if (!apiHost || isLoopbackOrUnspecifiedHost(apiHost)) {
+    return { host, rewriteNote: null };
+  }
+  return {
+    host: apiHost,
+    rewriteNote: `Rabbit host from server was ${host} (loopback/unspecified); using Server URL host ${apiHost} instead.`,
+  };
+}
+
+function defaultPortForTls(tls) {
+  return tls ? 5671 : 5672;
+}
+
 /**
  * Normalize register.rabbit (+ defaults). Queue falls back to printer.Branch.{branchId}.
  */
-function normalizeRabbitConfig(rabbit, branchId) {
+function normalizeRabbitConfig(rabbit, branchId, opts = {}) {
   const r = rabbit && typeof rabbit === "object" ? rabbit : {};
   const branch = branchId != null ? String(branchId).trim() : "";
   const defaultQueue = branch
@@ -491,10 +575,25 @@ function normalizeRabbitConfig(rabbit, branchId) {
   }
   const durable =
     r.queue_durable != null ? Boolean(r.queue_durable) : ASSUMPTIONS.defaultQueueDurable;
+  const tls = r.tls === true;
   const portRaw = r.port != null ? Number(r.port) : null;
+  let port =
+    Number.isFinite(portRaw) && portRaw > 0 ? Math.floor(portRaw) : null;
+  if (port == null && r.tls != null) {
+    port = defaultPortForTls(tls);
+  }
+  const manualOverride = Boolean(opts.manualOverride);
+  const resolved = resolveBrokerHost(
+    r.host != null ? String(r.host).trim() : "",
+    opts.apiBaseUrl,
+    manualOverride
+  );
   return {
-    host: r.host != null ? String(r.host).trim() : "",
-    port: Number.isFinite(portRaw) && portRaw > 0 ? Math.floor(portRaw) : null,
+    host: resolved.host,
+    hostRewriteNote: resolved.rewriteNote,
+    port,
+    tls: r.tls != null ? Boolean(r.tls) : false,
+    protocol: tls ? "amqps" : "amqp",
     vhost: r.vhost != null ? String(r.vhost) : "/",
     username: r.username != null ? String(r.username).trim() : "",
     password: r.password != null ? String(r.password) : "",
@@ -516,7 +615,7 @@ function normalizeRabbitConfig(rabbit, branchId) {
         ? Number(r.prefetch)
         : ASSUMPTIONS.prefetch,
     hasBrokerCreds: Boolean(
-      (r.host && String(r.host).trim()) ||
+      resolved.host ||
         (r.username && String(r.username).trim()) ||
         (r.password != null && String(r.password) !== "")
     ),
@@ -557,6 +656,7 @@ function rabbitConfigToPersistPatch(rabbitConfig, opts = {}) {
   }
   if (rabbitConfig.host) patch.rabbit_host = rabbitConfig.host;
   if (rabbitConfig.port != null) patch.rabbit_port = rabbitConfig.port;
+  if (rabbitConfig.tls != null) patch.rabbit_tls = Boolean(rabbitConfig.tls);
   if (rabbitConfig.username) patch.rabbit_username = rabbitConfig.username;
   if (rabbitConfig.password !== "" && rabbitConfig.password != null) {
     patch.rabbit_password = rabbitConfig.password;
@@ -580,6 +680,7 @@ function rabbitConnectionFingerprint(cfg = {}) {
     cfg.rabbit_queue_durable != null ? String(cfg.rabbit_queue_durable) : "",
     JSON.stringify(cfg.rabbit_queue_arguments || {}),
     cfg.rabbit_prefetch != null ? String(cfg.rabbit_prefetch) : "",
+    cfg.rabbit_tls != null ? String(Boolean(cfg.rabbit_tls)) : "false",
     cfg.branch_id != null ? String(cfg.branch_id) : "",
   ].join("|");
 }
@@ -709,10 +810,23 @@ function verifyPdfChecksum(buffer, expectedSha256) {
   return { ok: true, digest };
 }
 
-function resolveApiUrl(apiBase, path) {
-  const base = String(apiBase || "")
+function normalizeAgentApiBase(apiBase) {
+  let base = String(apiBase || "")
     .trim()
     .replace(/\/+$/, "");
+  if (!base) return "";
+  // Users often paste the full print-agent prefix; strip so we do not double it.
+  const suffix = String(ASSUMPTIONS.apiBasePath || "/api/v1/print-agent").replace(/\/+$/, "");
+  const lower = base.toLowerCase();
+  const sufLower = suffix.toLowerCase();
+  if (lower.endsWith(sufLower)) {
+    base = base.slice(0, base.length - suffix.length).replace(/\/+$/, "");
+  }
+  return base;
+}
+
+function resolveApiUrl(apiBase, path) {
+  const base = normalizeAgentApiBase(apiBase);
   const p = String(path || "");
   if (!base) return p;
   if (/^https?:\/\//i.test(p)) return p;
@@ -791,5 +905,10 @@ module.exports = {
   verifyPdfChecksum,
   classifyPdfUrlHttpStatus,
   resolveApiUrl,
+  normalizeAgentApiBase,
+  isLoopbackOrUnspecifiedHost,
+  hostFromServerUrl,
+  resolveBrokerHost,
+  defaultPortForTls,
   mapPrinterForApi,
 };

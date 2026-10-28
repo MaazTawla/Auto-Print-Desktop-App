@@ -1330,10 +1330,12 @@ function buildRabbitOptions() {
   const cfg = readUserConfig();
   const layer = getMergedRabbitDefaultLayer();
   const host = getRabbitEffectiveHost();
+  const tls = cfg.rabbit_tls === true;
+  const protocol = tls ? "amqps" : layer.protocol || "amqp";
   if (!host) {
     return {
       configured: false,
-      protocol: layer.protocol,
+      protocol,
       host: "",
       port: "",
       username: "",
@@ -1341,12 +1343,15 @@ function buildRabbitOptions() {
       exchange: "",
       routingKey: "",
       url: "",
+      tls,
     };
   }
-  let port = layer.port;
+  let port = tls ? 5671 : layer.port;
   if (cfg.rabbit_port != null && String(cfg.rabbit_port).trim() !== "") {
     const n = Number(cfg.rabbit_port);
     if (Number.isFinite(n) && n > 0 && n < 65536) port = Math.floor(n);
+  } else if (cfg.rabbit_tls != null) {
+    port = tls ? 5671 : 5672;
   }
   const username =
     cfg.rabbit_username != null && String(cfg.rabbit_username).trim() !== ""
@@ -1374,7 +1379,7 @@ function buildRabbitOptions() {
   const vhostPath =
     vhost === "/" ? "/" : "/" + encodeURIComponent(vhost).replace(/%2F/gi, "%2F");
   const url =
-    `${layer.protocol}://${encodedUser}:${encodedPass}@${host}:${port}${vhostPath}` +
+    `${protocol}://${encodedUser}:${encodedPass}@${host}:${port}${vhostPath}` +
     `?heartbeat=${RABBITMQ_HEARTBEAT_SECONDS}`;
   const exchangeType =
     cfg.rabbit_exchange_type != null && String(cfg.rabbit_exchange_type).trim() !== ""
@@ -1382,7 +1387,8 @@ function buildRabbitOptions() {
       : "topic";
   return {
     configured: true,
-    protocol: layer.protocol,
+    protocol,
+    tls,
     host,
     port,
     username,
@@ -1907,16 +1913,18 @@ ipcMain.handle("set-rabbit-settings", async (_e, opts) => {
 });
 
 ipcMain.handle("set-rabbit-manual-override", async (_e, enabled) => {
-  const on = Boolean(enabled);
-  saveUserConfig({ rabbit_manual_override: on });
-  log(
-    on
-      ? "Advanced: manual RabbitMQ override ON — server register will not overwrite broker fields."
-      : "Advanced: manual RabbitMQ override OFF — broker settings will follow the server.",
-    "⚙️"
-  );
+  const sp = getStationPrinting();
+  const result = sp.setRabbitManualOverride(Boolean(enabled));
+  if (result && result.rabbitChanged) {
+    resetRabbitReconnectBackoff();
+    await startRabbit();
+  }
   pushState();
-  return { ok: true, rabbitManualOverride: on };
+  return {
+    ok: true,
+    rabbitManualOverride: Boolean(result && result.rabbitManualOverride),
+    rabbitChanged: Boolean(result && result.rabbitChanged),
+  };
 });
 
 ipcMain.handle("set-agent-api-settings", async (_e, opts) => {
@@ -1962,6 +1970,11 @@ ipcMain.handle("retry-print-host-register", async () => {
     await startRabbit();
     pushState();
     const st = sp.publicHostState();
+    const cfgAfter = readUserConfig();
+    const hasToken = Boolean(
+      (sp.api && sp.api.getToken && sp.api.getToken()) ||
+        (cfgAfter.agent_token && String(cfgAfter.agent_token).trim())
+    );
     if (st.lastRegisterError) {
       return {
         ok: false,
@@ -1976,6 +1989,27 @@ ipcMain.handle("retry-print-host-register", async () => {
         ok: false,
         error: st.hostConflict.message,
         code: st.hostConflict.code,
+        stationPrinting: st,
+      };
+    }
+    // H1: never toast success unless register actually produced a token + host.
+    if (!hasToken) {
+      return {
+        ok: false,
+        error:
+          "Register did not complete — check Server URL, pairing code, and network. Branch ID comes from the server after Connect.",
+        code: "REGISTER_INCOMPLETE",
+        stationPrinting: st,
+      };
+    }
+    if (!st.isPrintHost) {
+      return {
+        ok: false,
+        error:
+          st.hostConflict && st.hostConflict.message
+            ? st.hostConflict.message
+            : "Registered, but this device is not the print host.",
+        code: "NOT_PRINT_HOST",
         stationPrinting: st,
       };
     }
@@ -2637,6 +2671,10 @@ async function runAgentHeartbeat() {
     );
     sp.markFlushDone();
   }
+  if (result.ok && result.rabbitChanged && result.shouldConsume) {
+    resetRabbitReconnectBackoff();
+    await startRabbit();
+  }
 }
 
 async function stopRabbit() {
@@ -2671,7 +2709,25 @@ async function startRabbit() {
       cfgEarly.agent_api_base && String(cfgEarly.agent_api_base).trim()
     );
 
-    if (!String(state.branchId || "").trim()) {
+    // H1: Connect may run with pairing + Server URL before any local Branch ID.
+    // Register supplies branch_id; only require a local branch when we cannot register/resume.
+    const hasPairingEarly = Boolean(
+      cfgEarly.pairing_code && String(cfgEarly.pairing_code).trim()
+    );
+    let hasTokenEarly = false;
+    try {
+      const spEarly = getStationPrinting();
+      hasTokenEarly = Boolean(
+        (spEarly.api && spEarly.api.getToken && spEarly.api.getToken()) ||
+          (cfgEarly.agent_token && String(cfgEarly.agent_token).trim())
+      );
+    } catch (_) {
+      hasTokenEarly = Boolean(cfgEarly.agent_token && String(cfgEarly.agent_token).trim());
+    }
+    const canSessionWithoutBranch =
+      apiConfiguredEarly && (hasPairingEarly || hasTokenEarly);
+
+    if (!String(state.branchId || "").trim() && !canSessionWithoutBranch) {
       state.rabbitmq = "idle";
       state.channel = "";
       pushState();
@@ -2681,6 +2737,13 @@ async function startRabbit() {
 
     // When Agent API is configured, register first (may supply rabbit.*). Otherwise require local broker settings.
     if (!apiConfiguredEarly) {
+      if (!String(state.branchId || "").trim()) {
+        state.rabbitmq = "idle";
+        state.channel = "";
+        pushState();
+        log("Branch ID not set — set Branch in Settings before consuming orders.", "ℹ️");
+        return;
+      }
       if (!rabbitOpts.configured) {
         state.rabbitmq = "idle";
         state.channel = resolveRoutingKey(getRoutingKeyTemplate(), state.branchId);
@@ -2780,6 +2843,25 @@ async function startRabbit() {
           pushState();
           return;
         }
+      }
+
+      // Sync Branch ID from register/heartbeat (server is source of truth on fresh Connect).
+      {
+        const cfgBranch = readUserConfig();
+        const serverBranch =
+          cfgBranch.branch_id != null ? String(cfgBranch.branch_id).trim() : "";
+        if (serverBranch && serverBranch !== String(state.branchId || "").trim()) {
+          await applyBranchId(serverBranch);
+        }
+      }
+      if (!String(state.branchId || "").trim()) {
+        state.rabbitmq = "idle";
+        pushState();
+        log(
+          "No Branch ID after register — server did not return branch_id; cannot consume yet.",
+          "⚠️"
+        );
+        return;
       }
 
       // Rebuild broker options after register may have applied rabbit.* creds
@@ -2911,7 +2993,16 @@ async function startRabbit() {
       pushState();
     } catch (err) {
       state.rabbitmq = "error";
-      log("RabbitMQ start failed: " + err.message, "❌");
+      {
+        const msg = err && err.message ? String(err.message) : String(err);
+        const refused =
+          /ECONNREFUSED/i.test(msg) ||
+          (err && (err.code === "ECONNREFUSED" || err.errno === "ECONNREFUSED"));
+        const guestHint = refused
+          ? " If the broker user is guest, RabbitMQ only allows that from localhost."
+          : "";
+        log("RabbitMQ start failed: " + msg + guestHint, "❌");
+      }
       pushState();
       scheduleRabbitReconnect();
     } finally {

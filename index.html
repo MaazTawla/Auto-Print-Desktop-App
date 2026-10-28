@@ -4245,6 +4245,7 @@
     if (pairingInput) pairingInput.classList.remove('field-invalid');
     if (btn) btn.disabled = true;
     if (saveLabel) { saveLabel.dataset.busy = '1'; saveLabel.textContent = 'Connecting…'; }
+    let connectSucceeded = false;
     try {
       const payload = { apiBase, deviceLabel, pairingCode: pairingCode.trim() };
       const saveRes = await window.api.setAgentApiSettings(payload);
@@ -4254,7 +4255,7 @@
         showToast(msg, 'error', 3400);
         return;
       }
-      document.getElementById('settings-pairing-code').value = '';
+      // L2: keep pairing code in the input until register succeeds.
       const reg = await window.api.retryPrintHostRegister();
       if (!reg || !reg.ok) {
         const msg =
@@ -4266,13 +4267,17 @@
         showToast(msg, 'error', 3400);
         return;
       }
+      connectSucceeded = true;
+      const pairingInputEl = document.getElementById('settings-pairing-code');
+      if (pairingInputEl) pairingInputEl.value = '';
       if (errEl) errEl.textContent = '';
       showToast('Connected as print host.');
     } finally {
       if (btn) btn.disabled = false;
       if (saveLabel) {
         delete saveLabel.dataset.busy;
-        saveLabel.textContent = 'Reconnect';
+        // L1: Reconnect only after a successful Connect; otherwise stay Connect.
+        saveLabel.textContent = connectSucceeded ? 'Reconnect' : 'Connect';
       }
     }
   });

@@ -128,6 +128,10 @@ describe("station-printing controller", () => {
       branch_id: "147",
       is_print_host: true,
       host_epoch: 2,
+      // Host-only: consumer needs stored broker creds (HB may omit rabbit when version matches).
+      rabbit_host: "mq.example.com",
+      rabbit_password: "secret",
+      rabbit_version: "aaaaaaaaaaaaaaaa",
     });
     let paths = [];
     const request = async (cfg) => {

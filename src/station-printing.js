@@ -23,6 +23,7 @@ const {
   resolveQueueDeclareOptions,
   resolveQueueName,
   normalizeRabbitConfig,
+  normalizeAgentApiBase,
 } = require("./agent-contract");
 
 function createStationPrintingController(deps = {}) {
@@ -108,17 +109,80 @@ function createStationPrintingController(deps = {}) {
   }
 
   function setApiBase(base) {
-    api.setApiBase(base);
-    writeConfig({ agent_api_base: String(base || "").trim() });
+    const normalized = normalizeAgentApiBase(base);
+    api.setApiBase(normalized);
+    writeConfig({ agent_api_base: normalized });
   }
 
   function setDeviceLabel(label) {
     writeConfig({ device_label: String(label || "").trim() });
   }
 
+  /** Drop broker connection creds when host role is lost (409 / epoch). Absence of rabbit ≠ clear. */
+  function dropBrokerCredentialsPatch() {
+    return {
+      rabbit_host: "",
+      rabbit_port: "",
+      rabbit_username: "",
+      rabbit_password: "",
+      rabbit_tls: false,
+      rabbit_version: "",
+      last_server_rabbit: null,
+      rabbit_vhost: "/",
+      rabbit_exchange: "",
+      rabbit_routing_key: "",
+    };
+  }
+
   function setPairingCode(code) {
     writeConfig({ pairing_code: String(code || "").trim() });
   }
+
+  /**
+   * L13: when Advanced override turns off, restore last server rabbit and
+   * return whether broker fingerprint changed (caller should reconnect).
+   */
+  function setRabbitManualOverride(enabled) {
+    const on = Boolean(enabled);
+    const cfg = readConfig();
+    if (on) {
+      writeConfig({ rabbit_manual_override: true });
+      log(
+        "Advanced: manual RabbitMQ override ON — server register will not overwrite broker fields.",
+        "⚙️"
+      );
+      onStateChange(publicHostState());
+      return { ok: true, rabbitManualOverride: true, rabbitChanged: false };
+    }
+    const beforeFp = rabbitConnectionFingerprint(cfg);
+    const snapshot = cfg.last_server_rabbit;
+    const patch = { rabbit_manual_override: false };
+    if (snapshot && typeof snapshot === "object") {
+      const rabbitConfig = normalizeRabbitConfig(snapshot, cfg.branch_id, {
+        apiBaseUrl: cfg.agent_api_base || "",
+        manualOverride: false,
+      });
+      Object.assign(patch, rabbitConfigToPersistPatch(rabbitConfig, { manualOverride: false }));
+      if (rabbitConfig.hostRewriteNote) {
+        log(rabbitConfig.hostRewriteNote, "ℹ️");
+      }
+      log(
+        `Override off — restored Rabbit settings from last server payload (${rabbitConfig.host || "host?"}:${rabbitConfig.port || "?"}).`,
+        "⚙️"
+      );
+    } else {
+      log(
+        "Advanced: manual RabbitMQ override OFF — broker settings will follow the server on next Connect/heartbeat.",
+        "⚙️"
+      );
+    }
+    writeConfig(patch);
+    const afterFp = rabbitConnectionFingerprint(readConfig());
+    const rabbitChanged = beforeFp !== afterFp;
+    onStateChange(publicHostState());
+    return { ok: true, rabbitManualOverride: false, rabbitChanged };
+  }
+
 
   function clearHostConflict() {
     hostConflict = null;
@@ -137,8 +201,8 @@ function createStationPrintingController(deps = {}) {
     needsPairing = true;
     hostConflict = null;
     writeConfig({
+      ...dropBrokerCredentialsPatch(),
       agent_token: "",
-      rabbit_password: "",
       pairing_code: "",
       is_print_host: false,
       host_epoch: 1,
@@ -219,9 +283,11 @@ function createStationPrintingController(deps = {}) {
       };
       policy.revoke("print_host_already_configured");
       consumeEnabled = false;
+      writeConfig(dropBrokerCredentialsPatch());
       persistHostFlags();
       onStateChange(publicHostState());
       log(`Print host conflict: ${result.conflict.message}`, "⚠️");
+      log("Dropped local Rabbit credentials (not print host).", "ℹ️");
       return { ok: false, conflict: result.conflict, shouldConsume: false };
     }
 
@@ -256,39 +322,73 @@ function createStationPrintingController(deps = {}) {
     if (result.pdf_host) {
       patch.pdf_host = result.pdf_host;
     }
-    // Persist rabbit.queue / durable / arguments; broker creds unless Advanced override is on.
+    // Persist rabbit only when present (host-only). Absence must NOT wipe stored creds.
     const beforeFp = rabbitConnectionFingerprint(cfg);
     const manualOverride = Boolean(cfg.rabbit_manual_override);
-    const rabbitConfig =
-      result.rabbitConfig ||
-      normalizeRabbitConfig(result.rabbit, result.branch_id || branchId || cfg.branch_id);
-    Object.assign(
-      patch,
-      rabbitConfigToPersistPatch(rabbitConfig, { manualOverride })
-    );
+    let rabbitConfig = null;
+    if (result.rabbit && typeof result.rabbit === "object") {
+      rabbitConfig = normalizeRabbitConfig(
+        result.rabbit,
+        result.branch_id || branchId || cfg.branch_id,
+        { apiBaseUrl: cfg.agent_api_base || "", manualOverride }
+      );
+      Object.assign(
+        patch,
+        rabbitConfigToPersistPatch(rabbitConfig, { manualOverride })
+      );
+      patch.last_server_rabbit = result.rabbit;
+    }
+    if (result.rabbit_version != null && String(result.rabbit_version).trim() !== "") {
+      patch.rabbit_version = String(result.rabbit_version).trim();
+    }
+    // L2: never leave pairing code on disk after a successful register.
+    patch.pairing_code = "";
     if (Object.keys(patch).length) writeConfig(patch);
     const afterCfg = readConfig();
     const afterFp = rabbitConnectionFingerprint(afterCfg);
-    if (manualOverride) {
-      log(
-        "Register rabbit payload received; Advanced manual override is on — keeping local broker settings.",
-        "ℹ️"
-      );
-    } else if (rabbitConfig.hasBrokerCreds) {
-      log(
-        `Applied Rabbit settings from register (${rabbitConfig.host || "host?"}:${rabbitConfig.port || "?"}, queue ${rabbitConfig.queue}).`,
-        "⚙️"
-      );
-    } else if (rabbitConfig.queue) {
-      log(`Using print queue ${rabbitConfig.queue} (from register / default).`, "ℹ️");
+    if (rabbitConfig && rabbitConfig.hostRewriteNote) {
+      log(rabbitConfig.hostRewriteNote, "ℹ️");
+    }
+    if (rabbitConfig) {
+      if (manualOverride) {
+        log(
+          "Register rabbit payload received; Advanced manual override is on — keeping local broker settings.",
+          "ℹ️"
+        );
+      } else if (rabbitConfig.hasBrokerCreds) {
+        log(
+          `Applied Rabbit settings from register (${rabbitConfig.host || "host?"}:${rabbitConfig.port || "?"}, queue ${rabbitConfig.queue}).`,
+          "⚙️"
+        );
+      } else if (rabbitConfig.queue) {
+        log(`Using print queue ${rabbitConfig.queue} (from register / default).`, "ℹ️");
+      }
     }
     const rabbitChanged = beforeFp !== afterFp;
     const applied = policy.applyServerState({
       is_print_host: result.is_print_host,
       host_epoch: result.host_epoch,
     });
-    consumeEnabled = applied.shouldConsume;
-    if (applied.promoted) flushPending = true;
+    // Host-only consumer: need is_print_host AND broker creds.
+    const hasBroker =
+      Boolean(afterCfg.rabbit_host && String(afterCfg.rabbit_host).trim()) ||
+      Boolean(rabbitConfig && rabbitConfig.hasBrokerCreds);
+    if (result.is_print_host && !hasBroker) {
+      consumeEnabled = false;
+      log(
+        "Print host confirmed, but server sent no Rabbit credentials yet — consumer idle.",
+        "ℹ️"
+      );
+    } else {
+      consumeEnabled = applied.shouldConsume && hasBroker;
+    }
+    if (applied.promoted && consumeEnabled) flushPending = true;
+    if (!result.is_print_host) {
+      log(
+        "Not the print host — Rabbit credentials are only sent to the print host. Consumer stays idle.",
+        "ℹ️"
+      );
+    }
     persistHostFlags();
     onStateChange(publicHostState());
     log(
@@ -305,6 +405,7 @@ function createStationPrintingController(deps = {}) {
       rabbit: result.rabbit || null,
       rabbitConfig,
       rabbitChanged: Boolean(rabbitChanged),
+      branch_id: result.branch_id != null ? String(result.branch_id) : afterCfg.branch_id || null,
     };
   }
 
@@ -476,6 +577,10 @@ function createStationPrintingController(deps = {}) {
         appId,
         branchId: bid,
         printers: [],
+        rabbitVersion:
+          cfg.rabbit_version != null && String(cfg.rabbit_version).trim() !== ""
+            ? String(cfg.rabbit_version).trim()
+            : undefined,
       });
     } finally {
       livenessInFlight = false;
@@ -511,13 +616,79 @@ function createStationPrintingController(deps = {}) {
       host_epoch: live.host_epoch,
     });
     consumeEnabled = applied.shouldConsume;
-    if (applied.promoted) flushPending = true;
     if (applied.revoked) {
+      writeConfig(dropBrokerCredentialsPatch());
       log(
-        `Print host revoked (epoch ${live.host_epoch}) — stopping consumer.`,
+        `Print host revoked (epoch ${live.host_epoch}) — stopping consumer and dropped local Rabbit credentials.`,
         "⚠️"
       );
     }
+
+    // v1.7: rabbit_version always; full rabbit only when ours missing/stale.
+    // Host-only: never apply rabbit after revoke / when not print host (absence ≠ wipe; presence on non-host ignored).
+    let rabbitChanged = false;
+    const hbPatch = {};
+    if (live.rabbit_version) {
+      hbPatch.rabbit_version = String(live.rabbit_version).trim();
+    }
+    if (
+      live.is_print_host &&
+      !applied.revoked &&
+      live.rabbit &&
+      typeof live.rabbit === "object"
+    ) {
+      const beforeFp = rabbitConnectionFingerprint(cfg);
+      const manualOverride = Boolean(cfg.rabbit_manual_override);
+      const rabbitConfig = normalizeRabbitConfig(live.rabbit, bid || cfg.branch_id, {
+        apiBaseUrl: cfg.agent_api_base || "",
+        manualOverride,
+      });
+      Object.assign(hbPatch, rabbitConfigToPersistPatch(rabbitConfig, { manualOverride }));
+      hbPatch.last_server_rabbit = live.rabbit;
+      if (rabbitConfig.hostRewriteNote) {
+        log(rabbitConfig.hostRewriteNote, "ℹ️");
+      }
+      if (!manualOverride) {
+        log(
+          `Applied Rabbit settings from heartbeat (${rabbitConfig.host || "host?"}:${rabbitConfig.port || "?"}).`,
+          "⚙️"
+        );
+      }
+      writeConfig(hbPatch);
+      const afterFp = rabbitConnectionFingerprint(readConfig());
+      rabbitChanged = beforeFp !== afterFp;
+      if (rabbitChanged) {
+        log(
+          "Rabbit broker config changed — reconnecting consumer (finish in-flight, no double ack).",
+          "🔄"
+        );
+      }
+    } else if (Object.keys(hbPatch).length && !applied.revoked) {
+      writeConfig(hbPatch);
+    }
+
+    // Host-only: need broker creds to consume. Absence of rabbit does not wipe prior creds.
+    {
+      const cfgNow = readConfig();
+      const hasBroker = Boolean(
+        cfgNow.rabbit_host && String(cfgNow.rabbit_host).trim()
+      );
+      if (applied.shouldConsume && !hasBroker) {
+        consumeEnabled = false;
+        if (live.is_print_host) {
+          log(
+            "Print host active, but no Rabbit credentials yet — waiting for server payload.",
+            "ℹ️"
+          );
+        }
+      } else if (!applied.revoked) {
+        consumeEnabled = applied.shouldConsume && hasBroker;
+      } else {
+        consumeEnabled = false;
+      }
+      if (applied.promoted && consumeEnabled) flushPending = true;
+    }
+
     persistHostFlags();
     onStateChange(publicHostState());
 
@@ -536,6 +707,10 @@ function createStationPrintingController(deps = {}) {
                 branchId: bid,
                 printers: payload,
                 timeout: timeoutMs,
+                rabbitVersion: (() => {
+                  const v = readConfig().rabbit_version;
+                  return v != null && String(v).trim() !== "" ? String(v).trim() : undefined;
+                })(),
               });
               if (r && r.authError) {
                 handleAuthFailure(r, "heartbeat_unauthorized");
@@ -578,6 +753,7 @@ function createStationPrintingController(deps = {}) {
       promoted: applied.promoted,
       pending_job_count: live.pending_job_count,
       flushPending,
+      rabbitChanged: Boolean(rabbitChanged),
       printerUpsert,
       syncConflict: Boolean(printerUpsert && printerUpsert.syncConflict),
       retriesExhausted: Boolean(printerUpsert && printerUpsert.retriesExhausted),
@@ -817,6 +993,7 @@ function createStationPrintingController(deps = {}) {
     setApiBase,
     setDeviceLabel,
     setPairingCode,
+    setRabbitManualOverride,
     clearHostConflict,
     clearLocalAuth,
     registerAsHost,
