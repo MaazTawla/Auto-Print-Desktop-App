@@ -44,9 +44,10 @@ describe("agent-http-retry-policy", () => {
     assert.equal(parseRetryAfterMs("9999", Date.now(), 120000), 120000);
     assert.equal(parseRetryAfterMs(""), null);
     assert.equal(parseRetryAfterMs(null), null);
-    // L4: negative / signed integers are absent (not Date.parse → 0)
+    // L4 / L3-R2-I2: signed integers are absent (not Date.parse → 0)
     assert.equal(parseRetryAfterMs("-1"), null);
     assert.equal(parseRetryAfterMs("-5"), null);
+    assert.equal(parseRetryAfterMs("+5"), null);
   });
 
   it("SYNC_CONFLICT 409 is retryable for sync path", () => {

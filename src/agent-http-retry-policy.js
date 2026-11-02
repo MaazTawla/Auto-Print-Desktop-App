@@ -50,12 +50,14 @@ function parseRetryAfterMs(raw, nowMs = Date.now(), maxMs = 120000) {
   if (raw == null) return null;
   const s = String(raw).trim();
   if (!s) return null;
-  // Delta-seconds: only non-negative integers. Signed/negative (e.g. "-1") → absent.
-  if (/^-?\d+$/.test(s)) {
+  // Delta-seconds: unsigned digits only. Signed forms ("+5", "-1") are absent —
+  // never fall through to Date.parse (which maps "+5"/"-1" to a weird delay).
+  if (/^\d+$/.test(s)) {
     const sec = Number(s);
     if (!Number.isFinite(sec) || sec < 0) return null;
     return Math.min(maxMs, Math.max(0, sec * 1000));
   }
+  if (/^[+-]\d+$/.test(s)) return null;
   const then = Date.parse(s);
   if (!Number.isFinite(then)) return null;
   return Math.min(maxMs, Math.max(0, then - nowMs));

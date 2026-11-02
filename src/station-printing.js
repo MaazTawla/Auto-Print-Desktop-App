@@ -724,8 +724,9 @@ function createStationPrintingController(deps = {}) {
         );
       } catch (_) {}
       consecutiveHbFailures = 0;
-      authUnpairTracker.noteSuccess();
     }
+    // L3-R2-L1: every successful authenticated HB resets soft-auth (not only recoveries).
+    authUnpairTracker.noteSuccess();
 
     const applied = policy.applyServerState({
       is_print_host: live.is_print_host,
@@ -1027,6 +1028,16 @@ function createStationPrintingController(deps = {}) {
           allOk = false;
           consecutiveStatusPushFailures += 1;
           const st = r && r.status != null ? Number(r.status) : null;
+          // L3-R2-L2: same unpair rule as ACK/HB/sync.
+          if (handleAuthFailure(r, "status_unauthorized")) {
+            return {
+              ok: false,
+              results,
+              committed: false,
+              authError: true,
+              consecutiveFailures: consecutiveStatusPushFailures,
+            };
+          }
           if (
             shouldLogStatusPushFailure(consecutiveStatusPushFailures) ||
             (st != null && !httpIsRetryable(st) && st >= 400 && st < 500)
@@ -1064,6 +1075,7 @@ function createStationPrintingController(deps = {}) {
         } catch (_) {}
       }
       consecutiveStatusPushFailures = 0;
+      authUnpairTracker.noteSuccess();
       if (statusPushRetryTimer) {
         clearTimer(statusPushRetryTimer);
         statusPushRetryTimer = null;
