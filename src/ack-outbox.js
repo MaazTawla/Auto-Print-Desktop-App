@@ -24,7 +24,7 @@ const {
 const DEFAULT_MAX = 2000;
 const DEFAULT_CORRUPT_KEEP = 10;
 const BACKOFF_MS = [1000, 5000, 15000, 30000, 60000, 120000];
-/** Cap retryable ACK failures (5xx / 401 / 403 / 408 / 429 / network). ~30 ≈ under an hour. */
+/** Cap retryable ACK failures (5xx / 408 / 429 / network). ~30 ≈ under an hour. */
 const MAX_ATTEMPTS = 30;
 /** Absolute age ceiling so skipped_no_token cannot loop forever. */
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -305,16 +305,33 @@ function createAckOutbox(opts = {}) {
     const entry = map.get(id);
     if (!entry) return null;
     const now = nowMs != null ? Number(nowMs) : Date.now();
-    if (ok || isSuccessAckStatus(status) || isTerminalAckStatus(status)) {
+    if (ok || isSuccessAckStatus(status)) {
       map.delete(id);
       persist();
       return {
         removed: true,
         entry,
         terminal: true,
-        ok: Boolean(ok || isSuccessAckStatus(status)),
+        ok: true,
         exhausted: false,
         deadLettered: false,
+      };
+    }
+    // Terminal 4xx (every 4xx except 408/429): dead-letter + release slot (L1).
+    if (isTerminalAckStatus(status)) {
+      entry.attempts = (entry.attempts || 0) + 1;
+      entry.lastStatus = status != null ? Number(status) : null;
+      entry.lastError = error != null ? String(error) : null;
+      appendDeadLetter(entry, "TERMINAL_4XX", now);
+      map.delete(id);
+      persist();
+      return {
+        removed: true,
+        entry,
+        terminal: true,
+        ok: false,
+        exhausted: false,
+        deadLettered: true,
       };
     }
     entry.attempts = (entry.attempts || 0) + 1;

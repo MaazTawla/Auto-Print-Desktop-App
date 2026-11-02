@@ -23,7 +23,10 @@ const {
   resolveApiUrl,
   ERROR_CODES,
 } = require("./agent-contract");
-const { parseRetryAfterMs } = require("./agent-http-retry-policy");
+const {
+  parseRetryAfterMs,
+  shouldUnpairImmediately,
+} = require("./agent-http-retry-policy");
 
 function createAgentApi(options = {}) {
   let apiBase = String(options.apiBase || "").trim();
@@ -129,11 +132,23 @@ function createAgentApi(options = {}) {
       callOpts
     );
     if (status === 401 || status === 403) {
+      const parsed = parseAgentError(data, status);
+      const code =
+        (parsed && parsed.code) ||
+        (status === 401 ? "UNAUTHORIZED" : "FORBIDDEN");
       return {
         ok: false,
         status,
-        authError: true,
-        error: { code: "UNAUTHORIZED", message: "Agent token rejected" },
+        authError: shouldUnpairImmediately(status, code),
+        error: {
+          code,
+          message:
+            (parsed && parsed.message) ||
+            (status === 401
+              ? "Agent token rejected"
+              : "Agent forbidden"),
+        },
+        code,
         headers,
       };
     }
@@ -193,13 +208,15 @@ function createAgentApi(options = {}) {
       callOpts
     );
     if (status === 401 || status === 403) {
+      const error = parseAgentError(data, status);
+      const code = error.code || (status === 401 ? "UNAUTHORIZED" : "FORBIDDEN");
       return {
         ok: false,
         status,
-        authError: true,
-        error: parseAgentError(data, status),
-        code: parseAgentError(data, status).code,
-        message: parseAgentError(data, status).message,
+        authError: shouldUnpairImmediately(status, code),
+        error: { ...error, code },
+        code,
+        message: error.message,
         ...parsePrintersSyncResponse({}),
       };
     }
@@ -259,7 +276,10 @@ function createAgentApi(options = {}) {
       return {
         ok: false,
         status,
-        authError: status === 401 || status === 403,
+        authError: shouldUnpairImmediately(
+          status,
+          parsed.error && parsed.error.code
+        ),
         error: parsed.error,
         code: parsed.error.code,
         message: parsed.error.message,
@@ -286,7 +306,10 @@ function createAgentApi(options = {}) {
       return {
         ok: false,
         status,
-        authError: status === 401 || status === 403,
+        authError: shouldUnpairImmediately(
+          status,
+          parsed.error && parsed.error.code
+        ),
         error: parsed.error,
         code: parsed.error.code,
         message: parsed.error.message,

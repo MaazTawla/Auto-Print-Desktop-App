@@ -29,6 +29,8 @@ const ERROR_CODES = Object.freeze({
   MISSING_PDF: "MISSING_PDF",
   VALIDATION_ERROR: "VALIDATION_ERROR",
   UNAUTHORIZED: "UNAUTHORIZED",
+  FORBIDDEN: "FORBIDDEN",
+  AGENT_NOT_FOUND: "AGENT_NOT_FOUND",
 });
 
 /** Relative paths under /api/v1/print-agent */

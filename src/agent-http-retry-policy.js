@@ -50,7 +50,8 @@ function parseRetryAfterMs(raw, nowMs = Date.now(), maxMs = 120000) {
   if (raw == null) return null;
   const s = String(raw).trim();
   if (!s) return null;
-  if (/^\d+$/.test(s)) {
+  // Delta-seconds: only non-negative integers. Signed/negative (e.g. "-1") → absent.
+  if (/^-?\d+$/.test(s)) {
     const sec = Number(s);
     if (!Number.isFinite(sec) || sec < 0) return null;
     return Math.min(maxMs, Math.max(0, sec * 1000));
@@ -85,6 +86,110 @@ function shouldCommitStatusFingerprint(allSucceeded, attempted) {
   return Boolean(attempted && allSucceeded);
 }
 
+
+/**
+ * Session unpair / clear-local-auth policy (L3).
+ *
+ * Immediate unpair:
+ *   - HTTP 401 (UNAUTHORIZED / revoked / invalid bearer — contract revoke path)
+ *   - HTTP 404 AGENT_NOT_FOUND (unknown host)
+ *
+ * Soft auth (count toward threshold, default 3):
+ *   - HTTP 403 including FORBIDDEN / NOT_PRINT_HOST / BRANCH_MISMATCH / bare 403
+ *   A single 403 FORBIDDEN on one job is terminal for that job only — no unpair
+ *   until the consecutive soft-auth threshold is hit.
+ *
+ * Apply on every path (ACK, heartbeat, sync, status).
+ */
+const AUTH_UNPAIR_THRESHOLD = 3;
+const IMMEDIATE_UNPAIR_CODES_404 = new Set(["AGENT_NOT_FOUND"]);
+
+function normalizeErrorCode(code) {
+  if (code == null) return null;
+  const s = String(code).trim();
+  return s ? s.toUpperCase() : null;
+}
+
+function shouldUnpairImmediately(status, errorCode) {
+  const st = status == null ? null : Number(status);
+  if (st === 401) return true;
+  const code = normalizeErrorCode(errorCode);
+  if (st === 404 && code && IMMEDIATE_UNPAIR_CODES_404.has(code)) return true;
+  return false;
+}
+
+/** Auth-related signal worth tracking (not every 4xx). */
+function isAuthRelated(status, errorCode) {
+  const st = status == null ? null : Number(status);
+  if (st === 401 || st === 403) return true;
+  const code = normalizeErrorCode(errorCode);
+  if (st === 404 && code && IMMEDIATE_UNPAIR_CODES_404.has(code)) return true;
+  return false;
+}
+
+function isSoftAuthFailure(status, errorCode) {
+  if (!isAuthRelated(status, errorCode)) return false;
+  return !shouldUnpairImmediately(status, errorCode);
+}
+
+function createAuthUnpairTracker(opts = {}) {
+  const threshold =
+    opts.threshold != null ? Number(opts.threshold) : AUTH_UNPAIR_THRESHOLD;
+  let consecutiveSoft = 0;
+
+  function noteSuccess() {
+    consecutiveSoft = 0;
+    return { shouldUnpair: false, consecutiveSoft: 0, reason: null };
+  }
+
+  function noteFailure(status, errorCode) {
+    if (!isAuthRelated(status, errorCode)) {
+      return { shouldUnpair: false, consecutiveSoft, reason: null };
+    }
+    if (shouldUnpairImmediately(status, errorCode)) {
+      consecutiveSoft = 0;
+      const code = normalizeErrorCode(errorCode);
+      return {
+        shouldUnpair: true,
+        consecutiveSoft: 0,
+        immediate: true,
+        reason:
+          Number(status) === 401
+            ? "unauthorized"
+            : code || "agent_not_found",
+      };
+    }
+    consecutiveSoft += 1;
+    if (consecutiveSoft >= threshold) {
+      const n = consecutiveSoft;
+      consecutiveSoft = 0;
+      return {
+        shouldUnpair: true,
+        consecutiveSoft: 0,
+        immediate: false,
+        reason: `soft_auth_x${n}`,
+      };
+    }
+    return {
+      shouldUnpair: false,
+      consecutiveSoft,
+      immediate: false,
+      reason: null,
+    };
+  }
+
+  function getConsecutiveSoft() {
+    return consecutiveSoft;
+  }
+
+  return {
+    noteSuccess,
+    noteFailure,
+    getConsecutiveSoft,
+    threshold,
+  };
+}
+
 module.exports = {
   Outcome,
   classify,
@@ -98,4 +203,9 @@ module.exports = {
   statusPushRetryMs,
   shouldLogStatusPushFailure,
   shouldCommitStatusFingerprint,
+  AUTH_UNPAIR_THRESHOLD,
+  shouldUnpairImmediately,
+  isAuthRelated,
+  isSoftAuthFailure,
+  createAuthUnpairTracker,
 };

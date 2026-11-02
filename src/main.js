@@ -206,10 +206,15 @@ async function flushAckOutbox() {
       if (outcome && outcome.removed) {
         flushed += 1;
         if (outcome.exhausted || outcome.deadLettered) {
+          const code =
+            (result && result.code) ||
+            (result && result.error && result.error.code) ||
+            null;
+          const codePart = code ? ` code=${code}` : "";
           log(
             `Server ack outbox dead-lettered job_id=${entry.jobId} status=${entry.status} ` +
               `after ${outcome.entry.attempts} attempts ` +
-              `(last HTTP ${outcome.entry.lastStatus != null ? outcome.entry.lastStatus : "n/a"}: ` +
+              `(last HTTP ${outcome.entry.lastStatus != null ? outcome.entry.lastStatus : "n/a"}${codePart}: ` +
               `${outcome.entry.lastError || "error"}) — slot released.`,
             "⚠️"
           );
@@ -233,6 +238,10 @@ async function flushAckOutbox() {
             "⚠️"
           );
         }
+      }
+      // L2/L3: ACK 401 immediate unpair; soft 403 counts toward threshold (same as HB/sync).
+      if (result && !result.ok && typeof sp.handleAuthFailure === "function") {
+        sp.handleAuthFailure(result, "ack_unauthorized");
       }
     }
     // Schedule next due

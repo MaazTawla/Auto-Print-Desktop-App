@@ -12,6 +12,11 @@ const {
   shouldCommitStatusFingerprint,
   statusPushRetryMs,
   shouldLogStatusPushFailure,
+  shouldUnpairImmediately,
+  isAuthRelated,
+  isSoftAuthFailure,
+  createAuthUnpairTracker,
+  AUTH_UNPAIR_THRESHOLD,
 } = require("../src/agent-http-retry-policy");
 
 describe("agent-http-retry-policy", () => {
@@ -39,12 +44,43 @@ describe("agent-http-retry-policy", () => {
     assert.equal(parseRetryAfterMs("9999", Date.now(), 120000), 120000);
     assert.equal(parseRetryAfterMs(""), null);
     assert.equal(parseRetryAfterMs(null), null);
+    // L4: negative / signed integers are absent (not Date.parse → 0)
+    assert.equal(parseRetryAfterMs("-1"), null);
+    assert.equal(parseRetryAfterMs("-5"), null);
   });
 
   it("SYNC_CONFLICT 409 is retryable for sync path", () => {
     assert.equal(isSyncConflictRetryable(409, "SYNC_CONFLICT"), true);
     assert.equal(isSyncConflictRetryable(409, "OTHER"), false);
     assert.equal(isTerminal(409), true); // generic 4xx terminal; sync special-cases
+  });
+
+  it("unpair: 401 and AGENT_NOT_FOUND immediate; 403 FORBIDDEN soft until threshold", () => {
+    assert.equal(shouldUnpairImmediately(401, "UNAUTHORIZED"), true);
+    assert.equal(shouldUnpairImmediately(401, null), true);
+    assert.equal(shouldUnpairImmediately(404, "AGENT_NOT_FOUND"), true);
+    assert.equal(shouldUnpairImmediately(403, "FORBIDDEN"), false);
+    assert.equal(shouldUnpairImmediately(403, "NOT_PRINT_HOST"), false);
+    assert.equal(shouldUnpairImmediately(403, "BRANCH_MISMATCH"), false);
+    assert.equal(shouldUnpairImmediately(404, "NOT_FOUND"), false);
+    assert.equal(isSoftAuthFailure(403, "FORBIDDEN"), true);
+    assert.equal(isAuthRelated(403, "FORBIDDEN"), true);
+    assert.equal(AUTH_UNPAIR_THRESHOLD, 3);
+
+    const t = createAuthUnpairTracker();
+    assert.equal(t.noteFailure(403, "FORBIDDEN").shouldUnpair, false);
+    assert.equal(t.noteFailure(403, "FORBIDDEN").shouldUnpair, false);
+    const third = t.noteFailure(403, "FORBIDDEN");
+    assert.equal(third.shouldUnpair, true);
+    assert.equal(third.immediate, false);
+
+    const t2 = createAuthUnpairTracker();
+    t2.noteFailure(403, "FORBIDDEN");
+    t2.noteSuccess();
+    assert.equal(t2.noteFailure(403, "FORBIDDEN").shouldUnpair, false);
+
+    const t3 = createAuthUnpairTracker();
+    assert.equal(t3.noteFailure(401, "UNAUTHORIZED").shouldUnpair, true);
   });
 
   it("status fingerprint commit + retry helpers", () => {

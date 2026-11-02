@@ -39,6 +39,8 @@ const {
   shouldLogStatusPushFailure,
   shouldCommitStatusFingerprint,
   STATUS_PUSH_MAX_RETRY_MS,
+  createAuthUnpairTracker,
+  isAuthRelated,
 } = require("./agent-http-retry-policy");
 
 function createStationPrintingController(deps = {}) {
@@ -71,6 +73,7 @@ function createStationPrintingController(deps = {}) {
   let lastHeartbeatAt = null;
   let consumeEnabled = policy.shouldConsume();
   let flushPending = false;
+  const authUnpairTracker = createAuthUnpairTracker();
 
   function persistHostFlags() {
     const snap = policy.snapshot();
@@ -247,8 +250,30 @@ function createStationPrintingController(deps = {}) {
   }
 
   function handleAuthFailure(result, context) {
-    if (!result || !result.authError) return false;
-    clearLocalAuth(context || "token_revoked");
+    if (!result) return false;
+    if (result.ok) {
+      authUnpairTracker.noteSuccess();
+      return false;
+    }
+    const status = result.status != null ? Number(result.status) : null;
+    const code =
+      result.code ||
+      (result.error && result.error.code) ||
+      null;
+    if (!isAuthRelated(status, code)) return false;
+    const decision = authUnpairTracker.noteFailure(status, code);
+    if (!decision.shouldUnpair) {
+      try {
+        log(
+          `${context || "auth"} signal HTTP ${status}` +
+            (code ? ` ${code}` : "") +
+            ` (soft ${decision.consecutiveSoft}/${authUnpairTracker.threshold}) — session kept.`,
+          "⚠️"
+        );
+      } catch (_) {}
+      return false;
+    }
+    clearLocalAuth(context || decision.reason || "token_revoked");
     lastRegisterError = {
       code: (result.error && result.error.code) || "UNAUTHORIZED",
       message:
@@ -699,6 +724,7 @@ function createStationPrintingController(deps = {}) {
         );
       } catch (_) {}
       consecutiveHbFailures = 0;
+      authUnpairTracker.noteSuccess();
     }
 
     const applied = policy.applyServerState({
@@ -1239,6 +1265,8 @@ function createStationPrintingController(deps = {}) {
     setRabbitManualOverride,
     clearHostConflict,
     clearLocalAuth,
+    handleAuthFailure,
+    evaluateAuthFailure: handleAuthFailure,
     registerAsHost,
     ensureSession,
     heartbeat,

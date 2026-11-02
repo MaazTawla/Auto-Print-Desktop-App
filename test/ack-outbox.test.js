@@ -53,6 +53,7 @@ describe("ack-outbox", () => {
     box.enqueue({ jobId: "c", status: "failed", reason: "gone" });
     const r3 = box.markAttempt("c", { ok: false, status: 404, error: "not found" });
     assert.equal(r3.removed, true);
+    assert.equal(r3.deadLettered, true);
     assert.equal(box.has("c"), false);
   });
 
@@ -105,11 +106,14 @@ describe("ack-outbox", () => {
     const r400 = box.markAttempt("bad", { ok: false, status: 400, error: "bad" });
     assert.equal(r400.removed, true);
     assert.equal(r400.ok, false);
+    assert.equal(r400.deadLettered, true);
     assert.equal(box.has("bad"), false);
+    assert.equal(box.listDeadLetters().slice(-1)[0].cause, "TERMINAL_4XX");
 
     box.enqueue({ jobId: "gone", status: "printed" });
     const r404 = box.markAttempt("gone", { ok: false, status: 404, error: "nf" });
     assert.equal(r404.removed, true);
+    assert.equal(r404.deadLettered, true);
     assert.equal(box.has("gone"), false);
 
     box.enqueue({ jobId: "to", status: "printed" });
