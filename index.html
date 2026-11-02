@@ -2882,6 +2882,44 @@
 
 <div id="toast-wrap" class="toast-wrap" aria-live="polite" aria-atomic="true"></div>
 
+
+<!-- Printer edit modal (L1: dialog like Android, not inline details) -->
+<div id="printer-edit-modal" class="modal-overlay" aria-hidden="true">
+  <div class="modal-box" role="dialog" aria-labelledby="printer-edit-modal-title" aria-modal="true">
+    <div class="modal-head">
+      <h3 id="printer-edit-modal-title">Edit printer</h3>
+      <button type="button" class="modal-close" id="printer-edit-modal-close" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="field-hint" id="printer-edit-lock-hint" style="margin:0 0 8px;">
+        External ID is locked. For LAN printers, changing host/port updates the id and replaces this printer mapping.
+      </p>
+      <input type="hidden" id="printer-edit-id" value="" />
+      <div class="field">
+        <label for="printer-edit-name">Name</label>
+        <input type="text" id="printer-edit-name" placeholder="Kitchen" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="printer-edit-eid">External ID (locked)</label>
+        <input type="text" id="printer-edit-eid" disabled autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="printer-edit-host">Host / IP</label>
+        <input type="text" id="printer-edit-host" placeholder="192.168.1.50" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="printer-edit-port">Port</label>
+        <input type="number" id="printer-edit-port" value="9100" min="1" max="65535" />
+      </div>
+      <div class="err-text" id="printer-edit-err" style="margin-top:8px;"></div>
+      <div class="inline-actions" style="margin-top:12px;">
+        <button type="button" class="btn-primary" id="printer-edit-save">Save printer</button>
+        <button type="button" class="btn-outline" id="printer-edit-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Printer modal -->
 <div id="printer-modal" class="modal-overlay" aria-hidden="true">
   <div class="modal-box modal-printer-picker" role="dialog" aria-labelledby="printer-modal-title">
@@ -3992,10 +4030,12 @@
     tbody.innerHTML = list.map((p) => {
       const def = p.is_default ? 'Yes' : '';
       const eid = escHtml(p.external_id || '');
+      // Local Windows test-print only works on win32 with a target printer (L2).
+      const canTest = s.platform === 'win32' && !!(p.windows_name || s.defaultPrinter || p.is_default);
       const actions =
         '<div class="inline-actions" style="flex-wrap:wrap; gap:6px;">' +
           '<button type="button" class="btn-outline btn-sm" data-printer-action="test" data-external-id="' + eid + '"' +
-            (canEdit || true ? '' : ' disabled') + '>Test</button>' +
+            (canTest ? '' : ' disabled') + (canTest ? '' : ' title="Test print needs Windows and a printer target"') + '>Test</button>' +
           '<button type="button" class="btn-outline btn-sm" data-printer-action="edit" data-external-id="' + eid + '"' +
             (canEdit ? '' : ' disabled') + '>Edit</button>' +
           '<button type="button" class="btn-outline btn-sm" data-printer-action="remove" data-external-id="' + eid + '"' +
@@ -4012,63 +4052,78 @@
     }).join('');
   }
 
+  function openPrinterEditModal() {
+    const modal = document.getElementById('printer-edit-modal');
+    if (!modal) return;
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+  }
+
+  function closePrinterEditModal() {
+    const modal = document.getElementById('printer-edit-modal');
+    if (!modal) return;
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+  }
+
   function beginEditPrinter(printer) {
     if (!printer) return;
-    const details = document.getElementById('settings-printer-manual-details');
-    const summary = document.getElementById('settings-printer-manual-summary');
-    const lockHint = document.getElementById('settings-manual-printer-lock-hint');
-    const eidField = document.getElementById('settings-manual-printer-eid-field');
-    const eidInput = document.getElementById('settings-manual-printer-eid');
-    const editId = document.getElementById('settings-manual-printer-edit-id');
-    const nameEl = document.getElementById('settings-manual-printer-name');
-    const hostEl = document.getElementById('settings-manual-printer-host');
-    const portEl = document.getElementById('settings-manual-printer-port');
-    const addBtn = document.getElementById('settings-manual-printer-add');
-    const cancelBtn = document.getElementById('settings-manual-printer-cancel');
-    const errEl = document.getElementById('settings-manual-printer-err');
+    const errEl = document.getElementById('printer-edit-err');
+    const editId = document.getElementById('printer-edit-id');
+    const nameEl = document.getElementById('printer-edit-name');
+    const hostEl = document.getElementById('printer-edit-host');
+    const portEl = document.getElementById('printer-edit-port');
+    const eidInput = document.getElementById('printer-edit-eid');
     if (errEl) errEl.textContent = '';
     if (editId) editId.value = printer.external_id || '';
     if (nameEl) nameEl.value = printer.name || '';
     if (hostEl) hostEl.value = printer.ip_address || '';
     if (portEl) portEl.value = printer.port != null ? String(printer.port) : '9100';
     if (eidInput) eidInput.value = printer.external_id || '';
-    if (eidField) eidField.style.display = '';
-    if (lockHint) lockHint.style.display = '';
-    if (summary) summary.textContent = 'Edit printer';
-    if (addBtn) addBtn.textContent = 'Save printer';
-    if (cancelBtn) cancelBtn.style.display = '';
-    if (details) {
-      details.open = true;
-      try { details.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (_) {}
-    }
-    // Non-LAN edits: host/port may be blank; keep visible for LAN rows.
     const conn = String(printer.connection || '').toLowerCase();
-    if (hostEl) hostEl.disabled = !(conn === 'lan' || conn === 'network');
-    if (portEl) portEl.disabled = !(conn === 'lan' || conn === 'network');
+    const lan = conn === 'lan' || conn === 'network';
+    if (hostEl) hostEl.disabled = !lan;
+    if (portEl) portEl.disabled = !lan;
+    openPrinterEditModal();
   }
 
   function clearPrinterEditForm() {
-    const details = document.getElementById('settings-printer-manual-details');
-    const summary = document.getElementById('settings-printer-manual-summary');
-    const lockHint = document.getElementById('settings-manual-printer-lock-hint');
-    const eidField = document.getElementById('settings-manual-printer-eid-field');
-    const editId = document.getElementById('settings-manual-printer-edit-id');
-    const nameEl = document.getElementById('settings-manual-printer-name');
-    const hostEl = document.getElementById('settings-manual-printer-host');
-    const portEl = document.getElementById('settings-manual-printer-port');
-    const addBtn = document.getElementById('settings-manual-printer-add');
-    const cancelBtn = document.getElementById('settings-manual-printer-cancel');
-    const errEl = document.getElementById('settings-manual-printer-err');
+    closePrinterEditModal();
+    const errEl = document.getElementById('printer-edit-err');
+    const editId = document.getElementById('printer-edit-id');
+    const nameEl = document.getElementById('printer-edit-name');
+    const hostEl = document.getElementById('printer-edit-host');
+    const portEl = document.getElementById('printer-edit-port');
+    const eidInput = document.getElementById('printer-edit-eid');
     if (errEl) errEl.textContent = '';
     if (editId) editId.value = '';
     if (nameEl) nameEl.value = '';
     if (hostEl) { hostEl.value = ''; hostEl.disabled = false; }
     if (portEl) { portEl.value = '9100'; portEl.disabled = false; }
+    if (eidInput) eidInput.value = '';
+    // Also reset the manual-add details form (add path only).
+    const details = document.getElementById('settings-printer-manual-details');
+    const summary = document.getElementById('settings-printer-manual-summary');
+    const lockHint = document.getElementById('settings-manual-printer-lock-hint');
+    const eidField = document.getElementById('settings-manual-printer-eid-field');
+    const manualEditId = document.getElementById('settings-manual-printer-edit-id');
+    const manualName = document.getElementById('settings-manual-printer-name');
+    const manualHost = document.getElementById('settings-manual-printer-host');
+    const manualPort = document.getElementById('settings-manual-printer-port');
+    const addBtn = document.getElementById('settings-manual-printer-add');
+    const cancelBtn = document.getElementById('settings-manual-printer-cancel');
+    const manualErr = document.getElementById('settings-manual-printer-err');
+    if (manualErr) manualErr.textContent = '';
+    if (manualEditId) manualEditId.value = '';
+    if (manualName) manualName.value = '';
+    if (manualHost) { manualHost.value = ''; manualHost.disabled = false; }
+    if (manualPort) { manualPort.value = '9100'; manualPort.disabled = false; }
     if (eidField) eidField.style.display = 'none';
     if (lockHint) lockHint.style.display = 'none';
     if (summary) summary.textContent = 'Enter printer manually';
     if (addBtn) addBtn.textContent = 'Add LAN printer';
     if (cancelBtn) cancelBtn.style.display = 'none';
+    if (details) details.open = false;
   }
 
   function applyPrintHostForm(s) {
@@ -4701,6 +4756,116 @@
     });
   }
 
+
+  async function savePrinterEditFromModal() {
+    const errEl = document.getElementById('printer-edit-err');
+    if (errEl) errEl.textContent = '';
+    if (window.__printerAddHost === false) {
+      const msg = 'Only the print host can edit printers.';
+      if (errEl) errEl.textContent = msg;
+      showToast(msg, 'error', 3400);
+      return;
+    }
+    const editingId = String((document.getElementById('printer-edit-id') || {}).value || '').trim();
+    if (!editingId) return;
+    const name = (document.getElementById('printer-edit-name') || {}).value || '';
+    const hostEl = document.getElementById('printer-edit-host');
+    const portEl = document.getElementById('printer-edit-port');
+    const host = String((hostEl || {}).value || '').trim();
+    const portRaw = (portEl || {}).value;
+    const hostDisabled = !!(hostEl && hostEl.disabled);
+    function isIpv6(h) {
+      let x = String(h || '').trim();
+      if (x.startsWith('[') && x.endsWith(']')) x = x.slice(1, -1);
+      if (!x.includes(':')) return false;
+      return /^[0-9a-fA-F:]+$/.test(x) && x.includes(':');
+    }
+    function parsePortStrict(raw) {
+      const t = String(raw == null ? '' : raw).trim();
+      if (!t || !/^\d+$/.test(t)) return null;
+      const n = Number(t);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
+      return n;
+    }
+    if (!window.api || typeof window.api.setPrinterMapping !== 'function') return;
+    const saveBtn = document.getElementById('printer-edit-save');
+    if (saveBtn) saveBtn.disabled = true;
+    try {
+      if (hostDisabled || !host) {
+        const state = window.__lastState || {};
+        const list = (state.stationPrinting && state.stationPrinting.printers) || [];
+        const row = list.find((p) => String(p.external_id || '').toLowerCase() === editingId.toLowerCase());
+        const res = await window.api.setPrinterMapping({
+          externalId: editingId,
+          name: String(name).trim() || (row && row.name) || editingId,
+          windowsName: row && row.windows_name,
+          connection: (row && row.connection) || 'lan',
+          host: row && row.ip_address,
+          port: row && row.port,
+          replaceExternalId: editingId,
+          isDefault: !!(row && row.is_default),
+        });
+        if (!res || !res.ok) {
+          if (errEl) errEl.textContent = (res && res.error) || 'Could not update printer.';
+          showToast((res && res.error) || 'Could not update printer.', 'error', 3400);
+          return;
+        }
+        showToast('Printer updated.');
+        clearPrinterEditForm();
+        return;
+      }
+      if (isIpv6(host)) {
+        if (errEl) errEl.textContent = 'IPv6 addresses are not supported for LAN printers; use IPv4 or a hostname.';
+        return;
+      }
+      const usePort = parsePortStrict(portRaw);
+      if (usePort == null) {
+        if (errEl) errEl.textContent = 'Port must be an integer between 1 and 65535.';
+        return;
+      }
+      const externalId = 'lan:' + host + ':' + usePort;
+      const res = await window.api.setPrinterMapping({
+        externalId: externalId,
+        name: String(name).trim() || ('Network ' + host),
+        connection: 'lan',
+        host: host,
+        port: usePort,
+        replaceExternalId: editingId,
+      });
+      if (!res || !res.ok) {
+        if (errEl) errEl.textContent = (res && res.error) || 'Could not update printer.';
+        showToast((res && res.error) || 'Could not update printer.', 'error', 3400);
+        return;
+      }
+      showToast('Printer updated.');
+      clearPrinterEditForm();
+    } catch (err) {
+      if (errEl) errEl.textContent = err && err.message ? err.message : String(err);
+      showToast(err && err.message ? err.message : 'Could not update printer.', 'error', 3400);
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
+    }
+  }
+
+  const printerEditSaveBtn = document.getElementById('printer-edit-save');
+  if (printerEditSaveBtn) {
+    printerEditSaveBtn.addEventListener('click', () => { savePrinterEditFromModal(); });
+  }
+  const printerEditCancelBtn = document.getElementById('printer-edit-cancel');
+  if (printerEditCancelBtn) {
+    printerEditCancelBtn.addEventListener('click', () => { clearPrinterEditForm(); });
+  }
+  const printerEditCloseBtn = document.getElementById('printer-edit-modal-close');
+  if (printerEditCloseBtn) {
+    printerEditCloseBtn.addEventListener('click', () => { clearPrinterEditForm(); });
+  }
+  const printerEditModal = document.getElementById('printer-edit-modal');
+  if (printerEditModal) {
+    printerEditModal.addEventListener('click', (ev) => {
+      if (ev.target === printerEditModal) clearPrinterEditForm();
+    });
+  }
+
   const printerMapTable = document.getElementById('settings-printer-map-table');
   if (printerMapTable) {
     printerMapTable.addEventListener('click', async (ev) => {
@@ -4742,7 +4907,9 @@
             return;
           }
           showToast('Printer removed.');
-          if ((document.getElementById('settings-manual-printer-edit-id') || {}).value === externalId) {
+          const editingModalId = String((document.getElementById('printer-edit-id') || {}).value || '');
+          const editingManualId = String((document.getElementById('settings-manual-printer-edit-id') || {}).value || '');
+          if (editingModalId === externalId || editingManualId === externalId) {
             clearPrinterEditForm();
           }
         } catch (err) {
@@ -4778,7 +4945,7 @@
     });
   }
 
-  document.getElementById('settings-branch-save').addEventListener('click', async () => {  document.getElementById('settings-branch-save').addEventListener('click', async () => {
+  document.getElementById('settings-branch-save').addEventListener('click', async () => {
     const errEl = document.getElementById('settings-branch-err');
     errEl.textContent = '';
     const v = document.getElementById('settings-branch').value.trim();

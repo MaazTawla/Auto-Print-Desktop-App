@@ -925,7 +925,8 @@ function createStationPrintingController(deps = {}) {
 
   /**
    * Upsert a managed printer. When replaceExternalId differs from the new
-   * external_id (LAN host/port edit), drop the old mapping first.
+   * external_id (LAN host/port edit), migrate aliases / server_id and reject
+   * collisions with another printer's eid (M1/M2).
    */
   function upsertManagedPrinter(printer, opts = {}) {
     const replaceId = String(opts.replaceExternalId || "").trim();
@@ -933,7 +934,14 @@ function createStationPrintingController(deps = {}) {
     const externalId = String(rowIn.external_id || rowIn.externalId || "").trim();
     if (!externalId) return { ok: false, error: "Missing printer external_id." };
     if (replaceId && replaceId.toLowerCase() !== externalId.toLowerCase()) {
-      printers.remove(replaceId);
+      const replaced = printers.replaceExternalId(replaceId, {
+        ...rowIn,
+        external_id: externalId,
+      });
+      if (!replaced.ok) return replaced;
+      persistHostFlags();
+      onStateChange(publicHostState());
+      return replaced;
     }
     const saved = printers.upsert({
       ...rowIn,

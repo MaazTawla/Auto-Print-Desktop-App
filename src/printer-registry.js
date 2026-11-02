@@ -15,9 +15,54 @@ function normalizeExternalId(raw) {
   return String(raw || "").trim();
 }
 
+function normalizeAliasKey(raw) {
+  return normalizeExternalId(raw).toLowerCase();
+}
+
+/** Record from→to and rewrite any aliases that pointed at from. */
+function migrateEidAlias(existing, from, to) {
+  const src = normalizeExternalId(from);
+  const dst = normalizeExternalId(to);
+  if (!src || !dst || src.toLowerCase() === dst.toLowerCase()) {
+    return { ...(existing || {}) };
+  }
+  const out = {};
+  const map = existing && typeof existing === "object" ? existing : {};
+  for (const [k, v] of Object.entries(map)) {
+    const key = normalizeAliasKey(k);
+    let value = normalizeExternalId(v);
+    if (!key || !value) continue;
+    if (value.toLowerCase() === src.toLowerCase()) value = dst;
+    if (key === value.toLowerCase()) continue;
+    out[key] = value;
+  }
+  out[normalizeAliasKey(src)] = dst;
+  return out;
+}
+
+function resolveEidAlias(externalId, aliases) {
+  let cur = normalizeExternalId(externalId);
+  if (!cur) return cur;
+  const map = aliases && typeof aliases === "object" ? aliases : {};
+  const seen = new Set();
+  while (true) {
+    const key = cur.toLowerCase();
+    if (seen.has(key)) return cur;
+    seen.add(key);
+    const next = normalizeExternalId(map[key]);
+    if (!next || next.toLowerCase() === cur.toLowerCase()) return cur;
+    cur = next;
+  }
+}
+
 function createPrinterRegistry(initial = {}) {
   /** @type {Map<string, object>} */
   const byExternalId = new Map();
+  /** @type {Record<string, string>} old eid → new eid */
+  let eidAliases =
+    initial.eidAliases && typeof initial.eidAliases === "object"
+      ? { ...initial.eidAliases }
+      : {};
   let defaultExternalId =
     initial.defaultExternalId != null
       ? normalizeExternalId(initial.defaultExternalId)
@@ -240,7 +285,11 @@ function createPrinterRegistry(initial = {}) {
         ? normalizeExternalId(msg.printer_external_id)
         : "";
     if (externalId) {
-      let found = byExternalId.get(externalId);
+      const resolved = resolveEidAlias(externalId, eidAliases);
+      let found = byExternalId.get(resolved) || byExternalId.get(externalId);
+      if (!found && !/^win:/i.test(resolved)) {
+        found = byExternalId.get(windowsPrinterExternalId(resolved));
+      }
       if (!found && !/^win:/i.test(externalId)) {
         found = byExternalId.get(windowsPrinterExternalId(externalId));
       }
@@ -283,16 +332,66 @@ function createPrinterRegistry(initial = {}) {
     return {
       defaultExternalId,
       printers: list(),
+      eidAliases: { ...eidAliases },
     };
   }
 
   function hydrate(data) {
     byExternalId.clear();
     defaultExternalId = "";
+    eidAliases = {};
     if (!data || typeof data !== "object") return;
     const printers = Array.isArray(data.printers) ? data.printers : [];
     for (const p of printers) upsert(p);
     if (data.defaultExternalId) setDefault(data.defaultExternalId);
+    if (data.eidAliases && typeof data.eidAliases === "object") {
+      eidAliases = { ...data.eidAliases };
+    }
+  }
+
+  function getEidAliases() {
+    return { ...eidAliases };
+  }
+
+  function setEidAliases(next) {
+    eidAliases = next && typeof next === "object" ? { ...next } : {};
+    return getEidAliases();
+  }
+
+  /**
+   * Replace old eid with new printer row. Rejects when new eid already belongs
+   * to a different printer. Migrates aliases and carries server_id.
+   */
+  function replaceExternalId(oldExternalId, printer) {
+    const prev = normalizeExternalId(oldExternalId);
+    const rowIn = printer && typeof printer === "object" ? printer : {};
+    const nextId = normalizeExternalId(
+      rowIn.external_id || rowIn.externalId || ""
+    );
+    if (!nextId) return { ok: false, error: "Missing printer external_id." };
+    if (prev && prev.toLowerCase() !== nextId.toLowerCase()) {
+      const collision = byExternalId.get(nextId);
+      if (collision) {
+        const host =
+          collision.ip_address && collision.port != null
+            ? `${collision.ip_address}:${collision.port}`
+            : nextId;
+        return {
+          ok: false,
+          error: `Printer already exists at ${host}`,
+          code: "EID_COLLISION",
+          existing: collision,
+        };
+      }
+      const oldRow = byExternalId.get(prev);
+      if (oldRow && (rowIn.server_id == null && rowIn.id == null)) {
+        rowIn.server_id = oldRow.server_id;
+      }
+      remove(prev);
+      eidAliases = migrateEidAlias(eidAliases, prev, nextId);
+    }
+    const saved = upsert({ ...rowIn, external_id: nextId });
+    return { ok: true, printer: saved, aliases: getEidAliases() };
   }
 
   return {
@@ -301,6 +400,7 @@ function createPrinterRegistry(initial = {}) {
     getByServerId,
     upsert,
     remove,
+    replaceExternalId,
     applyServerSync,
     syncFromWindowsList,
     setDefault,
@@ -309,6 +409,8 @@ function createPrinterRegistry(initial = {}) {
     toSyncPayload,
     serialize,
     hydrate,
+    getEidAliases,
+    setEidAliases,
   };
 }
 
@@ -344,4 +446,9 @@ function mapWindowsStatus(p) {
   return { status: "online", status_detail: null };
 }
 
-module.exports = { createPrinterRegistry, normalizeExternalId };
+module.exports = {
+  createPrinterRegistry,
+  normalizeExternalId,
+  migrateEidAlias,
+  resolveEidAlias,
+};
