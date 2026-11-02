@@ -719,6 +719,116 @@ describe("station-printing controller", () => {
     assert.equal(statusCalls, after, "unchanged status must not re-POST");
   });
 
+  it("failed status push retries then commits fingerprint; no resend after success", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    let statusCalls = 0;
+    let failLeft = 2;
+    const timers = [];
+    const ctrl = createStationPrintingController({
+      ...store,
+      log: () => {},
+      sleep: async () => {},
+      setTimeout: (fn) => {
+        timers.push(fn);
+        return 1;
+      },
+      clearTimeout: () => {},
+      request: async (cfg) => {
+        const url = String(cfg.url || "");
+        if (url.includes("/printers/") && url.includes("/status")) {
+          statusCalls += 1;
+          if (failLeft > 0) {
+            failLeft -= 1;
+            return {
+              status: 500,
+              data: { error: { code: "SERVER", message: "boom" } },
+              headers: {},
+            };
+          }
+          return { status: 200, data: { ok: true }, headers: {} };
+        }
+        return { status: 200, data: {}, headers: {} };
+      },
+    });
+    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
+    const list = ctrl.printers.list();
+    const eid = list[0].external_id;
+    ctrl.printers.upsert({
+      ...list[0],
+      external_id: eid,
+      status: "error",
+      status_detail: "Out of paper",
+    });
+    const first = await ctrl.pushPrinterStatusesIfChanged();
+    assert.equal(first.ok, false);
+    assert.equal(first.committed, false);
+    assert.ok(statusCalls >= 1);
+    // Fingerprint must NOT be stored — second call retries
+    const second = await ctrl.pushPrinterStatusesIfChanged();
+    assert.equal(second.ok, false);
+    assert.ok(statusCalls >= 2);
+    const third = await ctrl.pushPrinterStatusesIfChanged();
+    assert.equal(third.ok, true);
+    assert.equal(third.committed, true);
+    const after = statusCalls;
+    const fourth = await ctrl.pushPrinterStatusesIfChanged();
+    assert.equal(fourth.unchanged, true);
+    assert.equal(statusCalls, after, "no resend after successful commit");
+  });
+
+  it("persistent 5xx status push does not flood logs", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+    });
+    const logs = [];
+    let statusCalls = 0;
+    const ctrl = createStationPrintingController({
+      ...store,
+      log: (msg) => logs.push(String(msg)),
+      sleep: async () => {},
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      request: async (cfg) => {
+        const url = String(cfg.url || "");
+        if (url.includes("/status")) {
+          statusCalls += 1;
+          return {
+            status: 500,
+            data: { error: { code: "SERVER", message: "boom" } },
+            headers: {},
+          };
+        }
+        return { status: 200, data: {}, headers: {} };
+      },
+    });
+    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
+    const list = ctrl.printers.list();
+    ctrl.printers.upsert({
+      ...list[0],
+      external_id: list[0].external_id,
+      status: "offline",
+    });
+    for (let i = 0; i < 9; i++) {
+      await ctrl.pushPrinterStatusesIfChanged();
+    }
+    assert.ok(statusCalls >= 9);
+    const failLogs = logs.filter((m) => m.includes("Printer status push failed"));
+    // Throttled: 1st, 3rd, 6th, 9th... << 9
+    assert.ok(failLogs.length < statusCalls, `logs=${failLogs.length} calls=${statusCalls}`);
+    assert.ok(failLogs.length <= 4, `expected <=4 throttled logs, got ${failLogs.length}`);
+    assert.equal(
+      (store.readConfig().last_printer_status_fingerprint || ""),
+      "",
+      "fingerprint must stay unset while failing"
+    );
+  });
+
   it("failed heartbeat recovers without flooding logs", async () => {
     const store = memoryStore({
       agent_api_base: "https://api.example.com",

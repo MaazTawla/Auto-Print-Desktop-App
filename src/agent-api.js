@@ -23,6 +23,7 @@ const {
   resolveApiUrl,
   ERROR_CODES,
 } = require("./agent-contract");
+const { parseRetryAfterMs } = require("./agent-http-retry-policy");
 
 function createAgentApi(options = {}) {
   let apiBase = String(options.apiBase || "").trim();
@@ -121,7 +122,7 @@ function createAgentApi(options = {}) {
     const body = buildHeartbeatRequest(fields);
     const callOpts = {};
     if (fields && fields.timeout != null) callOpts.timeout = fields.timeout;
-    const { status, data } = await call(
+    const { status, data, headers } = await call(
       "POST",
       ENDPOINTS.heartbeat,
       body,
@@ -133,6 +134,7 @@ function createAgentApi(options = {}) {
         status,
         authError: true,
         error: { code: "UNAUTHORIZED", message: "Agent token rejected" },
+        headers,
       };
     }
     // v1.4 M5: heartbeat printer upsert can return 409 SYNC_CONFLICT (same as printers/sync)
@@ -162,6 +164,10 @@ function createAgentApi(options = {}) {
             `Heartbeat failed (${status})`,
         },
         code: parsed.code || "HEARTBEAT_FAILED",
+        headers,
+        retryAfterMs: parseRetryAfterMs(
+          headers && (headers["retry-after"] || headers["Retry-After"])
+        ),
       };
     }
     return { ok: true, status, ...parseHeartbeatResponse(data) };
@@ -240,10 +246,13 @@ function createAgentApi(options = {}) {
 
   async function ackJob(jobId, opts) {
     const body = buildAckRequest(opts || {});
-    const { status, data } = await call(
+    const { status, data, headers } = await call(
       "POST",
       ENDPOINTS.jobAck(jobId),
       body
+    );
+    const retryAfterMs = parseRetryAfterMs(
+      headers && (headers["retry-after"] || headers["Retry-After"])
     );
     const parsed = parseAckResponse(data, status);
     if (!parsed.ok) {
@@ -255,9 +264,11 @@ function createAgentApi(options = {}) {
         code: parsed.error.code,
         message: parsed.error.message,
         data,
+        retryAfterMs,
+        headers,
       };
     }
-    return { ok: true, status, ...parsed };
+    return { ok: true, status, ...parsed, retryAfterMs };
   }
 
   async function reportPrinterStatus(printerId, payload) {

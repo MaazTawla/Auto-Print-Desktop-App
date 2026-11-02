@@ -32,6 +32,14 @@ const {
   shouldLogHeartbeatFailure,
   heartbeatFailureRetryMs,
 } = require("./printer-list-sync-policy");
+const {
+  isRetryable: httpIsRetryable,
+  parseRetryAfterMs,
+  statusPushRetryMs,
+  shouldLogStatusPushFailure,
+  shouldCommitStatusFingerprint,
+  STATUS_PUSH_MAX_RETRY_MS,
+} = require("./agent-http-retry-policy");
 
 function createStationPrintingController(deps = {}) {
   const readConfig = deps.readConfig || (() => ({}));
@@ -588,6 +596,10 @@ function createStationPrintingController(deps = {}) {
    */
   let livenessInFlight = false;
   let consecutiveHbFailures = 0;
+  let consecutiveStatusPushFailures = 0;
+  let statusPushRetryTimer = null;
+  const scheduleTimer = deps.setTimeout || setTimeout;
+  const clearTimer = deps.clearTimeout || clearTimeout;
 
   function isLivenessInFlight() {
     return livenessInFlight;
@@ -650,6 +662,20 @@ function createStationPrintingController(deps = {}) {
         } catch (_) {}
       }
       onStateChange(publicHostState());
+      const status = live && live.status != null ? Number(live.status) : null;
+      // Accelerated retry only for retryable (5xx / 408 / 429 / network).
+      let retrySoonMs = null;
+      if (httpIsRetryable(status) || status == null) {
+        retrySoonMs = heartbeatFailureRetryMs(consecutiveHbFailures);
+        if (status === 429) {
+          const ra = parseRetryAfterMs(
+            live &&
+              live.headers &&
+              (live.headers["retry-after"] || live.headers["Retry-After"])
+          );
+          if (ra != null) retrySoonMs = Math.max(retrySoonMs, ra);
+        }
+      }
       return {
         ok: false,
         error:
@@ -661,7 +687,8 @@ function createStationPrintingController(deps = {}) {
         retriesExhausted: Boolean(live && live.retriesExhausted),
         shouldConsume: consumeEnabled,
         consecutiveHbFailures,
-        retrySoonMs: heartbeatFailureRetryMs(consecutiveHbFailures),
+        retrySoonMs,
+        status,
       };
     }
     if (consecutiveHbFailures > 0) {
@@ -767,8 +794,16 @@ function createStationPrintingController(deps = {}) {
 
     // Printer-list config sync is NOT on the heartbeat cadence.
     // Host online status is kept by the ungated printers:[] liveness ping above.
-    // List sync runs on connect / add-edit-remove (hash-skipped). Status uses
-    // pushPrinterStatusesIfChanged().
+    // List sync runs on connect / add-edit-remove (hash-skipped).
+    // Per-printer status: push when fingerprint differs; commit only on success.
+    let statusPush = null;
+    try {
+      statusPush = await pushPrinterStatusesIfChanged();
+    } catch (err) {
+      try {
+        log(`Printer status push error: ${err.message || err}`, "⚠️");
+      } catch (_) {}
+    }
     const printerUpsert = null;
 
     return {
@@ -782,6 +817,7 @@ function createStationPrintingController(deps = {}) {
       rabbitChanged: Boolean(rabbitChanged),
       waitingForRabbitCreds: waitingForCreds,
       printerUpsert,
+      statusPush,
       syncConflict: false,
       retriesExhausted: false,
     };
@@ -913,8 +949,22 @@ function createStationPrintingController(deps = {}) {
     );
   }
 
+  function scheduleStatusPushRetry(delayMs) {
+    if (statusPushRetryTimer) return;
+    const wait = Math.min(
+      STATUS_PUSH_MAX_RETRY_MS,
+      Math.max(250, Number(delayMs) || 5000)
+    );
+    statusPushRetryTimer = scheduleTimer(() => {
+      statusPushRetryTimer = null;
+      pushPrinterStatusesIfChanged().catch(() => {});
+    }, wait);
+  }
+
   /**
-   * Push per-printer status immediately when the local status fingerprint changes.
+   * Push per-printer status when the local fingerprint differs from the last
+   * *successful* push. Fingerprint commits only after every POST succeeds; on
+   * failure retry on next heartbeat or a short backoff (≤20s).
    */
   async function pushPrinterStatusesIfChanged() {
     const cfg = readConfig();
@@ -926,9 +976,12 @@ function createStationPrintingController(deps = {}) {
       return { ok: true, skipped: true, unchanged: true };
     }
     const results = [];
+    let allOk = true;
+    let attempted = false;
     for (const p of payload) {
       const pathId = p.id || p.external_id;
       if (!pathId) continue;
+      attempted = true;
       try {
         const r = await api.reportPrinterStatus(pathId, {
           status: p.status || "online",
@@ -945,25 +998,62 @@ function createStationPrintingController(deps = {}) {
             );
           } catch (_) {}
         } else {
+          allOk = false;
+          consecutiveStatusPushFailures += 1;
+          const st = r && r.status != null ? Number(r.status) : null;
+          if (
+            shouldLogStatusPushFailure(consecutiveStatusPushFailures) ||
+            (st != null && !httpIsRetryable(st) && st >= 400 && st < 500)
+          ) {
+            try {
+              log(
+                `Printer status push failed for ${p.external_id}: ` +
+                  ((r && r.error && r.error.message) || (r && r.error) || "error"),
+                "⚠️"
+              );
+            } catch (_) {}
+          }
+        }
+      } catch (err) {
+        allOk = false;
+        consecutiveStatusPushFailures += 1;
+        if (shouldLogStatusPushFailure(consecutiveStatusPushFailures)) {
           try {
             log(
-              `Printer status push failed for ${p.external_id}: ` +
-                ((r && r.error && r.error.message) || (r && r.error) || "error"),
+              `Printer status push failed for ${p.external_id}: ${err.message || err}`,
               "⚠️"
             );
           } catch (_) {}
         }
-      } catch (err) {
+        results.push({ ok: false, error: err });
+      }
+    }
+    if (shouldCommitStatusFingerprint(allOk, attempted)) {
+      if (consecutiveStatusPushFailures > 0) {
         try {
           log(
-            `Printer status push failed for ${p.external_id}: ${err.message || err}`,
-            "⚠️"
+            `Printer status push recovered after ${consecutiveStatusPushFailures} failure(s).`,
+            "✅"
           );
         } catch (_) {}
       }
+      consecutiveStatusPushFailures = 0;
+      if (statusPushRetryTimer) {
+        clearTimer(statusPushRetryTimer);
+        statusPushRetryTimer = null;
+      }
+      writeConfig({ last_printer_status_fingerprint: fp });
+      return { ok: true, results, committed: true };
     }
-    writeConfig({ last_printer_status_fingerprint: fp });
-    return { ok: true, results };
+    const retrySoonMs = statusPushRetryMs(consecutiveStatusPushFailures);
+    scheduleStatusPushRetry(retrySoonMs);
+    return {
+      ok: false,
+      results,
+      committed: false,
+      consecutiveFailures: consecutiveStatusPushFailures,
+      retrySoonMs,
+    };
   }
 
   function syncWindowsPrinters(windowsList) {

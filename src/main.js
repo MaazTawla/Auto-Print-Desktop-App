@@ -201,18 +201,19 @@ async function flushAckOutbox() {
           (result && result.message) ||
           (result && result.error && result.error.message) ||
           null,
+        retryAfterMs: result && result.retryAfterMs,
       });
       if (outcome && outcome.removed) {
         flushed += 1;
-        if (outcome.exhausted) {
+        if (outcome.exhausted || outcome.deadLettered) {
           log(
-            `Server ack outbox gave up job_id=${entry.jobId} status=${entry.status} ` +
+            `Server ack outbox dead-lettered job_id=${entry.jobId} status=${entry.status} ` +
               `after ${outcome.entry.attempts} attempts ` +
               `(last HTTP ${outcome.entry.lastStatus != null ? outcome.entry.lastStatus : "n/a"}: ` +
-              `${outcome.entry.lastError || "error"}) — dropped to stop unbounded retries.`,
+              `${outcome.entry.lastError || "error"}) — slot released.`,
             "⚠️"
           );
-        } else {
+        } else if (outcome.ok) {
           log(
             `Server ack outbox delivered job_id=${entry.jobId} status=${entry.status}`,
             "✅"
@@ -2908,8 +2909,13 @@ async function runAgentHeartbeat() {
         ? Number(result.consecutiveHbFailures)
         : agentHeartbeatConsecutiveFailures;
     agentHeartbeatConsecutiveFailures = n;
-    const delay = heartbeatFailureRetryMs(n);
-    scheduleAgentHeartbeatSoon(delay);
+    // retrySoonMs is null for terminal 4xx — wait for the normal interval.
+    if (result.retrySoonMs != null && Number(result.retrySoonMs) > 0) {
+      scheduleAgentHeartbeatSoon(Number(result.retrySoonMs));
+    } else if (result.retrySoonMs === undefined) {
+      // Older path / missing classification — keep prior accelerated retry.
+      scheduleAgentHeartbeatSoon(heartbeatFailureRetryMs(n));
+    }
     return;
   }
   agentHeartbeatConsecutiveFailures = 0;

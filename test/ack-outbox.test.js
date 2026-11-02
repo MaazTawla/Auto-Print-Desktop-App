@@ -15,6 +15,7 @@ const {
   shouldLogRetryFailure,
   MAX_ATTEMPTS,
   MAX_AGE_MS,
+  DEAD_LETTER_NAME,
 } = require("../src/ack-outbox");
 
 describe("ack-outbox", () => {
@@ -60,7 +61,10 @@ describe("ack-outbox", () => {
     assert.equal(isTerminalAckStatus(404), true);
     assert.equal(isTerminalAckStatus(422), true);
     assert.equal(isTerminalAckStatus(429), false);
-    assert.equal(isTerminalAckStatus(401), false);
+    assert.equal(isTerminalAckStatus(408), false);
+    assert.equal(isTerminalAckStatus(401), true);
+    assert.equal(isTerminalAckStatus(403), true);
+    assert.equal(isTerminalAckStatus(400), true);
     assert.equal(isTerminalAckStatus(503), false);
     assert.equal(nextBackoffMs(1, 0.5), 1000);
     assert.equal(nextBackoffMs(99, 0.5), 120000);
@@ -84,11 +88,91 @@ describe("ack-outbox", () => {
     }
     assert.ok(last);
     assert.equal(last.exhausted, true);
+    assert.equal(last.deadLettered, true);
     assert.equal(last.removed, true);
     assert.equal(last.ok, false);
     assert.equal(last.entry.attempts, MAX_ATTEMPTS);
     assert.equal(box.has("persist-500"), false);
     assert.equal(box.size(), 0);
+  });
+
+  it("400 and 404 are terminal; 408 retries; 429 honors Retry-After", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ack-cls-"));
+    const filePath = path.join(dir, "ack-outbox.json");
+    const box = createAckOutbox({ filePath });
+
+    box.enqueue({ jobId: "bad", status: "failed", reason: "x" });
+    const r400 = box.markAttempt("bad", { ok: false, status: 400, error: "bad" });
+    assert.equal(r400.removed, true);
+    assert.equal(r400.ok, false);
+    assert.equal(box.has("bad"), false);
+
+    box.enqueue({ jobId: "gone", status: "printed" });
+    const r404 = box.markAttempt("gone", { ok: false, status: 404, error: "nf" });
+    assert.equal(r404.removed, true);
+    assert.equal(box.has("gone"), false);
+
+    box.enqueue({ jobId: "to", status: "printed" });
+    const r408 = box.markAttempt("to", {
+      ok: false,
+      status: 408,
+      error: "timeout",
+      nowMs: 1_000_000,
+      jitter01: 0.5,
+    });
+    assert.equal(r408.removed, false);
+    assert.ok(box.get("to").nextAttemptAt > 1_000_000);
+
+    box.enqueue({ jobId: "rl", status: "printed" });
+    const r429 = box.markAttempt("rl", {
+      ok: false,
+      status: 429,
+      error: "slow",
+      nowMs: 2_000_000,
+      jitter01: 0.5,
+      retryAfterMs: 30_000,
+    });
+    assert.equal(r429.removed, false);
+    // backoff for attempt 1 with jitter 0.5 is 1000; Retry-After 30s wins
+    assert.equal(box.get("rl").nextAttemptAt, 2_000_000 + 30_000);
+  });
+
+  it("network error (null status) retries under the same budget", () => {
+    const box = createAckOutbox({});
+    box.enqueue({ jobId: "net", status: "printed" });
+    const r = box.markAttempt("net", {
+      ok: false,
+      status: null,
+      error: "ECONNRESET",
+      jitter01: 0.5,
+    });
+    assert.equal(r.removed, false);
+    assert.equal(box.has("net"), true);
+  });
+
+  it("persistent 500 dead-letters and releases the outbox slot", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ack-dl-"));
+    const filePath = path.join(dir, "ack-outbox.json");
+    const box = createAckOutbox({ filePath, deadLetterKeep: 10 });
+    box.enqueue({ jobId: "poison", status: "printed" });
+    let last = null;
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      last = box.markAttempt("poison", {
+        ok: false,
+        status: 500,
+        error: "boom",
+        nowMs: Date.now(),
+        jitter01: 0.5,
+      });
+      if (last && last.exhausted) break;
+    }
+    assert.equal(last.deadLettered, true);
+    assert.equal(box.size(), 0);
+    const dead = box.listDeadLetters();
+    assert.ok(dead.length >= 1);
+    assert.equal(dead[dead.length - 1].jobId, "poison");
+    assert.equal(dead[dead.length - 1].cause, "MAX_ATTEMPTS");
+    assert.ok(fs.existsSync(path.join(dir, DEAD_LETTER_NAME)));
   });
 
   it("stops when MAX_AGE_MS exceeded", () => {

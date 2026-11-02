@@ -1,9 +1,10 @@
 /**
  * Durable outbox for server job acks (printed / failed).
  * Mark job processed first (caller), enqueue here, Rabbit-ack after durable write.
- * Flush with jittered backoff until 2xx, terminal 4xx (404 = job not found), or the
- * retry budget (MAX_ATTEMPTS / MAX_AGE_MS) is exhausted — a persistent 5xx must not
- * retry forever. Server ack is idempotent per job_id.
+ * Flush with jittered backoff until 2xx, terminal 4xx (every 4xx except 408/429),
+ * or the retry budget (MAX_ATTEMPTS / MAX_AGE_MS) is exhausted. Exhausted entries
+ * are dead-lettered (ack-outbox.dead.json for Maintenance) and removed so they
+ * release their outbox slot. Server ack is idempotent per job_id.
  *
  * Corrupt outbox JSON: quarantine to outbox.corrupt-<ts>.json, surface warning,
  * start a fresh empty outbox — never silently drop without a trace.
@@ -13,6 +14,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  isTerminal: httpIsTerminal,
+  isSuccess: httpIsSuccess,
+  delayMs: httpDelayMs,
+  parseRetryAfterMs,
+} = require("./agent-http-retry-policy");
 
 const DEFAULT_MAX = 2000;
 const DEFAULT_CORRUPT_KEEP = 10;
@@ -21,21 +28,19 @@ const BACKOFF_MS = [1000, 5000, 15000, 30000, 60000, 120000];
 const MAX_ATTEMPTS = 30;
 /** Absolute age ceiling so skipped_no_token cannot loop forever. */
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_DEAD_LETTER_KEEP = 50;
+const DEAD_LETTER_NAME = "ack-outbox.dead.json";
 const CORRUPT_NAME_RE = /^outbox\.corrupt-(\d+)\.json$/;
 
 function isTerminalAckStatus(status) {
   if (status == null || !Number.isFinite(Number(status))) return false;
   const s = Number(status);
   if (s >= 200 && s < 300) return true; // success also terminal for remove
-  if (s === 408 || s === 429) return false;
-  if (s === 401 || s === 403) return false; // retry after re-pair
-  if (s >= 400 && s < 500) return true;
-  return false;
+  return httpIsTerminal(s);
 }
 
 function isSuccessAckStatus(status) {
-  const s = Number(status);
-  return Number.isFinite(s) && s >= 200 && s < 300;
+  return httpIsSuccess(status);
 }
 
 function nextBackoffMs(attempts, jitter01 = 0.5) {
@@ -100,6 +105,8 @@ function pruneCorruptQuarantines(dir, keep = DEFAULT_CORRUPT_KEEP) {
 function createAckOutbox(opts = {}) {
   const filePath = opts.filePath;
   const maxEntries = opts.maxEntries != null ? Number(opts.maxEntries) : DEFAULT_MAX;
+  const deadLetterKeep =
+    opts.deadLetterKeep != null ? Number(opts.deadLetterKeep) : DEFAULT_DEAD_LETTER_KEEP;
   const onCorrupt = typeof opts.onCorrupt === "function" ? opts.onCorrupt : null;
   /** @type {Map<string, object>} keyed by jobId (one pending ack per job) */
   let map = new Map();
@@ -246,7 +253,54 @@ function createAckOutbox(opts = {}) {
     return [...map.values()].sort((a, b) => a.createdAt - b.createdAt);
   }
 
-  function markAttempt(jobId, { ok, status, error, nowMs, jitter01 } = {}) {
+  function deadLetterPath() {
+    if (!filePath) return null;
+    return path.join(path.dirname(filePath), DEAD_LETTER_NAME);
+  }
+
+  function loadDeadLetters() {
+    const p = deadLetterPath();
+    if (!p || !fs.existsSync(p)) return [];
+    try {
+      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+      return Array.isArray(raw.entries) ? raw.entries : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function appendDeadLetter(entry, cause, nowMs) {
+    const p = deadLetterPath();
+    if (!p) return false;
+    try {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      const existing = loadDeadLetters();
+      existing.push({
+        jobId: entry.jobId,
+        status: entry.status,
+        reason: entry.reason != null ? entry.reason : null,
+        printerExternalId: entry.printerExternalId != null ? entry.printerExternalId : null,
+        attempts: entry.attempts || 0,
+        lastStatus: entry.lastStatus != null ? entry.lastStatus : null,
+        lastError: entry.lastError != null ? entry.lastError : null,
+        createdAt: entry.createdAt || 0,
+        deadLetteredAt: nowMs,
+        cause: cause || "RETRY_BUDGET",
+      });
+      const keep = Math.max(1, deadLetterKeep || DEFAULT_DEAD_LETTER_KEEP);
+      const trimmed = existing.slice(-keep);
+      fs.writeFileSync(p, JSON.stringify({ entries: trimmed }, null, 0), "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function listDeadLetters() {
+    return loadDeadLetters();
+  }
+
+  function markAttempt(jobId, { ok, status, error, nowMs, jitter01, retryAfterMs } = {}) {
     const id = String(jobId).trim();
     const entry = map.get(id);
     if (!entry) return null;
@@ -260,21 +314,37 @@ function createAckOutbox(opts = {}) {
         terminal: true,
         ok: Boolean(ok || isSuccessAckStatus(status)),
         exhausted: false,
+        deadLettered: false,
       };
     }
     entry.attempts = (entry.attempts || 0) + 1;
     entry.lastStatus = status != null ? Number(status) : null;
     entry.lastError = error != null ? String(error) : null;
-    entry.nextAttemptAt =
-      now + nextBackoffMs(entry.attempts, jitter01 != null ? jitter01 : Math.random());
+    const j = jitter01 != null ? jitter01 : Math.random();
+    const delay = httpDelayMs(entry.attempts, {
+      jitter01: j,
+      retryAfterMs: retryAfterMs != null ? Number(retryAfterMs) : null,
+      backoffMs: nextBackoffMs,
+    });
+    entry.nextAttemptAt = now + delay;
     if (isRetryBudgetExhausted(entry.attempts, entry.createdAt, now)) {
+      const cause =
+        entry.attempts >= MAX_ATTEMPTS ? "MAX_ATTEMPTS" : "MAX_AGE";
+      const wrote = appendDeadLetter(entry, cause, now);
       map.delete(id);
       persist();
-      return { removed: true, entry, terminal: true, ok: false, exhausted: true };
+      return {
+        removed: true,
+        entry,
+        terminal: true,
+        ok: false,
+        exhausted: true,
+        deadLettered: Boolean(wrote || true),
+      };
     }
     map.set(id, entry);
     persist();
-    return { removed: false, entry, terminal: false, ok: false, exhausted: false };
+    return { removed: false, entry, terminal: false, ok: false, exhausted: false, deadLettered: false };
   }
 
   function size() {
@@ -305,6 +375,8 @@ function createAckOutbox(opts = {}) {
     BACKOFF_MS,
     MAX_ATTEMPTS,
     MAX_AGE_MS,
+    listDeadLetters,
+    deadLetterPath,
   };
 }
 
@@ -316,9 +388,12 @@ module.exports = {
   nextBackoffMs,
   isRetryBudgetExhausted,
   shouldLogRetryFailure,
+  parseRetryAfterMs,
   BACKOFF_MS,
   MAX_ATTEMPTS,
   MAX_AGE_MS,
   DEFAULT_MAX,
   DEFAULT_CORRUPT_KEEP,
+  DEFAULT_DEAD_LETTER_KEEP,
+  DEAD_LETTER_NAME,
 };
