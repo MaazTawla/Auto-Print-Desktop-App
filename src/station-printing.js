@@ -25,6 +25,12 @@ const {
   normalizeRabbitConfig,
   normalizeAgentApiBase,
 } = require("./agent-contract");
+const {
+  configHash: printerListConfigHash,
+  statusFingerprint: printerStatusFingerprint,
+  shouldSkipUnchanged: shouldSkipPrinterListSync,
+  shouldLogHeartbeatFailure,
+} = require("./printer-list-sync-policy");
 
 function createStationPrintingController(deps = {}) {
   const readConfig = deps.readConfig || (() => ({}));
@@ -580,6 +586,7 @@ function createStationPrintingController(deps = {}) {
    *    Timeout/errors after liveness are caught and logged (no unhandled rejection).
    */
   let livenessInFlight = false;
+  let consecutiveHbFailures = 0;
 
   function isLivenessInFlight() {
     return livenessInFlight;
@@ -621,7 +628,9 @@ function createStationPrintingController(deps = {}) {
     lastHeartbeatAt = new Date().toISOString();
 
     if (!live || !live.ok) {
+      consecutiveHbFailures += 1;
       if (live && handleAuthFailure(live, "heartbeat_unauthorized")) {
+        consecutiveHbFailures = 0;
         return {
           ok: false,
           authError: true,
@@ -629,6 +638,15 @@ function createStationPrintingController(deps = {}) {
           error: lastRegisterError,
           shouldConsume: false,
         };
+      }
+      if (shouldLogHeartbeatFailure(consecutiveHbFailures)) {
+        try {
+          const msg =
+            (live && live.error && live.error.message) ||
+            (live && live.error) ||
+            "Heartbeat failed";
+          log(`Heartbeat liveness failed: ${msg}`, "⚠️");
+        } catch (_) {}
       }
       onStateChange(publicHostState());
       return {
@@ -642,6 +660,15 @@ function createStationPrintingController(deps = {}) {
         retriesExhausted: Boolean(live && live.retriesExhausted),
         shouldConsume: consumeEnabled,
       };
+    }
+    if (consecutiveHbFailures > 0) {
+      try {
+        log(
+          `Heartbeat recovered after ${consecutiveHbFailures} failure(s).`,
+          "✅"
+        );
+      } catch (_) {}
+      consecutiveHbFailures = 0;
     }
 
     const applied = policy.applyServerState({
@@ -735,62 +762,11 @@ function createStationPrintingController(deps = {}) {
     persistHostFlags();
     onStateChange(publicHostState());
 
-    // 2) Gated printer upsert — may wait behind sync; liveness already refreshed.
-    // r7 L2: catch timeout/errors so heartbeat() never rejects after a successful liveness.
-    let printerUpsert = null;
-    const payload = printers.toSyncPayload();
-    if (payload.length > 0) {
-      try {
-        printerUpsert = await withPrinterSyncSingleFlight(() =>
-          withSyncConflictRetries(
-            "Heartbeat printers",
-            async (_attempt, { timeoutMs }) => {
-              const r = await api.heartbeat({
-                appId,
-                branchId: bid,
-                printers: payload,
-                timeout: timeoutMs,
-                rabbitVersion: (() => {
-                  const c = readConfig();
-                  return rabbitVersionToSendOnHeartbeat(
-                    c,
-                    Boolean(c.is_print_host)
-                  );
-                })(),
-              });
-              if (r && r.authError) {
-                handleAuthFailure(r, "heartbeat_unauthorized");
-              }
-              return r;
-            },
-            { budgetMs: PRINTER_SYNC_BUDGET_MS }
-          )
-        );
-      } catch (err) {
-        const msg =
-          (err && err.message != null && String(err.message)) ||
-          String(err || "printer upsert failed");
-        const code = err && err.code != null ? String(err.code) : "";
-        const timedOut =
-          code === "ECONNABORTED" ||
-          code === "ETIMEDOUT" ||
-          /timeout|timed\s*out|ECONNABORTED|ETIMEDOUT/i.test(msg);
-        try {
-          log(
-            `Heartbeat printer upsert failed after liveness: ${msg}`,
-            "⚠️"
-          );
-        } catch (_) {}
-        printerUpsert = {
-          ok: false,
-          timedOut,
-          error: {
-            code: timedOut ? "TIMEOUT" : "UPSERT_FAILED",
-            message: msg,
-          },
-        };
-      }
-    }
+    // Printer-list config sync is NOT on the heartbeat cadence.
+    // Host online status is kept by the ungated printers:[] liveness ping above.
+    // List sync runs on connect / add-edit-remove (hash-skipped). Status uses
+    // pushPrinterStatusesIfChanged().
+    const printerUpsert = null;
 
     return {
       ok: true,
@@ -803,8 +779,8 @@ function createStationPrintingController(deps = {}) {
       rabbitChanged: Boolean(rabbitChanged),
       waitingForRabbitCreds: waitingForCreds,
       printerUpsert,
-      syncConflict: Boolean(printerUpsert && printerUpsert.syncConflict),
-      retriesExhausted: Boolean(printerUpsert && printerUpsert.retriesExhausted),
+      syncConflict: false,
+      retriesExhausted: false,
     };
   }
 
@@ -868,15 +844,27 @@ function createStationPrintingController(deps = {}) {
    * On 409 SYNC_CONFLICT (v1.4), retry ~3 times with short jittered backoff,
    * then defer to the next poll/heartbeat. Not PRINT_HOST_ALREADY_CONFIGURED.
    */
-  async function syncPrintersToServer({ branchId } = {}) {
+  async function syncPrintersToServer({ branchId, force = false } = {}) {
     const cfg = readConfig();
     if (!api.getToken()) return { ok: false, skipped: true };
+    const payload = printers.toSyncPayload();
+    const hash = printerListConfigHash(payload);
+    const lastHash = cfg.last_printer_list_sync_hash || "";
+    if (
+      !force &&
+      shouldSkipPrinterListSync(hash, lastHash, {
+        forceEmpty: false,
+        pendingEmpty: Boolean(cfg.pending_empty_printer_sync),
+      })
+    ) {
+      return { ok: true, skipped: true, unchanged: true };
+    }
     return withPrinterSyncSingleFlight(() =>
       withSyncConflictRetries("Printers sync", async (_attempt, { timeoutMs }) => {
         const result = await api.syncPrinters({
           appId,
           branchId: branchId || cfg.branch_id,
-          printers: printers.toSyncPayload(),
+          printers: payload,
           timeout: timeoutMs,
         });
         if (handleAuthFailure(result, "sync_unauthorized")) {
@@ -895,10 +883,81 @@ function createStationPrintingController(deps = {}) {
             persistHostFlags();
             onStateChange(publicHostState());
           }
+          writeConfig({ last_printer_list_sync_hash: hash });
+          try {
+            log(
+              `Synced ${payload.length} printer(s) to server` +
+                (Array.isArray(result.printers) && result.printers.length
+                  ? ` (${result.printers.length} with server ids).`
+                  : "."),
+              "📡"
+            );
+          } catch (_) {}
+        } else {
+          try {
+            const msg =
+              (result && result.error && result.error.message) ||
+              (result && result.error) ||
+              "Printer sync failed";
+            log(`Printer sync failed: ${msg}`, "⚠️");
+          } catch (_) {}
         }
         return result;
       })
     );
+  }
+
+  /**
+   * Push per-printer status immediately when the local status fingerprint changes.
+   */
+  async function pushPrinterStatusesIfChanged() {
+    const cfg = readConfig();
+    if (!api.getToken()) return { ok: false, skipped: true };
+    const payload = printers.toSyncPayload();
+    if (!payload.length) return { ok: true, skipped: true };
+    const fp = printerStatusFingerprint(payload);
+    if (fp && fp === (cfg.last_printer_status_fingerprint || "")) {
+      return { ok: true, skipped: true, unchanged: true };
+    }
+    const results = [];
+    for (const p of payload) {
+      const pathId = p.id || p.external_id;
+      if (!pathId) continue;
+      try {
+        const r = await api.reportPrinterStatus(pathId, {
+          status: p.status || "online",
+          status_detail: p.status_detail || null,
+          external_id: p.external_id,
+        });
+        results.push(r);
+        if (r && r.ok) {
+          try {
+            log(
+              `Printer status ${p.external_id} → ${p.status || "online"}` +
+                (p.status_detail ? ` (${p.status_detail})` : ""),
+              "📡"
+            );
+          } catch (_) {}
+        } else {
+          try {
+            log(
+              `Printer status push failed for ${p.external_id}: ` +
+                ((r && r.error && r.error.message) || (r && r.error) || "error"),
+              "⚠️"
+            );
+          } catch (_) {}
+        }
+      } catch (err) {
+        try {
+          log(
+            `Printer status push failed for ${p.external_id}: ${err.message || err}`,
+            "⚠️"
+          );
+        } catch (_) {}
+      }
+    }
+    writeConfig({ last_printer_status_fingerprint: fp });
+    return { ok: true, results };
   }
 
   function syncWindowsPrinters(windowsList) {
@@ -1089,6 +1148,7 @@ function createStationPrintingController(deps = {}) {
     heartbeat,
     deregister,
     syncPrintersToServer,
+    pushPrinterStatusesIfChanged,
     isPrinterSyncInFlight,
     isLivenessInFlight,
     syncWindowsPrinters,

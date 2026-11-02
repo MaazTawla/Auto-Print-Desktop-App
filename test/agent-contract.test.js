@@ -43,6 +43,7 @@ describe("agent-contract v1.0", () => {
     assert.equal(ASSUMPTIONS.applyRabbitFromRegister, true);
     assert.equal(ASSUMPTIONS.pdfSha256MismatchFails, true);
     assert.equal(ASSUMPTIONS.pdfUrlRequiresBearer, true);
+    assert.equal(ASSUMPTIONS.pdfDelivery, "base64_then_url");
     assert.equal(ASSUMPTIONS.resumeViaHeartbeat, true);
     assert.equal(ASSUMPTIONS.appIdStableAcrossUpdates, true);
   });

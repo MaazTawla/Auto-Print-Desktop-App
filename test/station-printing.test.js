@@ -356,7 +356,7 @@ describe("station-printing controller", () => {
     assert.equal(ctrl.hostConflict.code, "PRINT_HOST_ALREADY_CONFIGURED");
   });
 
-  it("heartbeat printer upsert retries SYNC_CONFLICT then succeeds (same policy as printers/sync)", async () => {
+  it("heartbeat is liveness-only — no printer-list upsert on the 30s cadence", async () => {
     const store = memoryStore({
       agent_api_base: "https://api.example.com",
       agent_token: "tok",
@@ -366,7 +366,6 @@ describe("station-printing controller", () => {
     });
     let liveCalls = 0;
     let upsertCalls = 0;
-    const sleeps = [];
     const request = async (cfg) => {
       const url = String(cfg.url || "");
       const body = cfg.data || {};
@@ -381,13 +380,6 @@ describe("station-printing controller", () => {
           };
         }
         upsertCalls += 1;
-        if (upsertCalls < 3) {
-          return {
-            status: 409,
-            data: { error: { code: "SYNC_CONFLICT", message: "hb lock" } },
-            headers: {},
-          };
-        }
         return {
           status: 200,
           data: { is_print_host: true, host_epoch: 2, pending_job_count: 1 },
@@ -400,45 +392,44 @@ describe("station-printing controller", () => {
       ...store,
       request,
       log: () => {},
-      sleep: async (ms) => {
-        sleeps.push(ms);
-      },
+      sleep: async () => {},
     });
     ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 2 });
     ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
     const res = await ctrl.heartbeat({ branchId: "147" });
     assert.equal(res.ok, true);
     assert.equal(liveCalls, 1);
-    assert.equal(upsertCalls, 3);
-    assert.equal(sleeps.length, 2);
-    assert.ok(sleeps[0] >= 200);
+    assert.equal(upsertCalls, 0);
+    assert.equal(res.printerUpsert, null);
+    assert.equal(res.syncConflict, false);
   });
 
-  it("heartbeat liveness stays ok when printer upsert exhausts SYNC_CONFLICT (not host conflict)", async () => {
+  it("heartbeat continues while printer-list config is unchanged (hash skip on sync)", async () => {
     const store = memoryStore({
       agent_api_base: "https://api.example.com",
       agent_token: "tok",
       branch_id: "147",
+      is_print_host: true,
+      host_epoch: 1,
     });
     let liveCalls = 0;
-    let upsertCalls = 0;
+    let syncCalls = 0;
     const request = async (cfg) => {
       const url = String(cfg.url || "");
       const body = cfg.data || {};
       if (url.includes("/heartbeat")) {
-        const list = Array.isArray(body.printers) ? body.printers : [];
-        if (list.length === 0) {
-          liveCalls += 1;
-          return {
-            status: 200,
-            data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
-            headers: {},
-          };
-        }
-        upsertCalls += 1;
+        liveCalls += 1;
         return {
-          status: 409,
-          data: { error: { code: "SYNC_CONFLICT", message: "still" } },
+          status: 200,
+          data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+          headers: {},
+        };
+      }
+      if (url.includes("/printers/sync")) {
+        syncCalls += 1;
+        return {
+          status: 200,
+          data: { accepted: 1, printers: [{ id: 9, external_id: "win:Kitchen Printer 1" }] },
           headers: {},
         };
       }
@@ -451,15 +442,19 @@ describe("station-printing controller", () => {
       sleep: async () => {},
     });
     ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
-    const res = await ctrl.heartbeat({ branchId: "147" });
-    // Liveness already refreshed online — upsert conflict must not fail the tick.
-    assert.equal(res.ok, true);
-    assert.equal(res.syncConflict, true);
-    assert.equal(res.retriesExhausted, true);
-    assert.equal(liveCalls, 1);
-    assert.equal(upsertCalls, 3);
-    assert.equal(ctrl.hostConflict, null);
-    assert.ok(res.printerUpsert && res.printerUpsert.syncConflict);
+    const first = await ctrl.syncPrintersToServer({ branchId: "147" });
+    assert.equal(first.ok, true);
+    assert.equal(syncCalls, 1);
+    const second = await ctrl.syncPrintersToServer({ branchId: "147" });
+    assert.equal(second.ok, true);
+    assert.equal(second.unchanged, true);
+    assert.equal(syncCalls, 1, "unchanged hash must skip HTTP");
+    const hb1 = await ctrl.heartbeat({ branchId: "147" });
+    const hb2 = await ctrl.heartbeat({ branchId: "147" });
+    assert.equal(hb1.ok, true);
+    assert.equal(hb2.ok, true);
+    assert.equal(liveCalls, 2);
+    assert.equal(syncCalls, 1, "heartbeat must not trigger printers/sync");
   });
 
   it("single-flight: sync and heartbeat printer upsert never overlap", async () => {
@@ -682,110 +677,88 @@ describe("station-printing controller", () => {
     assert.equal(ctrl.isLivenessInFlight(), false);
   });
 
-  it("liveness can tick again while prior gated upsert still runs", async () => {
+  it("status fingerprint change is pushed immediately via printers/status", async () => {
     const store = memoryStore({
       agent_api_base: "https://api.example.com",
       agent_token: "tok",
       branch_id: "147",
     });
-    let liveCalls = 0;
-    let releaseUpsert;
-    const upsertHold = new Promise((r) => {
-      releaseUpsert = r;
-    });
-    let upsertStarted = false;
+    let statusCalls = 0;
+    const request = async (cfg) => {
+      const url = String(cfg.url || "");
+      if (url.includes("/printers/") && url.includes("/status")) {
+        statusCalls += 1;
+        return { status: 200, data: { ok: true }, headers: {} };
+      }
+      return { status: 200, data: {}, headers: {} };
+    };
     const ctrl = createStationPrintingController({
       ...store,
+      request,
       log: () => {},
       sleep: async () => {},
-      request: async (cfg) => {
-        const body = cfg.data || {};
-        const list = Array.isArray(body.printers) ? body.printers : [];
-        const url = String(cfg.url || "");
-        if (url.includes("/heartbeat") && list.length === 0) {
-          liveCalls += 1;
-          return {
-            status: 200,
-            data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
-            headers: {},
-          };
-        }
-        if (url.includes("/heartbeat") && list.length > 0) {
-          upsertStarted = true;
-          await upsertHold;
-          return {
-            status: 200,
-            data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
-            headers: {},
-          };
-        }
-        return { status: 200, data: {}, headers: {} };
-      },
     });
     ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
-    const first = ctrl.heartbeat({ branchId: "147" });
-    for (let i = 0; i < 40 && !upsertStarted; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    assert.ok(upsertStarted, "first heartbeat should be in gated upsert");
-    assert.equal(ctrl.isLivenessInFlight(), false);
-    // Do not await full second HB yet — its gated upsert queues behind first.
-    const secondP = ctrl.heartbeat({ branchId: "147" });
-    for (let i = 0; i < 40 && liveCalls < 2; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    assert.equal(liveCalls, 2, "second liveness must proceed once prior ping finished");
-    releaseUpsert();
-    const [firstRes, second] = await Promise.all([first, secondP]);
-    assert.equal(firstRes.ok, true);
-    assert.equal(second.ok, true);
-    assert.notEqual(second.livenessSkipped, true);
+    // Force a status change on the registry row
+    const list = ctrl.printers.list();
+    assert.ok(list.length >= 1);
+    const eid = list[0].external_id;
+    ctrl.printers.upsert({
+      ...list[0],
+      external_id: eid,
+      status: "error",
+      status_detail: "Out of paper",
+    });
+    const first = await ctrl.pushPrinterStatusesIfChanged();
+    assert.equal(first.ok, true);
+    assert.ok(statusCalls >= 1);
+    const second = await ctrl.pushPrinterStatusesIfChanged();
+    assert.equal(second.unchanged, true);
+    assert.equal(statusCalls, statusCalls); // no extra calls
+    const after = statusCalls;
+    await ctrl.pushPrinterStatusesIfChanged();
+    assert.equal(statusCalls, after, "unchanged status must not re-POST");
   });
 
-  it("gated upsert timeout after liveness is caught — no rejection", async () => {
+  it("failed heartbeat recovers without flooding logs", async () => {
     const store = memoryStore({
       agent_api_base: "https://api.example.com",
       agent_token: "tok",
       branch_id: "147",
     });
     const logs = [];
+    let n = 0;
     const ctrl = createStationPrintingController({
       ...store,
-      log: (msg) => {
-        logs.push(String(msg));
-      },
+      log: (msg) => logs.push(String(msg)),
       sleep: async () => {},
-      request: async (cfg) => {
-        const body = cfg.data || {};
-        const list = Array.isArray(body.printers) ? body.printers : [];
-        if (String(cfg.url || "").includes("/heartbeat") && list.length === 0) {
+      request: async () => {
+        n += 1;
+        if (n <= 2) {
           return {
-            status: 200,
-            data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+            status: 500,
+            data: { error: { code: "SERVER", message: "boom" } },
             headers: {},
           };
         }
-        if (list.length > 0) {
-          const err = new Error("timeout of " + cfg.timeout + "ms exceeded");
-          err.code = "ECONNABORTED";
-          throw err;
-        }
-        return { status: 200, data: {}, headers: {} };
+        return {
+          status: 200,
+          data: { is_print_host: true, host_epoch: 1, pending_job_count: 0 },
+          headers: {},
+        };
       },
     });
-    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
-    const res = await ctrl.heartbeat({ branchId: "147" });
-    assert.equal(res.ok, true);
-    assert.ok(res.printerUpsert);
-    assert.equal(res.printerUpsert.ok, false);
-    assert.equal(res.printerUpsert.timedOut, true);
-    assert.equal(res.printerUpsert.error.code, "TIMEOUT");
-    assert.equal(ctrl.isPrinterSyncInFlight(), false);
-    assert.ok(
-      logs.some((m) => /printer upsert failed after liveness/i.test(m)),
-      "must log upsert failure"
-    );
+    const r1 = await ctrl.heartbeat({ branchId: "147" });
+    const r2 = await ctrl.heartbeat({ branchId: "147" });
+    const r3 = await ctrl.heartbeat({ branchId: "147" });
+    assert.equal(r1.ok, false);
+    assert.equal(r2.ok, false);
+    assert.equal(r3.ok, true);
+    const failLogs = logs.filter((m) => /Heartbeat liveness failed/i.test(m));
+    assert.equal(failLogs.length, 1, "second failure must be throttled");
+    assert.ok(logs.some((m) => /Heartbeat recovered/i.test(m)));
   });
+
 });
 
 

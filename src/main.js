@@ -35,6 +35,7 @@ const {
   buildPdfAxiosConfig,
   isPdfTooLargeError,
   DEFAULT_MAX_PDF_BYTES,
+  BASE64_MAX_PDF_BYTES,
 } = require("./pdf-fetch-policy");
 const {
   migrateAndLoadSecrets,
@@ -396,6 +397,13 @@ async function saveIncomingPdfFromBase64(store, jobId, base64Raw, preferredName)
     throw new Error("Invalid pdf_base64 encoding: " + (err.message || String(err)));
   }
   if (!buf.length) throw new Error("Decoded pdf_base64 is empty");
+  const maxB64 = BASE64_MAX_PDF_BYTES || 5 * 1024 * 1024;
+  if (buf.length > maxB64) {
+    const tooLarge = new Error(STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE");
+    tooLarge.code = STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE";
+    tooLarge.retryable = false;
+    throw tooLarge;
+  }
   // PDF files start with %PDF — terminal INVALID_PDF (not free text / retryable)
   const header = buf.slice(0, 4).toString("latin1");
   if (header !== "%PDF") {
@@ -2120,7 +2128,9 @@ ipcMain.handle("add-discovered-printer", async (_e, raw) => {
     const row = discoveredPrinter.toRegistryPrinter(candidate, { makeDefault });
     sp.printers.upsert(row);
     if (makeDefault) sp.setDefaultPrinter(row.external_id);
-    await sp.syncPrintersToServer({ branchId: state.branchId });
+    try { saveUserConfig({ last_printer_list_sync_hash: "" }); } catch (_) {}
+    await sp.syncPrintersToServer({ branchId: state.branchId, force: true });
+    try { await sp.pushPrinterStatusesIfChanged(); } catch (_) {}
     pushState();
     return { ok: true, printers: sp.printers.list(), added: row };
   } catch (err) {
@@ -2169,7 +2179,9 @@ ipcMain.handle("set-printer-mapping", async (_e, opts) => {
       if (!up.ok) return up;
     }
     if (o.defaultExternalId) sp.setDefaultPrinter(o.defaultExternalId);
-    const sync = await sp.syncPrintersToServer({ branchId: state.branchId });
+    try { saveUserConfig({ last_printer_list_sync_hash: "" }); } catch (_) {}
+    const sync = await sp.syncPrintersToServer({ branchId: state.branchId, force: true });
+    try { await sp.pushPrinterStatusesIfChanged(); } catch (_) {}
     pushState();
     if (sync && sync.ok === false && !sync.skipped) {
       return {
@@ -2198,7 +2210,9 @@ ipcMain.handle("remove-printer", async (_e, opts) => {
     const removed = sp.removeManagedPrinter(externalId);
     if (!removed.ok) return removed;
     log(`Printer removed: ${externalId}`, "🖨️");
-    const sync = await sp.syncPrintersToServer({ branchId: state.branchId });
+    try { saveUserConfig({ last_printer_list_sync_hash: "" }); } catch (_) {}
+    const sync = await sp.syncPrintersToServer({ branchId: state.branchId, force: true });
+    try { await sp.pushPrinterStatusesIfChanged(); } catch (_) {}
     pushState();
     if (sync && sync.ok === false && !sync.skipped) {
       const msg =
@@ -3362,7 +3376,7 @@ async function handleMessage(channel, message) {
     };
     pushState();
 
-    // Contract v1.0: pdf_url by default; pdf_base64 opt-in; dual-run file_path.
+    // Prefer pdf_base64; fall back to signed pdf_url; then legacy file_path.
     const pdfUrl = parsed.pdf_url || "";
     const pdfBase64 = parsed.pdf_base64 || "";
     const filePath = parsed.file_path || "";
@@ -3372,12 +3386,12 @@ async function handleMessage(channel, message) {
     const localFilePath =
       !remoteUrl && filePath && !filePath.startsWith("http") ? filePath : "";
     if (!pdfUrl && !pdfBase64 && !filePath) {
-      log("Missing pdf_url / pdf_base64 / file_path in message.", "❌");
+      log("Missing pdf_base64 / pdf_url / file_path in message.", "❌");
       if (serverJobId) {
         finalizeServerAck({
           serverJobId,
           status: "failed",
-          reason: "missing_pdf",
+          reason: STATION_ERROR_CODES.MISSING_PDF || "MISSING_PDF",
         });
       }
       return "ack";
@@ -3415,42 +3429,48 @@ async function handleMessage(channel, message) {
     let localPath;
     let saveSource = null;
     try {
-      // Prefer signed pdf_url (default delivery), then base64, then legacy file_path.
-      if (remoteUrl) {
-        try {
-          const bearer =
-            (getStationPrinting().api && getStationPrinting().api.getToken()) ||
-            readUserConfig().agent_token ||
-            "";
-          localPath = await saveIncomingPdf(store, jobId, remoteUrl, true, {
-            authToken: bearer,
-          });
-          saveSource = pdfUrl ? "pdf_url" : "file_path_url";
-        } catch (urlErr) {
-          if (urlErr && urlErr.code === "PDF_URL_EXPIRED") throw urlErr;
-          if (urlErr && urlErr.code === "PDF_HOST_NOT_ALLOWED") throw urlErr;
-          if (urlErr && urlErr.code === "PDF_TOO_LARGE") throw urlErr;
-          if (!pdfBase64) throw urlErr;
-          log(
-            `pdf_url download failed (${urlErr.message || String(urlErr)}) — falling back to pdf_base64.`,
-            "⚠️"
-          );
-          localPath = await saveIncomingPdfFromBase64(store, jobId, pdfBase64, preferredName);
-          saveSource = "pdf_base64";
-        }
-      } else if (pdfBase64) {
+      // Prefer pdf_base64; fall back to pdf_url / file_path with a clear log.
+      if (pdfBase64) {
         try {
           localPath = await saveIncomingPdfFromBase64(store, jobId, pdfBase64, preferredName);
           saveSource = "pdf_base64";
         } catch (b64Err) {
-          if (!localFilePath) throw b64Err;
-          log(
-            `pdf_base64 failed (${b64Err.message || String(b64Err)}) — falling back to file_path.`,
-            "⚠️"
-          );
-          localPath = await saveIncomingPdf(store, jobId, localFilePath, false);
-          saveSource = "file_path";
+          if (b64Err && b64Err.code === "PDF_TOO_LARGE") {
+            // Still allow URL fallback for oversized inline payloads.
+          }
+          if (!remoteUrl && !localFilePath) throw b64Err;
+          const reason = (b64Err && b64Err.message) || String(b64Err);
+          if (remoteUrl) {
+            log(
+              `pdf_base64 failed (${reason}) — falling back to pdf_url.`,
+              "⚠️"
+            );
+            const bearer =
+              (getStationPrinting().api && getStationPrinting().api.getToken()) ||
+              readUserConfig().agent_token ||
+              "";
+            localPath = await saveIncomingPdf(store, jobId, remoteUrl, true, {
+              authToken: bearer,
+            });
+            saveSource = pdfUrl ? "pdf_url" : "file_path_url";
+          } else {
+            log(
+              `pdf_base64 failed (${reason}) — falling back to file_path.`,
+              "⚠️"
+            );
+            localPath = await saveIncomingPdf(store, jobId, localFilePath, false);
+            saveSource = "file_path";
+          }
         }
+      } else if (remoteUrl) {
+        const bearer =
+          (getStationPrinting().api && getStationPrinting().api.getToken()) ||
+          readUserConfig().agent_token ||
+          "";
+        localPath = await saveIncomingPdf(store, jobId, remoteUrl, true, {
+          authToken: bearer,
+        });
+        saveSource = pdfUrl ? "pdf_url" : "file_path_url";
       } else {
         localPath = await saveIncomingPdf(store, jobId, localFilePath, false);
         saveSource = "file_path";
@@ -3504,7 +3524,9 @@ async function handleMessage(channel, message) {
               ? "PDF_HOST_NOT_ALLOWED"
               : err && err.code === (STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF")
                 ? STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF"
-                : err.message || "save_failed";
+                : err && err.code === (STATION_ERROR_CODES.MISSING_PDF || "MISSING_PDF")
+                  ? STATION_ERROR_CODES.MISSING_PDF || "MISSING_PDF"
+                  : err.message || "save_failed";
       log("Could not save PDF: " + failReason, "❌");
       store.upsert({
         id: jobId,

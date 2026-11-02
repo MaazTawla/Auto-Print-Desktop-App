@@ -26,6 +26,7 @@ const ERROR_CODES = Object.freeze({
   PDF_HOST_NOT_ALLOWED: "PDF_HOST_NOT_ALLOWED",
   PRINT_INTERRUPTED: "PRINT_INTERRUPTED",
   INVALID_PDF: "INVALID_PDF",
+  MISSING_PDF: "MISSING_PDF",
   VALIDATION_ERROR: "VALIDATION_ERROR",
   UNAUTHORIZED: "UNAUTHORIZED",
 });
@@ -64,8 +65,8 @@ const ASSUMPTIONS = Object.freeze({
   consumeExclusive: false,
   prefetch: 1,
   messageSchemaVersion: 2,
-  /** Default PDF delivery is pdf_url; pdf_base64 is opt-in on server */
-  pdfDelivery: "url_or_base64",
+  /** Prefer pdf_base64 when present; fall back to signed pdf_url */
+  pdfDelivery: "base64_then_url",
   /** printers/sync keyed by external_id; server assigns numeric id */
   printersSyncKey: "external_id",
   printersServerAssignsId: true,
@@ -404,7 +405,7 @@ function firstNonEmpty(...vals) {
 
 /**
  * Parse Rabbit v2 print message (contract §6).
- * PDF: prefer pdf_url (default), else pdf_base64; dual-run file_path.
+ * PDF: prefer pdf_base64, else pdf_url; dual-run file_path as last resort.
  */
 function parsePrintMessage(raw) {
   let data = raw;

@@ -8,6 +8,7 @@
 "use strict";
 
 const DEFAULT_MAX_PDF_BYTES = 20 * 1024 * 1024; // 20 MB
+const BASE64_MAX_PDF_BYTES = 5 * 1024 * 1024; // 5 MB decoded pdf_base64
 
 function parseOrigin(urlOrBase) {
   if (urlOrBase == null || String(urlOrBase).trim() === "") return null;
@@ -132,6 +133,7 @@ function isPdfTooLargeError(err) {
 
 module.exports = {
   DEFAULT_MAX_PDF_BYTES,
+  BASE64_MAX_PDF_BYTES,
   parseOrigin,
   resolvePdfHostAllowOrigin,
   shouldSendBearerForPdfUrl,
