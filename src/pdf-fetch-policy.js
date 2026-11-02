@@ -131,6 +131,74 @@ function isPdfTooLargeError(err) {
   );
 }
 
+/** Optional data:application/pdf;base64, only — any other data: URI is INVALID_PDF. */
+const PDF_DATA_URI_RE = /^data:application\/pdf;base64,/i;
+const ANY_DATA_URI_RE = /^data:/i;
+
+/**
+ * Strip whitespace and an optional data:application/pdf;base64, prefix.
+ * Rejects other data: URIs before any decode allocation.
+ * @returns {string} raw base64 alphabet payload
+ */
+function normalizePdfBase64Input(raw) {
+  let s = String(raw ?? "").trim();
+  if (!s) {
+    const err = new Error("Empty pdf_base64");
+    err.code = "EMPTY_PDF_BASE64";
+    throw err;
+  }
+  if (ANY_DATA_URI_RE.test(s)) {
+    const m = PDF_DATA_URI_RE.exec(s);
+    if (!m) {
+      const err = new Error("INVALID_PDF");
+      err.code = "INVALID_PDF";
+      err.retryable = false;
+      throw err;
+    }
+    s = s.slice(m[0].length);
+  }
+  s = s.replace(/\s+/g, "");
+  if (!s) {
+    const err = new Error("Empty pdf_base64");
+    err.code = "EMPTY_PDF_BASE64";
+    throw err;
+  }
+  return s;
+}
+
+/**
+ * Estimate decoded byte length from a base64 payload (no decode).
+ * Uses len*3/4 minus padding.
+ */
+function estimateDecodedBase64Bytes(b64) {
+  const s = String(b64 || "");
+  const len = s.length;
+  let padding = 0;
+  if (len >= 2 && s.endsWith("==")) padding = 2;
+  else if (len >= 1 && s.endsWith("=")) padding = 1;
+  return Math.floor((len * 3) / 4) - padding;
+}
+
+/**
+ * Reject oversized pdf_base64 before Buffer.from allocates the decoded body.
+ */
+function assertBase64WithinDecodedMax(b64, maxBytes = BASE64_MAX_PDF_BYTES) {
+  const cap =
+    maxBytes != null && Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0
+      ? Number(maxBytes)
+      : BASE64_MAX_PDF_BYTES;
+  const estimated = estimateDecodedBase64Bytes(b64);
+  if (estimated > cap) {
+    const err = new Error("PDF_TOO_LARGE");
+    err.code = "PDF_TOO_LARGE";
+    err.retryable = false;
+    err.sizeBytes = estimated;
+    err.maxBytes = cap;
+    throw err;
+  }
+  return estimated;
+}
+
 module.exports = {
   DEFAULT_MAX_PDF_BYTES,
   BASE64_MAX_PDF_BYTES,
@@ -140,4 +208,8 @@ module.exports = {
   assertPdfUrlAllowed,
   buildPdfAxiosConfig,
   isPdfTooLargeError,
+  normalizePdfBase64Input,
+  estimateDecodedBase64Bytes,
+  assertBase64WithinDecodedMax,
+  PDF_DATA_URI_RE,
 };

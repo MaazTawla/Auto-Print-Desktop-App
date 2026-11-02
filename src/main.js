@@ -36,7 +36,10 @@ const {
   isPdfTooLargeError,
   DEFAULT_MAX_PDF_BYTES,
   BASE64_MAX_PDF_BYTES,
+  normalizePdfBase64Input,
+  assertBase64WithinDecodedMax,
 } = require("./pdf-fetch-policy");
+const { heartbeatFailureRetryMs } = require("./printer-list-sync-policy");
 const {
   migrateAndLoadSecrets,
   writeSealedConfigFile,
@@ -382,13 +385,31 @@ async function saveIncomingPdf(store, jobId, filePath, isUrl, opts = {}) {
  */
 async function saveIncomingPdfFromBase64(store, jobId, base64Raw, preferredName) {
   await ensureSpaceForIncomingPdf();
-  let b64 = String(base64Raw ?? "").trim();
-  if (!b64) throw new Error("Empty pdf_base64");
-
-  const dataUri = /^data:application\/pdf;base64,/i.exec(b64);
-  if (dataUri) b64 = b64.slice(dataUri[0].length);
-  // Strip whitespace/newlines some publishers insert
-  b64 = b64.replace(/\s+/g, "");
+  // Normalize data-URI / whitespace, then reject oversized payloads BEFORE decode (M1/L4).
+  let b64;
+  try {
+    b64 = normalizePdfBase64Input(base64Raw);
+  } catch (normErr) {
+    if (normErr && normErr.code === (STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF")) {
+      const invalid = new Error(STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF");
+      invalid.code = STATION_ERROR_CODES.INVALID_PDF || "INVALID_PDF";
+      invalid.retryable = false;
+      throw invalid;
+    }
+    throw normErr;
+  }
+  const maxB64 = BASE64_MAX_PDF_BYTES || 5 * 1024 * 1024;
+  try {
+    assertBase64WithinDecodedMax(b64, maxB64);
+  } catch (sizeErr) {
+    if (sizeErr && sizeErr.code === (STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE")) {
+      const tooLarge = new Error(STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE");
+      tooLarge.code = STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE";
+      tooLarge.retryable = false;
+      throw tooLarge;
+    }
+    throw sizeErr;
+  }
 
   let buf;
   try {
@@ -397,7 +418,7 @@ async function saveIncomingPdfFromBase64(store, jobId, base64Raw, preferredName)
     throw new Error("Invalid pdf_base64 encoding: " + (err.message || String(err)));
   }
   if (!buf.length) throw new Error("Decoded pdf_base64 is empty");
-  const maxB64 = BASE64_MAX_PDF_BYTES || 5 * 1024 * 1024;
+  // Defense in depth: still enforce after decode (padding / estimate edge cases).
   if (buf.length > maxB64) {
     const tooLarge = new Error(STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE");
     tooLarge.code = STATION_ERROR_CODES.PDF_TOO_LARGE || "PDF_TOO_LARGE";
@@ -1435,6 +1456,8 @@ const {
 let stationPrinting = null;
 let agentHeartbeatTimer = null;
 let agentHeartbeatSoonTimer = null;
+/** Consecutive liveness failures observed by main — drives soon-retry backoff (L1). */
+let agentHeartbeatConsecutiveFailures = 0;
 const AGENT_HEARTBEAT_MS = STATION_PRINT_ASSUMPTIONS.heartbeatIntervalMs || 30000;
 
 function getStationPrinting() {
@@ -2808,6 +2831,16 @@ function stopAgentHeartbeatLoop() {
     clearTimeout(agentHeartbeatSoonTimer);
     agentHeartbeatSoonTimer = null;
   }
+  agentHeartbeatConsecutiveFailures = 0;
+}
+
+function scheduleAgentHeartbeatSoon(delayMs) {
+  const ms = Math.max(0, Number(delayMs) || 0);
+  if (agentHeartbeatSoonTimer) clearTimeout(agentHeartbeatSoonTimer);
+  agentHeartbeatSoonTimer = setTimeout(() => {
+    agentHeartbeatSoonTimer = null;
+    runAgentHeartbeat().catch(() => {});
+  }, ms);
 }
 
 function startAgentHeartbeatLoop() {
@@ -2828,6 +2861,7 @@ async function runAgentHeartbeat() {
   const result = await sp.heartbeat({ branchId: state.branchId });
   if (!result || result.skipped) return;
   if (result.authError || result.needsPairing) {
+    agentHeartbeatConsecutiveFailures = 0;
     log(
       "Agent token rejected (401/403) — cleared session. Enter a fresh pairing code to register again.",
       "⚠️"
@@ -2838,12 +2872,25 @@ async function runAgentHeartbeat() {
     return;
   }
   if (result.revoked) {
+    agentHeartbeatConsecutiveFailures = 0;
     log("Host revoked on heartbeat — cancelling Rabbit consumer.", "⚠️");
     await stopRabbit();
     state.rabbitmq = "idle";
     pushState();
     return;
   }
+  if (!result.ok) {
+    agentHeartbeatConsecutiveFailures += 1;
+    const n =
+      Number(result.consecutiveHbFailures) > 0
+        ? Number(result.consecutiveHbFailures)
+        : agentHeartbeatConsecutiveFailures;
+    agentHeartbeatConsecutiveFailures = n;
+    const delay = heartbeatFailureRetryMs(n);
+    scheduleAgentHeartbeatSoon(delay);
+    return;
+  }
+  agentHeartbeatConsecutiveFailures = 0;
   if (result.promoted && result.shouldConsume) {
     log("Promoted to print host on heartbeat — starting Rabbit consumer.", "✅");
     if (result.flushPending || sp.flushPending) {
@@ -2862,11 +2909,7 @@ async function runAgentHeartbeat() {
     );
     state.rabbitmq = "idle";
     pushState();
-    if (agentHeartbeatSoonTimer) clearTimeout(agentHeartbeatSoonTimer);
-    agentHeartbeatSoonTimer = setTimeout(() => {
-      agentHeartbeatSoonTimer = null;
-      runAgentHeartbeat().catch(() => {});
-    }, 2500);
+    scheduleAgentHeartbeatSoon(2500);
     return;
   }
   if (result.ok && result.shouldConsume && sp.flushPending) {
@@ -3206,7 +3249,9 @@ async function startRabbit() {
           );
           // Server publishes Delayed jobs on host heartbeat; local flag cleared after HB confirms.
         }
-        await sp2.syncPrintersToServer({ branchId: state.branchId });
+        // L2 parity: force printers/sync on Rabbit connect (clear hash).
+        try { saveUserConfig({ last_printer_list_sync_hash: "" }); } catch (_) {}
+        await sp2.syncPrintersToServer({ branchId: state.branchId, force: true });
       } catch (_) {}
       pushState();
     } catch (err) {

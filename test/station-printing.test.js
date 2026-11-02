@@ -416,7 +416,6 @@ describe("station-printing controller", () => {
     let syncCalls = 0;
     const request = async (cfg) => {
       const url = String(cfg.url || "");
-      const body = cfg.data || {};
       if (url.includes("/heartbeat")) {
         liveCalls += 1;
         return {

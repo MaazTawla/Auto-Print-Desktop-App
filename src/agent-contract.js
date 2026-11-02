@@ -387,7 +387,11 @@ function parsePrintersSyncResponse(data) {
       model: p.model != null ? String(p.model) : undefined,
       connection_type: p.connection_type || p.connection || "lan",
       ip_address: p.ip_address != null ? String(p.ip_address) : null,
-      is_default: Boolean(p.is_default),
+      // Omit when server did not send it so applyServerSync keeps the local default.
+      is_default:
+        p.is_default != null || p.isDefault != null
+          ? Boolean(p.is_default ?? p.isDefault)
+          : undefined,
       status: p.status || "online",
       status_detail: p.status_detail != null ? String(p.status_detail) : null,
     })),

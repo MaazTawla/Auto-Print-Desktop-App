@@ -30,6 +30,7 @@ const {
   statusFingerprint: printerStatusFingerprint,
   shouldSkipUnchanged: shouldSkipPrinterListSync,
   shouldLogHeartbeatFailure,
+  heartbeatFailureRetryMs,
 } = require("./printer-list-sync-policy");
 
 function createStationPrintingController(deps = {}) {
@@ -659,6 +660,8 @@ function createStationPrintingController(deps = {}) {
         syncConflict: Boolean(live && live.syncConflict),
         retriesExhausted: Boolean(live && live.retriesExhausted),
         shouldConsume: consumeEnabled,
+        consecutiveHbFailures,
+        retrySoonMs: heartbeatFailureRetryMs(consecutiveHbFailures),
       };
     }
     if (consecutiveHbFailures > 0) {
@@ -883,7 +886,10 @@ function createStationPrintingController(deps = {}) {
             persistHostFlags();
             onStateChange(publicHostState());
           }
-          writeConfig({ last_printer_list_sync_hash: hash });
+          // Hash the post-apply payload so fields the server echoes (e.g. is_default)
+          // cannot invalidate the next skip check (M2).
+          const hashAfter = printerListConfigHash(printers.toSyncPayload());
+          writeConfig({ last_printer_list_sync_hash: hashAfter });
           try {
             log(
               `Synced ${payload.length} printer(s) to server` +

@@ -30,3 +30,28 @@ describe("printer-list-sync-policy", () => {
     assert.equal(shouldLogHeartbeatFailure(3), true);
   });
 });
+
+  it("is_default changes the configHash (M2)", () => {
+    const base = {
+      external_id: "lan:1",
+      name: "A",
+      connection_type: "lan",
+      status: "online",
+      ip_address: "1.1.1.1",
+      port: 9100,
+      model: "X",
+    };
+    const a = [{ ...base, is_default: false }];
+    const b = [{ ...base, is_default: true }];
+    assert.notEqual(configHash(a), configHash(b));
+    // isDefault camelCase alias also counts
+    const c = [{ ...base, isDefault: true }];
+    assert.equal(configHash(b), configHash(c));
+  });
+
+  it("heartbeatFailureRetryMs caps at 20s", () => {
+    const { heartbeatFailureRetryMs } = require("../src/printer-list-sync-policy");
+    assert.equal(heartbeatFailureRetryMs(1), 5000);
+    assert.equal(heartbeatFailureRetryMs(4), 20000);
+  });
+

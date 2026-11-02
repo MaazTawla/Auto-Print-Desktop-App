@@ -21,6 +21,8 @@ function configHash(payloads) {
       String(p.ip_address || "").trim(),
       p.port != null ? String(p.port) : "",
       String(p.model || "").trim(),
+      // Match toSyncPayload: default flag must invalidate the list-sync hash (M2).
+      p.is_default || p.isDefault ? "1" : "0",
     ].join("\u0001")
   );
   return crypto.createHash("sha256").update(lines.join("\n"), "utf8").digest("hex");
@@ -57,9 +59,20 @@ function shouldLogHeartbeatFailure(consecutiveFailures, everyNth = 3) {
   return n % everyNth === 0;
 }
 
+/**
+ * Accelerated heartbeat retry after a failed liveness ping.
+ * Matches Android: min(5s * consecutiveFailures, 20s) so recovery stays
+ * well inside the 90s offline TTL (L1).
+ */
+function heartbeatFailureRetryMs(consecutiveFailures) {
+  const n = Math.max(1, Number(consecutiveFailures) || 1);
+  return Math.min(5_000 * n, 20_000);
+}
+
 module.exports = {
   configHash,
   statusFingerprint,
   shouldSkipUnchanged,
   shouldLogHeartbeatFailure,
+  heartbeatFailureRetryMs,
 };
