@@ -48,7 +48,7 @@ const {
   getSessionSecret,
 } = require("./secure-store");
 const { createProcessedJobsStore } = require("./processed-jobs");
-const { createAckOutbox } = require("./ack-outbox");
+const { createAckOutbox, shouldLogRetryFailure } = require("./ack-outbox");
 
 /** Delays after failed attempts 1, 2, 3 before attempts 2, 3, 4 (exponential-style backoff). */
 const RETRY_DELAYS_MS = [5000, 30000, 60000];
@@ -204,12 +204,34 @@ async function flushAckOutbox() {
       });
       if (outcome && outcome.removed) {
         flushed += 1;
-        log(
-          `Server ack outbox delivered job_id=${entry.jobId} status=${entry.status}`,
-          "✅"
-        );
+        if (outcome.exhausted) {
+          log(
+            `Server ack outbox gave up job_id=${entry.jobId} status=${entry.status} ` +
+              `after ${outcome.entry.attempts} attempts ` +
+              `(last HTTP ${outcome.entry.lastStatus != null ? outcome.entry.lastStatus : "n/a"}: ` +
+              `${outcome.entry.lastError || "error"}) — dropped to stop unbounded retries.`,
+            "⚠️"
+          );
+        } else {
+          log(
+            `Server ack outbox delivered job_id=${entry.jobId} status=${entry.status}`,
+            "✅"
+          );
+        }
       } else {
         deferred += 1;
+        const attempts = outcome && outcome.entry ? outcome.entry.attempts : 0;
+        if (shouldLogRetryFailure(attempts)) {
+          const st = result && result.status != null ? result.status : "n/a";
+          const errMsg =
+            (result && result.message) ||
+            (result && result.error && result.error.message) ||
+            "error";
+          log(
+            `Server ack outbox defer job_id=${entry.jobId} attempt=${attempts} HTTP ${st}: ${errMsg}`,
+            "⚠️"
+          );
+        }
       }
     }
     // Schedule next due

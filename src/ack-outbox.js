@@ -1,7 +1,9 @@
 /**
  * Durable outbox for server job acks (printed / failed).
  * Mark job processed first (caller), enqueue here, Rabbit-ack after durable write.
- * Flush with backoff until 2xx or terminal 4xx. Server ack is idempotent per job_id.
+ * Flush with jittered backoff until 2xx, terminal 4xx (404 = job not found), or the
+ * retry budget (MAX_ATTEMPTS / MAX_AGE_MS) is exhausted — a persistent 5xx must not
+ * retry forever. Server ack is idempotent per job_id.
  *
  * Corrupt outbox JSON: quarantine to outbox.corrupt-<ts>.json, surface warning,
  * start a fresh empty outbox — never silently drop without a trace.
@@ -15,6 +17,10 @@ const path = require("path");
 const DEFAULT_MAX = 2000;
 const DEFAULT_CORRUPT_KEEP = 10;
 const BACKOFF_MS = [1000, 5000, 15000, 30000, 60000, 120000];
+/** Cap retryable ACK failures (5xx / 401 / 403 / 408 / 429 / network). ~30 ≈ under an hour. */
+const MAX_ATTEMPTS = 30;
+/** Absolute age ceiling so skipped_no_token cannot loop forever. */
+const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const CORRUPT_NAME_RE = /^outbox\.corrupt-(\d+)\.json$/;
 
 function isTerminalAckStatus(status) {
@@ -32,9 +38,34 @@ function isSuccessAckStatus(status) {
   return Number.isFinite(s) && s >= 200 && s < 300;
 }
 
-function nextBackoffMs(attempts) {
+function nextBackoffMs(attempts, jitter01 = 0.5) {
   const i = Math.min(Math.max(0, attempts - 1), BACKOFF_MS.length - 1);
-  return BACKOFF_MS[i];
+  const base = BACKOFF_MS[i];
+  const j = Math.min(1, Math.max(0, Number(jitter01)));
+  // ±20% jitter around the base delay.
+  const factor = 0.8 + 0.4 * (Number.isFinite(j) ? j : 0.5);
+  return Math.max(1, Math.round(base * factor));
+}
+
+function isRetryBudgetExhausted(
+  attempts,
+  createdAtMs,
+  nowMs = Date.now(),
+  maxAttempts = MAX_ATTEMPTS,
+  maxAgeMs = MAX_AGE_MS
+) {
+  if ((Number(attempts) || 0) >= maxAttempts) return true;
+  const created = Number(createdAtMs) || 0;
+  if (created > 0 && nowMs - created >= maxAgeMs) return true;
+  return false;
+}
+
+/** Log first failure, then every Nth — avoids flood on persistent 5xx. */
+function shouldLogRetryFailure(attempts, everyNth = 5) {
+  const a = Number(attempts) || 0;
+  if (a <= 0) return false;
+  if (a === 1) return true;
+  return a % everyNth === 0;
 }
 
 
@@ -215,22 +246,35 @@ function createAckOutbox(opts = {}) {
     return [...map.values()].sort((a, b) => a.createdAt - b.createdAt);
   }
 
-  function markAttempt(jobId, { ok, status, error }) {
+  function markAttempt(jobId, { ok, status, error, nowMs, jitter01 } = {}) {
     const id = String(jobId).trim();
     const entry = map.get(id);
     if (!entry) return null;
+    const now = nowMs != null ? Number(nowMs) : Date.now();
     if (ok || isSuccessAckStatus(status) || isTerminalAckStatus(status)) {
       map.delete(id);
       persist();
-      return { removed: true, entry, terminal: true, ok: Boolean(ok || isSuccessAckStatus(status)) };
+      return {
+        removed: true,
+        entry,
+        terminal: true,
+        ok: Boolean(ok || isSuccessAckStatus(status)),
+        exhausted: false,
+      };
     }
     entry.attempts = (entry.attempts || 0) + 1;
     entry.lastStatus = status != null ? Number(status) : null;
     entry.lastError = error != null ? String(error) : null;
-    entry.nextAttemptAt = Date.now() + nextBackoffMs(entry.attempts);
+    entry.nextAttemptAt =
+      now + nextBackoffMs(entry.attempts, jitter01 != null ? jitter01 : Math.random());
+    if (isRetryBudgetExhausted(entry.attempts, entry.createdAt, now)) {
+      map.delete(id);
+      persist();
+      return { removed: true, entry, terminal: true, ok: false, exhausted: true };
+    }
     map.set(id, entry);
     persist();
-    return { removed: false, entry, terminal: false, ok: false };
+    return { removed: false, entry, terminal: false, ok: false, exhausted: false };
   }
 
   function size() {
@@ -259,6 +303,8 @@ function createAckOutbox(opts = {}) {
     getCorruptInfo,
     clearCorruptInfo,
     BACKOFF_MS,
+    MAX_ATTEMPTS,
+    MAX_AGE_MS,
   };
 }
 
@@ -268,7 +314,11 @@ module.exports = {
   isTerminalAckStatus,
   isSuccessAckStatus,
   nextBackoffMs,
+  isRetryBudgetExhausted,
+  shouldLogRetryFailure,
   BACKOFF_MS,
+  MAX_ATTEMPTS,
+  MAX_AGE_MS,
   DEFAULT_MAX,
   DEFAULT_CORRUPT_KEEP,
 };
