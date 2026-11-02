@@ -2132,20 +2132,83 @@ ipcMain.handle("set-printer-mapping", async (_e, opts) => {
   try {
     const o = opts && typeof opts === "object" ? opts : {};
     const sp = getStationPrinting();
+    const pub = sp.publicHostState ? sp.publicHostState() : {};
     if (o.externalId && o.name) {
-      sp.printers.upsert({
-        external_id: o.externalId,
-        name: o.name,
-        windows_name: o.windowsName || o.name,
-        connection: o.connection || "lan",
-        is_default: !!o.isDefault,
-      });
+      const hostErr = lanHostValidation.assertPrintHostCanAdd(!!pub.isPrintHost);
+      if (hostErr) {
+        return { ok: false, error: hostErr, code: "NOT_PRINT_HOST" };
+      }
+      let connection = String(o.connection || "lan").trim() || "lan";
+      let externalId = String(o.externalId).trim();
+      let host = String(o.host || o.ip_address || "").trim();
+      let port = o.port != null ? Number(o.port) : null;
+      const replaceExternalId = String(o.replaceExternalId || "").trim() || null;
+      if ((connection === "lan" || connection === "network") && host) {
+        const portRaw = port != null && Number.isFinite(port) ? String(port) : String(o.port || "");
+        const lanErr = lanHostValidation.validateManualLan(host, portRaw);
+        if (lanErr) {
+          return { ok: false, error: lanErr, code: "LAN_VALIDATION" };
+        }
+        const usePort = lanHostValidation.parsePortStrict(portRaw);
+        port = usePort;
+        externalId = discoveredPrinter.lanExternalId(host, usePort);
+        connection = "lan";
+      }
+      const up = sp.upsertManagedPrinter(
+        {
+          external_id: externalId,
+          name: String(o.name).trim(),
+          windows_name: o.windowsName || o.name,
+          connection,
+          ip_address: host || null,
+          port: port,
+          is_default: !!o.isDefault,
+        },
+        { replaceExternalId },
+      );
+      if (!up.ok) return up;
     }
     if (o.defaultExternalId) sp.setDefaultPrinter(o.defaultExternalId);
-    await sp.syncPrintersToServer({ branchId: state.branchId });
+    const sync = await sp.syncPrintersToServer({ branchId: state.branchId });
     pushState();
+    if (sync && sync.ok === false && !sync.skipped) {
+      return {
+        ok: false,
+        error: (sync.error && sync.error.message) || sync.error || "Printer sync failed.",
+        printers: sp.printers.list(),
+      };
+    }
     return { ok: true, printers: sp.printers.list() };
   } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle("remove-printer", async (_e, opts) => {
+  try {
+    const o = opts && typeof opts === "object" ? opts : {};
+    const externalId = String(o.externalId || o.external_id || "").trim();
+    if (!externalId) return { ok: false, error: "Missing printer external_id." };
+    const sp = getStationPrinting();
+    const pub = sp.publicHostState ? sp.publicHostState() : {};
+    const hostErr = lanHostValidation.assertPrintHostCanAdd(!!pub.isPrintHost);
+    if (hostErr) {
+      return { ok: false, error: hostErr, code: "NOT_PRINT_HOST" };
+    }
+    const removed = sp.removeManagedPrinter(externalId);
+    if (!removed.ok) return removed;
+    log(`Printer removed: ${externalId}`, "🖨️");
+    const sync = await sp.syncPrintersToServer({ branchId: state.branchId });
+    pushState();
+    if (sync && sync.ok === false && !sync.skipped) {
+      const msg =
+        (sync.error && sync.error.message) || sync.error || "Printer sync failed.";
+      log(`Printer removed locally (${externalId}) but sync failed: ${msg}`, "⚠️");
+      return { ok: false, error: msg, printers: sp.printers.list() };
+    }
+    return { ok: true, printers: sp.printers.list(), removed: removed.removed };
+  } catch (err) {
+    log(`Remove printer failed: ${err.message || err}`, "⚠️");
     return { ok: false, error: err.message || String(err) };
   }
 });

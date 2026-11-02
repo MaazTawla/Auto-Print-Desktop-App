@@ -213,6 +213,27 @@ function createPrinterRegistry(initial = {}) {
     return null;
   }
 
+  /**
+   * Remove a managed printer by external_id. Promotes another default when needed.
+   * Returns the removed row, or null if missing.
+   */
+  function remove(externalId) {
+    const id = normalizeExternalId(externalId);
+    if (!id || !byExternalId.has(id)) return null;
+    const removed = byExternalId.get(id);
+    byExternalId.delete(id);
+    if (defaultExternalId === id) {
+      defaultExternalId = "";
+      if (byExternalId.size) {
+        const first = byExternalId.keys().next().value;
+        defaultExternalId = first;
+        const row = byExternalId.get(first);
+        if (row) row.is_default = true;
+      }
+    }
+    return removed;
+  }
+
   function routeMessage(msg) {
     const externalId =
       msg && msg.printer_external_id
@@ -279,6 +300,7 @@ function createPrinterRegistry(initial = {}) {
     get,
     getByServerId,
     upsert,
+    remove,
     applyServerSync,
     syncFromWindowsList,
     setDefault,

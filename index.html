@@ -2785,11 +2785,19 @@
                 <p class="field-hint" id="settings-printers-scan-progress" style="margin:0 0 10px; min-height:1.2em;"></p>
                 <div class="printer-pick-list" id="settings-discovered-printer-list" role="list" aria-label="Discovered printers" style="max-height:260px; margin-bottom:12px;"></div>
                 <details id="settings-printer-manual-details" style="margin-bottom:14px;">
-                  <summary style="cursor:pointer; font-size:13px;">Enter printer manually</summary>
+                  <summary style="cursor:pointer; font-size:13px;" id="settings-printer-manual-summary">Enter printer manually</summary>
                   <div class="settings-card-body" style="padding:10px 0 0;">
+                    <p class="field-hint" id="settings-manual-printer-lock-hint" style="display:none; margin:0 0 8px;">
+                      External ID is locked. For LAN printers, changing host/port updates the id and replaces this printer mapping.
+                    </p>
+                    <input type="hidden" id="settings-manual-printer-edit-id" value="" />
                     <div class="field">
                       <label for="settings-manual-printer-name">Name</label>
                       <input type="text" id="settings-manual-printer-name" placeholder="Kitchen" autocomplete="off" />
+                    </div>
+                    <div class="field" id="settings-manual-printer-eid-field" style="display:none;">
+                      <label for="settings-manual-printer-eid">External ID (locked)</label>
+                      <input type="text" id="settings-manual-printer-eid" disabled autocomplete="off" />
                     </div>
                     <div class="field">
                       <label for="settings-manual-printer-host">Host / IP</label>
@@ -2801,6 +2809,7 @@
                     </div>
                     <div class="inline-actions">
                       <button type="button" class="btn-outline" id="settings-manual-printer-add">Add LAN printer</button>
+                      <button type="button" class="btn-outline" id="settings-manual-printer-cancel" style="display:none;">Cancel edit</button>
                     </div>
                     <div class="err-text" id="settings-manual-printer-err" style="margin-top:8px;"></div>
                   </div>
@@ -2815,6 +2824,7 @@
                         <th>Connection</th>
                         <th>Status</th>
                         <th>Default</th>
+                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody id="settings-printer-map-tbody"></tbody>
@@ -3974,20 +3984,91 @@
     const tbody = document.getElementById('settings-printer-map-tbody');
     if (!tbody) return;
     const list = (s.stationPrinting && s.stationPrinting.printers) || [];
+    const canEdit = !!(s.stationPrinting && s.stationPrinting.isPrintHost);
     if (!list.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="field-hint">No printers added yet. Scan above or enter one manually.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="field-hint">No printers added yet. Scan above or enter one manually.</td></tr>';
       return;
     }
     tbody.innerHTML = list.map((p) => {
       const def = p.is_default ? 'Yes' : '';
+      const eid = escHtml(p.external_id || '');
+      const actions =
+        '<div class="inline-actions" style="flex-wrap:wrap; gap:6px;">' +
+          '<button type="button" class="btn-outline btn-sm" data-printer-action="test" data-external-id="' + eid + '"' +
+            (canEdit || true ? '' : ' disabled') + '>Test</button>' +
+          '<button type="button" class="btn-outline btn-sm" data-printer-action="edit" data-external-id="' + eid + '"' +
+            (canEdit ? '' : ' disabled') + '>Edit</button>' +
+          '<button type="button" class="btn-outline btn-sm" data-printer-action="remove" data-external-id="' + eid + '"' +
+            (canEdit ? '' : ' disabled') + '>Remove</button>' +
+        '</div>';
       return '<tr>' +
         '<td>' + escHtml(p.name || '') + '</td>' +
-        '<td class="mono">' + escHtml(p.external_id || '') + '</td>' +
+        '<td class="mono">' + eid + '</td>' +
         '<td>' + escHtml(p.connection || '') + '</td>' +
         '<td>' + escHtml(p.status || '') + '</td>' +
         '<td>' + def + '</td>' +
+        '<td>' + actions + '</td>' +
         '</tr>';
     }).join('');
+  }
+
+  function beginEditPrinter(printer) {
+    if (!printer) return;
+    const details = document.getElementById('settings-printer-manual-details');
+    const summary = document.getElementById('settings-printer-manual-summary');
+    const lockHint = document.getElementById('settings-manual-printer-lock-hint');
+    const eidField = document.getElementById('settings-manual-printer-eid-field');
+    const eidInput = document.getElementById('settings-manual-printer-eid');
+    const editId = document.getElementById('settings-manual-printer-edit-id');
+    const nameEl = document.getElementById('settings-manual-printer-name');
+    const hostEl = document.getElementById('settings-manual-printer-host');
+    const portEl = document.getElementById('settings-manual-printer-port');
+    const addBtn = document.getElementById('settings-manual-printer-add');
+    const cancelBtn = document.getElementById('settings-manual-printer-cancel');
+    const errEl = document.getElementById('settings-manual-printer-err');
+    if (errEl) errEl.textContent = '';
+    if (editId) editId.value = printer.external_id || '';
+    if (nameEl) nameEl.value = printer.name || '';
+    if (hostEl) hostEl.value = printer.ip_address || '';
+    if (portEl) portEl.value = printer.port != null ? String(printer.port) : '9100';
+    if (eidInput) eidInput.value = printer.external_id || '';
+    if (eidField) eidField.style.display = '';
+    if (lockHint) lockHint.style.display = '';
+    if (summary) summary.textContent = 'Edit printer';
+    if (addBtn) addBtn.textContent = 'Save printer';
+    if (cancelBtn) cancelBtn.style.display = '';
+    if (details) {
+      details.open = true;
+      try { details.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (_) {}
+    }
+    // Non-LAN edits: host/port may be blank; keep visible for LAN rows.
+    const conn = String(printer.connection || '').toLowerCase();
+    if (hostEl) hostEl.disabled = !(conn === 'lan' || conn === 'network');
+    if (portEl) portEl.disabled = !(conn === 'lan' || conn === 'network');
+  }
+
+  function clearPrinterEditForm() {
+    const details = document.getElementById('settings-printer-manual-details');
+    const summary = document.getElementById('settings-printer-manual-summary');
+    const lockHint = document.getElementById('settings-manual-printer-lock-hint');
+    const eidField = document.getElementById('settings-manual-printer-eid-field');
+    const editId = document.getElementById('settings-manual-printer-edit-id');
+    const nameEl = document.getElementById('settings-manual-printer-name');
+    const hostEl = document.getElementById('settings-manual-printer-host');
+    const portEl = document.getElementById('settings-manual-printer-port');
+    const addBtn = document.getElementById('settings-manual-printer-add');
+    const cancelBtn = document.getElementById('settings-manual-printer-cancel');
+    const errEl = document.getElementById('settings-manual-printer-err');
+    if (errEl) errEl.textContent = '';
+    if (editId) editId.value = '';
+    if (nameEl) nameEl.value = '';
+    if (hostEl) { hostEl.value = ''; hostEl.disabled = false; }
+    if (portEl) { portEl.value = '9100'; portEl.disabled = false; }
+    if (eidField) eidField.style.display = 'none';
+    if (lockHint) lockHint.style.display = 'none';
+    if (summary) summary.textContent = 'Enter printer manually';
+    if (addBtn) addBtn.textContent = 'Add LAN printer';
+    if (cancelBtn) cancelBtn.style.display = 'none';
   }
 
   function applyPrintHostForm(s) {
@@ -4201,6 +4282,7 @@
     applySettingsForm(s);
     applyPrintHostForm(s);
     renderHostConflict(s);
+    window.__lastState = s;
     renderPrinterMap(s);
     updatePrinterAddGates(s);
     updateDiskBanner(s);
@@ -4470,6 +4552,17 @@
     });
   }
 
+  function resetManualPrinterFormAfterSave() {
+    clearPrinterEditForm();
+  }
+
+  const manualCancelBtn = document.getElementById('settings-manual-printer-cancel');
+  if (manualCancelBtn) {
+    manualCancelBtn.addEventListener('click', () => {
+      clearPrinterEditForm();
+    });
+  }
+
   const manualAddBtn = document.getElementById('settings-manual-printer-add');
   if (manualAddBtn) {
     manualAddBtn.addEventListener('click', async () => {
@@ -4481,6 +4574,7 @@
         showToast(msg, 'error', 3400);
         return;
       }
+      const editingId = String((document.getElementById('settings-manual-printer-edit-id') || {}).value || '').trim();
       const name = (document.getElementById('settings-manual-printer-name') || {}).value || '';
       const host = String((document.getElementById('settings-manual-printer-host') || {}).value || '').trim();
       const portRaw = (document.getElementById('settings-manual-printer-port') || {}).value;
@@ -4489,7 +4583,6 @@
         let x = String(h || '').trim();
         if (x.startsWith('[') && x.endsWith(']')) x = x.slice(1, -1);
         if (!x.includes(':')) return false;
-        // Rough IPv6 literal check without net module in renderer
         return /^[0-9a-fA-F:]+$/.test(x) && x.includes(':');
       }
       function parsePortStrict(raw) {
@@ -4498,6 +4591,39 @@
         const n = Number(t);
         if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
         return n;
+      }
+      // Edit of non-LAN row: name-only via setPrinterMapping (host fields disabled).
+      if (editingId && (!host || (document.getElementById('settings-manual-printer-host') || {}).disabled)) {
+        if (!window.api || typeof window.api.setPrinterMapping !== 'function') return;
+        manualAddBtn.disabled = true;
+        try {
+          const state = window.__lastState || {};
+          const list = (state.stationPrinting && state.stationPrinting.printers) || [];
+          const row = list.find((p) => String(p.external_id || '').toLowerCase() === editingId.toLowerCase());
+          const res = await window.api.setPrinterMapping({
+            externalId: editingId,
+            name: String(name).trim() || (row && row.name) || editingId,
+            windowsName: row && row.windows_name,
+            connection: (row && row.connection) || 'lan',
+            host: row && row.ip_address,
+            port: row && row.port,
+            replaceExternalId: editingId,
+            isDefault: !!(row && row.is_default),
+          });
+          if (!res || !res.ok) {
+            if (errEl) errEl.textContent = (res && res.error) || 'Could not update printer.';
+            showToast((res && res.error) || 'Could not update printer.', 'error', 3400);
+            return;
+          }
+          showToast('Printer updated.');
+          resetManualPrinterFormAfterSave();
+        } catch (err) {
+          if (errEl) errEl.textContent = err && err.message ? err.message : String(err);
+          showToast(err && err.message ? err.message : 'Could not update printer.', 'error', 3400);
+        } finally {
+          manualAddBtn.disabled = false;
+        }
+        return;
       }
       if (!host) {
         if (errEl) errEl.textContent = 'Host / IP is required.';
@@ -4513,6 +4639,33 @@
         return;
       }
       const externalId = 'lan:' + host + ':' + usePort;
+      if (editingId) {
+        if (!window.api || typeof window.api.setPrinterMapping !== 'function') return;
+        manualAddBtn.disabled = true;
+        try {
+          const res = await window.api.setPrinterMapping({
+            externalId: externalId,
+            name: String(name).trim() || ('Network ' + host),
+            connection: 'lan',
+            host: host,
+            port: usePort,
+            replaceExternalId: editingId,
+          });
+          if (!res || !res.ok) {
+            if (errEl) errEl.textContent = (res && res.error) || 'Could not update printer.';
+            showToast((res && res.error) || 'Could not update printer.', 'error', 3400);
+            return;
+          }
+          showToast('Printer updated.');
+          resetManualPrinterFormAfterSave();
+        } catch (err) {
+          if (errEl) errEl.textContent = err && err.message ? err.message : String(err);
+          showToast(err && err.message ? err.message : 'Could not update printer.', 'error', 3400);
+        } finally {
+          manualAddBtn.disabled = false;
+        }
+        return;
+      }
       const candidate = {
         name: String(name).trim() || ('Network ' + host),
         connection: 'lan',
@@ -4533,11 +4686,7 @@
           return;
         }
         showToast('Added ' + candidate.name + '.');
-        const hostEl = document.getElementById('settings-manual-printer-host');
-        const nameEl = document.getElementById('settings-manual-printer-name');
-        if (hostEl) hostEl.value = '';
-        if (nameEl) nameEl.value = '';
-        // Mark matching discovered row if present
+        resetManualPrinterFormAfterSave();
         discoveredScanCache = discoveredScanCache.map((c) =>
           String(c.externalId || '').toLowerCase() === externalId.toLowerCase()
             ? Object.assign({}, c, { alreadyAdded: true })
@@ -4552,7 +4701,84 @@
     });
   }
 
-  document.getElementById('settings-branch-save').addEventListener('click', async () => {
+  const printerMapTable = document.getElementById('settings-printer-map-table');
+  if (printerMapTable) {
+    printerMapTable.addEventListener('click', async (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest('[data-printer-action]') : null;
+      if (!btn || btn.disabled) return;
+      const action = btn.getAttribute('data-printer-action');
+      const externalId = String(btn.getAttribute('data-external-id') || '').trim();
+      if (!externalId) return;
+      const state = window.__lastState || {};
+      const list = (state.stationPrinting && state.stationPrinting.printers) || [];
+      const row = list.find((p) => String(p.external_id || '') === externalId);
+      if (action === 'edit') {
+        if (window.__printerAddHost === false) {
+          showToast('Only the print host can edit printers.', 'error', 3400);
+          return;
+        }
+        beginEditPrinter(row || { external_id: externalId, name: externalId, connection: 'lan' });
+        return;
+      }
+      if (action === 'remove') {
+        if (window.__printerAddHost === false) {
+          showToast('Only the print host can remove printers.', 'error', 3400);
+          return;
+        }
+        const label = (row && row.name) || externalId;
+        if (!window.confirm('Remove "' + label + '" from this device and sync the change to the server?')) {
+          return;
+        }
+        if (!window.api || typeof window.api.removePrinter !== 'function') {
+          showToast('Remove is not available in this build.', 'error', 3400);
+          return;
+        }
+        btn.disabled = true;
+        try {
+          const res = await window.api.removePrinter({ externalId: externalId });
+          if (!res || !res.ok) {
+            showToast((res && res.error) || 'Could not remove printer.', 'error', 3400);
+            btn.disabled = false;
+            return;
+          }
+          showToast('Printer removed.');
+          if ((document.getElementById('settings-manual-printer-edit-id') || {}).value === externalId) {
+            clearPrinterEditForm();
+          }
+        } catch (err) {
+          showToast(err && err.message ? err.message : 'Could not remove printer.', 'error', 3400);
+          btn.disabled = false;
+        }
+        return;
+      }
+      if (action === 'test') {
+        // Desktop test-print targets the default/windows printer path; surface feedback.
+        if (!window.api || typeof window.api.testPrint !== 'function') {
+          showToast('Test print is not available.', 'error', 3400);
+          return;
+        }
+        btn.disabled = true;
+        try {
+          // Prefer routing via default set momentarily if we have a windows name.
+          if (row && row.windows_name && typeof window.api.setDefaultPrinter === 'function') {
+            await window.api.setDefaultPrinter(row.windows_name || row.name);
+          }
+          const res = await window.api.testPrint();
+          if (!res || !res.ok) {
+            showToast((res && res.error) || 'Test print failed.', 'error', 3400);
+          } else {
+            showToast('Test print sent' + (row && row.name ? (' to ' + row.name) : '') + '.');
+          }
+        } catch (err) {
+          showToast(err && err.message ? err.message : 'Test print failed.', 'error', 3400);
+        } finally {
+          btn.disabled = false;
+        }
+      }
+    });
+  }
+
+  document.getElementById('settings-branch-save').addEventListener('click', async () => {  document.getElementById('settings-branch-save').addEventListener('click', async () => {
     const errEl = document.getElementById('settings-branch-err');
     errEl.textContent = '';
     const v = document.getElementById('settings-branch').value.trim();

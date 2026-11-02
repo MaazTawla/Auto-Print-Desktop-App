@@ -924,6 +924,38 @@ function createStationPrintingController(deps = {}) {
   }
 
   /**
+   * Upsert a managed printer. When replaceExternalId differs from the new
+   * external_id (LAN host/port edit), drop the old mapping first.
+   */
+  function upsertManagedPrinter(printer, opts = {}) {
+    const replaceId = String(opts.replaceExternalId || "").trim();
+    const rowIn = printer && typeof printer === "object" ? printer : {};
+    const externalId = String(rowIn.external_id || rowIn.externalId || "").trim();
+    if (!externalId) return { ok: false, error: "Missing printer external_id." };
+    if (replaceId && replaceId.toLowerCase() !== externalId.toLowerCase()) {
+      printers.remove(replaceId);
+    }
+    const saved = printers.upsert({
+      ...rowIn,
+      external_id: externalId,
+    });
+    persistHostFlags();
+    onStateChange(publicHostState());
+    return { ok: true, printer: saved };
+  }
+
+  /** Remove locally and persist; caller should syncPrintersToServer. */
+  function removeManagedPrinter(externalId) {
+    const id = String(externalId || "").trim();
+    if (!id) return { ok: false, error: "Missing printer external_id." };
+    const removed = printers.remove(id);
+    if (!removed) return { ok: false, error: "Printer not found." };
+    persistHostFlags();
+    onStateChange(publicHostState());
+    return { ok: true, removed };
+  }
+
+  /**
    * Evaluate an inbound Rabbit payload under HostOnlyPolicy.
    * Returns { action, parsed, route, reason }.
    */
@@ -1053,6 +1085,8 @@ function createStationPrintingController(deps = {}) {
     isLivenessInFlight,
     syncWindowsPrinters,
     setDefaultPrinter,
+    upsertManagedPrinter,
+    removeManagedPrinter,
     evaluateIncomingMessage,
     ackPrinted,
     ackFailed,

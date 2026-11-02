@@ -118,3 +118,65 @@ describe("printer-registry scan-first prune", () => {
     assert.ok(ids.some((id) => /^win:/i.test(id) && /New USB/i.test(id)));
   });
 });
+
+describe("printer-registry remove + edit replace", () => {
+  it("remove drops a printer and promotes a new default", () => {
+    const reg = createPrinterRegistry();
+    reg.upsert({
+      external_id: "lan:10.0.0.1:9100",
+      name: "Kitchen",
+      connection: "lan",
+      is_default: true,
+      ip_address: "10.0.0.1",
+      port: 9100,
+    });
+    reg.upsert({
+      external_id: "lan:10.0.0.2:9100",
+      name: "Bar",
+      connection: "lan",
+      ip_address: "10.0.0.2",
+      port: 9100,
+    });
+    const removed = reg.remove("lan:10.0.0.1:9100");
+    assert.equal(removed.name, "Kitchen");
+    assert.equal(reg.list().length, 1);
+    assert.equal(reg.getDefault().external_id, "lan:10.0.0.2:9100");
+    assert.equal(reg.getDefault().is_default, true);
+  });
+
+  it("remove of last printer yields empty registry", () => {
+    const reg = createPrinterRegistry();
+    reg.upsert({
+      external_id: "lan:10.0.0.1:9100",
+      name: "Kitchen",
+      connection: "lan",
+      is_default: true,
+    });
+    reg.remove("lan:10.0.0.1:9100");
+    assert.equal(reg.list().length, 0);
+    assert.equal(reg.getDefault(), null);
+  });
+
+  it("edit replace drops old lan eid when host/port changes", () => {
+    const reg = createPrinterRegistry();
+    reg.upsert({
+      external_id: "lan:10.0.0.1:9100",
+      name: "Kitchen",
+      connection: "lan",
+      is_default: true,
+      ip_address: "10.0.0.1",
+      port: 9100,
+    });
+    reg.remove("lan:10.0.0.1:9100");
+    reg.upsert({
+      external_id: "lan:10.0.0.9:9101",
+      name: "Kitchen",
+      connection: "lan",
+      is_default: true,
+      ip_address: "10.0.0.9",
+      port: 9101,
+    });
+    const ids = reg.list().map((p) => p.external_id);
+    assert.deepEqual(ids, ["lan:10.0.0.9:9101"]);
+  });
+});
