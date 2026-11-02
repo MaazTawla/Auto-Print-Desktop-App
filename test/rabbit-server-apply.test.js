@@ -199,6 +199,21 @@ describe("normalizeAgentApiBase / resolveApiUrl (M1)", () => {
       "https://api.example.com/api/v1/print-agent/register"
     );
   });
+
+  it("preserves /merchant mount path on subpath installs", () => {
+    assert.equal(
+      resolveApiUrl("https://dev.tawla.io/merchant", "/register"),
+      "https://dev.tawla.io/merchant/api/v1/print-agent/register"
+    );
+    assert.equal(
+      resolveApiUrl("https://dev.tawla.io/merchant/", "/api/v1/print-agent/register"),
+      "https://dev.tawla.io/merchant/api/v1/print-agent/register"
+    );
+    assert.equal(
+      resolveApiUrl("https://dev.tawla.io/merchant", "/api/v1/print-agent/heartbeat"),
+      "https://dev.tawla.io/merchant/api/v1/print-agent/heartbeat"
+    );
+  });
 });
 
 describe("v1.8 parseRabbitVersionSignal", () => {
