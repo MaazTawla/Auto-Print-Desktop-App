@@ -334,3 +334,14 @@ describe("R10D-I2 capHostDeviceLabel / live 409", () => {
     assert.equal(Array.from(capHostDeviceLabel("a" + emoji.repeat(70))).length, 71);
   });
 });
+
+describe("R11D-I2 grapheme cap", () => {
+  it("uses Intl.Segmenter so a ZWJ family counts as one grapheme", () => {
+    const family = "👨‍👩‍👧‍👦";
+    assert.ok(Array.from(family).length > 1);
+    const capped = capHostDeviceLabel(family.repeat(150));
+    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    assert.equal([...seg.segment(capped)].length, 120);
+    assert.equal(capped, family.repeat(120));
+  });
+});

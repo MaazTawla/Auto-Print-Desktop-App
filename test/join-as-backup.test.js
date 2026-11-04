@@ -567,8 +567,10 @@ describe("R9D: stale snapshot, clearLocalAuth, throw restore, stopRabbit", () =>
 describe("R10D: upper-case hash, code-point label cap, live 409 cap", () => {
   const crypto = require("node:crypto");
   const { parseHostConflictError, capHostDeviceLabel } = require("../src/agent-contract");
+  const asciiUpper = (c) =>
+    String(c).trim().replace(/[a-z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 32));
   const hashUpper = (c) =>
-    crypto.createHash("sha256").update(String(c).trim().toUpperCase(), "utf8").digest("hex");
+    crypto.createHash("sha256").update(asciiUpper(c), "utf8").digest("hex");
   const hashLegacy = (c) =>
     crypto.createHash("sha256").update(String(c).trim(), "utf8").digest("hex");
 
@@ -675,5 +677,82 @@ describe("R10D: upper-case hash, code-point label cap, live 409 cap", () => {
       409
     );
     assert.equal(longAscii.current_host.device_label, "B".repeat(120));
+  });
+});
+
+
+describe("R11D: legacy case forms, ASCII upper, grapheme cap", () => {
+  const crypto = require("node:crypto");
+  const { parseHostConflictError, capHostDeviceLabel } = require("../src/agent-contract");
+  const asciiUpper = (c) =>
+    String(c).trim().replace(/[a-z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 32));
+  const hashUpper = (c) =>
+    crypto.createHash("sha256").update(asciiUpper(c), "utf8").digest("hex");
+  const hashLegacy = (c) =>
+    crypto.createHash("sha256").update(String(c).trim(), "utf8").digest("hex");
+
+  it("R11D-L1: legacy hash of lower-case code still blocks after upper-case retype/relaunch", async () => {
+    const legacy = hashLegacy("abc123");
+    assert.notEqual(legacy, hashUpper("ABC123"));
+    assert.notEqual(legacy, hashLegacy("ABC123"));
+    const store = memoryStore(
+      seed({
+        pairing_code: "ABC123",
+        pairing_auto_register_blocked_hash: legacy,
+        pairing_auto_register_blocked_conflict: {
+          device_label: "Kitchen PC",
+          is_online: true,
+        },
+      })
+    );
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return HOST_CONFLICT;
+    });
+    assert.ok(ctrl.publicHostState().hostConflict, "must restore banner across case change");
+    assert.equal(store.get().pairing_auto_register_blocked_hash, hashUpper("ABC123"));
+    await ctrl.ensureSession({});
+    assert.equal(calls, 0, "must never resend after legacy+case retype");
+  });
+
+  it("R11D-I1: ASCII-only upper — ß/ı/é do not over-block against SS/I/É", async () => {
+    assert.equal(asciiUpper("straße"), "STRAßE");
+    assert.notEqual(asciiUpper("straße"), "STRASSE");
+    assert.equal(asciiUpper("café"), "CAFé");
+    const store = memoryStore(seed({ pairing_code: "straße" }));
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return HOST_CONFLICT;
+    });
+    await ctrl.ensureSession({});
+    assert.equal(calls, 1);
+    assert.equal(store.get().pairing_auto_register_blocked_hash, hashUpper("straße"));
+    ctrl.setPairingCode("STRASSE");
+    assert.equal(store.get().pairing_auto_register_blocked_hash, "");
+    assert.equal(ctrl.publicHostState().hostConflict, null);
+    await ctrl.ensureSession({});
+    assert.equal(calls, 2, "STRASSE is a different code under ASCII upper");
+  });
+
+  it("R11D-I2: cap at 120 graphemes (ZWJ family stays intact; Segmenter path)", () => {
+    const family = "👨‍👩‍👧‍👦";
+    assert.ok(Array.from(family).length > 1, "family emoji is multiple code points");
+    const capped = capHostDeviceLabel(family.repeat(200));
+    assert.ok(typeof Intl !== "undefined" && typeof Intl.Segmenter === "function");
+    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    assert.equal([...seg.segment(capped)].length, 120);
+    assert.equal(capped, family.repeat(120));
+    const live = parseHostConflictError(
+      {
+        error: {
+          code: "PRINT_HOST_ALREADY_CONFIGURED",
+          current_host: { device_label: family.repeat(200), is_online: true },
+        },
+      },
+      409
+    );
+    assert.equal(live.current_host.device_label, family.repeat(120));
   });
 });
