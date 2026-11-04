@@ -26,6 +26,7 @@ const {
   resolveQueueName,
   normalizeRabbitConfig,
   normalizeAgentApiBase,
+  capHostDeviceLabel,
 } = require("./agent-contract");
 const {
   configHash: printerListConfigHash,
@@ -78,10 +79,37 @@ function createStationPrintingController(deps = {}) {
   const BLOCKED_HASH_KEY = "pairing_auto_register_blocked_hash";
   /** R8D-L1: minimal host-conflict snapshot so Join/banner survive relaunch. */
   const BLOCKED_CONFLICT_KEY = "pairing_auto_register_blocked_conflict";
+  /**
+   * R10D-L1: match BE normalisation (trim + upper-case) so retyping a blocked
+   * code in a different case still hits the block. Legacy case-sensitive hashes
+   * still match via codeMatchesBlockedHash and are migrated on restore.
+   */
   function hashPairingCode(code) {
+    const c = String(code || "").trim().toUpperCase();
+    if (!c) return "";
+    return crypto.createHash("sha256").update(c, "utf8").digest("hex");
+  }
+  /** Pre-R10D case-sensitive hash — only for matching / migrating old stores. */
+  function hashPairingCodeLegacy(code) {
     const c = String(code || "").trim();
     if (!c) return "";
     return crypto.createHash("sha256").update(c, "utf8").digest("hex");
+  }
+  function codeMatchesBlockedHash(code, blockedHash) {
+    if (!blockedHash) return false;
+    const cur = hashPairingCode(code);
+    if (cur && cur === blockedHash) return true;
+    const legacy = hashPairingCodeLegacy(code);
+    return !!(legacy && legacy === blockedHash);
+  }
+  /** If the stored hash is legacy, rewrite it to the upper-case hash without dropping the snapshot. */
+  function migrateBlockedHashIfLegacy(code) {
+    if (!autoRegisterBlockedHash) return;
+    const cur = hashPairingCode(code);
+    if (!cur || cur === autoRegisterBlockedHash) return;
+    if (hashPairingCodeLegacy(code) !== autoRegisterBlockedHash) return;
+    const saved = readConfig()[BLOCKED_CONFLICT_KEY];
+    persistBlockedHash(cur, saved != null ? saved : null);
   }
   let autoRegisterBlockedHash = String(readConfig()[BLOCKED_HASH_KEY] || "").trim();
   /** Hash cleared by allowManualRegister; restored if that manual attempt throws (R5D-L2). */
@@ -101,15 +129,8 @@ function createStationPrintingController(deps = {}) {
   }
   function hostConflictFromSnapshot(snap) {
     if (!snap || typeof snap !== "object") return null;
-    // R9D-I1: string-only label (match parseHostConflictError) + BE 120 cap.
-    const MAX_LABEL = 120;
-    let label = "";
-    if (typeof snap.device_label === "string") {
-      const raw = snap.device_label.trim();
-      if (raw && !/^(null|undefined)$/i.test(raw)) {
-        label = raw.length > MAX_LABEL ? raw.slice(0, MAX_LABEL) : raw;
-      }
-    }
+    // R9D-I1 + R10D-I1: string-only, 120 Unicode code points (not UTF-16 units).
+    const label = capHostDeviceLabel(snap.device_label);
     const online =
       snap.is_online === true ? true : snap.is_online === false ? false : null;
     return {
@@ -140,8 +161,9 @@ function createStationPrintingController(deps = {}) {
   // pairing code still hashes to the blocked hash. A code change must never
   // show a stale host label or an enabled Join for a code that was never sent.
   if (autoRegisterBlockedHash) {
-    const currentHash = hashPairingCode(readConfig().pairing_code);
-    if (currentHash && currentHash === autoRegisterBlockedHash) {
+    const currentCode = readConfig().pairing_code;
+    if (codeMatchesBlockedHash(currentCode, autoRegisterBlockedHash)) {
+      migrateBlockedHashIfLegacy(currentCode);
       const saved = readConfig()[BLOCKED_CONFLICT_KEY];
       const restored = hostConflictFromSnapshot(saved);
       if (restored) hostConflict = restored;
@@ -253,14 +275,15 @@ function createStationPrintingController(deps = {}) {
   function setPairingCode(code) {
     const next = String(code || "").trim();
     writeConfig({ pairing_code: next });
-    // R9D-L1: a different code must drop the stale block + conflict snapshot so
-    // a relaunch (or offline) never shows the old host banner / Join.
+    // R9D-L1 / R10D-L1: a different code (after BE trim+upper) must drop the
+    // stale block + conflict snapshot. Case-only retypes keep the block.
     if (autoRegisterBlockedHash) {
-      const nextHash = hashPairingCode(next);
-      if (!nextHash || nextHash !== autoRegisterBlockedHash) {
+      if (!codeMatchesBlockedHash(next, autoRegisterBlockedHash)) {
         persistBlockedHash("");
         hostConflict = null;
         onStateChange(publicHostState());
+      } else {
+        migrateBlockedHashIfLegacy(next);
       }
     }
   }
@@ -1179,8 +1202,8 @@ function createStationPrintingController(deps = {}) {
     }
     // Register with pairing code (Bearer attached inside registerAsHostOnce when present).
     // v1.23 / R5D-L1: never auto-resend a code whose hash matches the persisted block.
-    const codeHash = hashPairingCode(code);
-    if (code && autoRegisterBlockedHash && codeHash === autoRegisterBlockedHash) {
+    if (code && autoRegisterBlockedHash && codeMatchesBlockedHash(code, autoRegisterBlockedHash)) {
+      migrateBlockedHashIfLegacy(code);
       log("Register not retried automatically for this pairing code — use Retry or enter a new code.", "ℹ️");
       return {
         ok: false,

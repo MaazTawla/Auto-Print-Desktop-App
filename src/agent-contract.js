@@ -208,6 +208,23 @@ function parseRegisterResponse(data) {
  * Parse 409 PRINT_HOST_ALREADY_CONFIGURED (contract §2.1).
  * Distinguishes from printers/sync 409 SYNC_CONFLICT by error.code (v1.4).
  */
+/** BE device_label max (mb_strlen / code points). */
+const MAX_HOST_DEVICE_LABEL = 120;
+
+/**
+ * R10D-I1/I2: string-only host label, capped at 120 Unicode code points
+ * (Array.from — not UTF-16 code units) so emoji never split. Non-strings → "".
+ */
+function capHostDeviceLabel(label) {
+  if (typeof label !== "string") return "";
+  const raw = label.trim();
+  if (!raw || /^(null|undefined)$/i.test(raw)) return "";
+  const chars = Array.from(raw);
+  return chars.length > MAX_HOST_DEVICE_LABEL
+    ? chars.slice(0, MAX_HOST_DEVICE_LABEL).join("")
+    : raw;
+}
+
 function parseHostConflictError(payload, _httpStatus) {
   const root = payload && typeof payload === "object" ? payload : {};
   const err = root.error && typeof root.error === "object" ? root.error : root;
@@ -225,7 +242,8 @@ function parseHostConflictError(payload, _httpStatus) {
   let current_host = null;
   if (current) {
     const lbl = current.device_label != null ? current.device_label : current.deviceLabel;
-    const label = typeof lbl === "string" ? lbl.trim() : "";
+    // R10D-I2: same string-only 120 code-point cap as snapshot restore.
+    const label = capHostDeviceLabel(lbl);
     const on = current.is_online !== undefined ? current.is_online : current.isOnline;
     current_host = {
       device_label: label,
@@ -934,6 +952,8 @@ module.exports = {
   buildRegisterRequest,
   parseRegisterResponse,
   parseHostConflictError,
+  capHostDeviceLabel,
+  MAX_HOST_DEVICE_LABEL,
   parseSyncConflictError,
   syncConflictBackoffMs,
   buildHeartbeatRequest,
