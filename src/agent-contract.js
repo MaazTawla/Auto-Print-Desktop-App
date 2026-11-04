@@ -212,10 +212,10 @@ function parseRegisterResponse(data) {
 const MAX_HOST_DEVICE_LABEL = 120;
 
 /**
- * R10D-I1/I2 + R11D-I2 + R12D-I1: string-only host label, capped at 120
- * graphemes AND 120 code points (whichever prefix is shorter), matching BE
- * mb_strlen. Intl.Segmenter when available; else code-point cut via Array.from
- * (never UTF-16 string.slice). Non-strings → "".
+ * R10D-I1/I2 + R12D-I1 + R13D-I2: string-only host label, capped at 120
+ * Unicode code points (BE mb_strlen), cut back to a grapheme boundary when
+ * Intl.Segmenter is available. Fallback: Array.from code-point cut (never
+ * UTF-16 string.slice). Non-strings → "".
  */
 function capHostDeviceLabelByCodePoints(raw) {
   const chars = Array.from(raw);
@@ -234,10 +234,8 @@ function capHostDeviceLabel(label) {
       let cps = 0;
       for (const { segment } of seg.segment(raw)) {
         const segCp = Array.from(segment).length;
-        // R12D-I1: stop when another grapheme would exceed 120 graphemes OR 120 code points.
-        if (parts.length + 1 > MAX_HOST_DEVICE_LABEL || cps + segCp > MAX_HOST_DEVICE_LABEL) {
-          break;
-        }
+        // 120 code points, cut back to a grapheme boundary (R13D-I2).
+        if (cps + segCp > MAX_HOST_DEVICE_LABEL) break;
         parts.push(segment);
         cps += segCp;
       }
