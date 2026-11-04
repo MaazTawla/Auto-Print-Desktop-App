@@ -80,10 +80,15 @@ function rateLimitedMessage(retryAfterSeconds) {
   return `Too many pairing attempts. Please wait about ${h} hour${h === 1 ? "" : "s"}, then try again.`;
 }
 
-/** Body retry_after_seconds wins; else Retry-After header (ms → s, rounded up). */
+/**
+ * Body retry_after_seconds wins; else Retry-After header (ms → s, rounded up).
+ * Android parity: the body value counts only if it is a JSON number (a string such
+ * as "12" is ignored → header); finite and > 0; above a day it becomes 86401 ("later").
+ */
 function retryAfterSeconds(bodySeconds, headerMs) {
-  const b = Number(bodySeconds);
-  if (bodySeconds != null && Number.isFinite(b) && b > 0) return Math.ceil(b);
+  if (typeof bodySeconds === "number" && Number.isFinite(bodySeconds) && bodySeconds > 0) {
+    return bodySeconds > RATE_LIMIT_MAX_SECONDS ? RATE_LIMIT_MAX_SECONDS + 1 : Math.ceil(bodySeconds);
+  }
   const h = Number(headerMs);
   if (headerMs != null && Number.isFinite(h) && h > 0) return Math.ceil(h / 1000);
   return null;
@@ -147,16 +152,18 @@ function friendlyRegisterError(result) {
   if (code === CODE_IN_FLIGHT) {
     return { code: CODE_IN_FLIGHT, message: "Pairing is already in progress. Please wait." };
   }
+  // Same order as Android PairingErrorMapper.failureMessage:
+  // in-flight → busy → rate-limited → branch mismatch → dead code.
   if (isBusy(status, code)) return { code: CODE_BUSY, message: MSG_SERVER_BUSY };
-  if (code === CODE_BRANCH_MISMATCH) {
-    return { code: CODE_BRANCH_MISMATCH, message: MSG_BRANCH_MISMATCH };
-  }
   if (isRateLimited(status, code)) {
     return {
       code: CODE_RATE_LIMITED,
       message: rateLimitedMessage(result.retryAfterSeconds),
       retryAfterSeconds: result.retryAfterSeconds != null ? result.retryAfterSeconds : null,
     };
+  }
+  if (code === CODE_BRANCH_MISMATCH) {
+    return { code: CODE_BRANCH_MISMATCH, message: MSG_BRANCH_MISMATCH };
   }
   if (isCodeRejected(status, code)) {
     return { code: code || CODE_INVALID, message: MSG_CODE_INVALID };

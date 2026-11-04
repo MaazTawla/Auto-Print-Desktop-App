@@ -460,13 +460,13 @@ describe("QA 451a1ca9 follow-up: L1, L2, I1", () => {
     assert.match(pe.rateLimitedMessage(r.retryAfterSeconds), /about 15 minutes/);
   });
 
-  it("L1: register header cap is 1 hour", async () => {
+  it("L1: register header cap is just over a day (Android parity)", async () => {
     const api = createAgentApi({
       apiBase: "https://tawla.io/merchant/api/v1/print-agent",
       request: async () => ({ status: 429, data: {}, headers: { "retry-after": "99999" } }),
     });
     const r = await api.register(fields);
-    assert.equal(r.retryAfterSeconds, 3600);
+    assert.equal(r.retryAfterSeconds, 86401);
   });
 
   it("L1: default (heartbeat) parseRetryAfterMs cap stays 120s", () => {
@@ -630,5 +630,78 @@ describe("v1.22 BRANCH_MISMATCH on register", () => {
     assert.equal(n, 6);
     assert.equal(r.error.message, pe.MSG_CODE_INVALID);
     assert.equal(store.get().pairing_code, "");
+  });
+});
+
+describe("QA 52c60f69: Android cross-check (L1, I1, I2)", () => {
+  const { parseRegisterRetryAfterMs, REGISTER_RETRY_AFTER_MAX_MS } = require("../src/agent-api");
+  const { parseRetryAfterMs } = require("../src/agent-http-retry-policy");
+  const W = (t) => `Too many pairing attempts. Please wait ${t}, then try again.`;
+  const LATER = "Too many pairing attempts. Please try again later.";
+
+  async function viaRegister(data, headers) {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => ({ status: 429, data, headers }));
+    const r = await ctrl.registerAsHost({ branchId: "147" });
+    return r.error.message;
+  }
+
+  // Expected values are Android 6b0f43d4's (QA xcheck-android.out).
+  const table = [
+    ["900", W("about 15 minutes")],
+    ["3600", W("about 1 hour")],
+    ["7200", W("about 2 hours")],
+    ["86400", W("about 24 hours")],
+    ["86401", LATER],
+    ["9999999999999", LATER],
+  ];
+  for (const [hdr, want] of table) {
+    it(`header-only Retry-After ${hdr} → ${want}`, async () => {
+      assert.equal(await viaRegister({ error: { code: "PAIRING_RATE_LIMITED" } }, { "retry-after": hdr }), want);
+    });
+  }
+
+  it("cap constant and >12-digit rule", () => {
+    assert.equal(REGISTER_RETRY_AFTER_MAX_MS, 86401000);
+    assert.equal(parseRegisterRetryAfterMs("9999999999999"), 86401000);
+    assert.equal(parseRegisterRetryAfterMs("999999999999"), 86401000);
+    assert.equal(parseRegisterRetryAfterMs("7200"), 7200000);
+    assert.equal(parseRegisterRetryAfterMs(null), null);
+    assert.equal(parseRetryAfterMs("7200"), 120000);
+  });
+
+  it("heartbeat 429 keeps the default 120s cap", async () => {
+    const api = createAgentApi({
+      apiBase: "https://tawla.io/merchant/api/v1/print-agent",
+      token: "t",
+      request: async () => ({ status: 429, data: {}, headers: { "retry-after": "7200" } }),
+    });
+    const r = await api.heartbeat({ appId: "a", branchId: "1" });
+    assert.equal(r.retryAfterMs, 120000);
+  });
+
+  it("I1: a string body value is ignored → header used", async () => {
+    assert.equal(
+      await viaRegister({ error: { code: "PAIRING_RATE_LIMITED", retry_after_seconds: "12" } }, { "retry-after": "900" }),
+      W("about 15 minutes")
+    );
+    assert.equal(
+      await viaRegister({ error: { code: "PAIRING_RATE_LIMITED", retry_after_seconds: "12" } }, {}),
+      W("a moment")
+    );
+    assert.equal(pe.retryAfterSeconds("12", null), null);
+    assert.equal(pe.retryAfterSeconds(12, null), 12);
+    assert.equal(pe.retryAfterSeconds(1e12, null), 86401);
+    assert.equal(pe.retryAfterSeconds(true, 5000), 5);
+  });
+
+  it("I2: rate-limited is checked before BRANCH_MISMATCH (Android order)", () => {
+    const f = pe.friendlyRegisterError({ ok: false, status: 400, code: "PAIRING_RATE_LIMITED", retryAfterSeconds: 5 });
+    assert.equal(f.code, "PAIRING_RATE_LIMITED");
+    const g = pe.friendlyRegisterError({ ok: false, status: 429, code: "BRANCH_MISMATCH", retryAfterSeconds: 5 });
+    assert.equal(g.code, "PAIRING_RATE_LIMITED");
+    assert.equal(g.message, W("5 seconds"));
+    const h = pe.friendlyRegisterError({ ok: false, status: 403, code: "BRANCH_MISMATCH" });
+    assert.equal(h.code, "BRANCH_MISMATCH");
   });
 });

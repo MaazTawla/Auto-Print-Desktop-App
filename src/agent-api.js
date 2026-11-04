@@ -29,7 +29,19 @@ const {
 } = require("./agent-http-retry-policy");
 const { retryAfterSeconds } = require("./pairing-errors");
 
-const REGISTER_RETRY_AFTER_MAX_MS = 3600000;
+/**
+ * Register-only Retry-After cap for UI text (Android MESSAGE_RETRY_AFTER_MAX_MS):
+ * just over 24h, so a >1-day header reads "try again later" rather than "about 24 hours".
+ * Heartbeat keeps parseRetryAfterMs's default 120s cap.
+ */
+const REGISTER_RETRY_AFTER_MAX_MS = 86401000;
+
+/** Android parseRetryAfterMsForMessage: >12 digits → cap (overflow-safe), else capped parse. */
+function parseRegisterRetryAfterMs(raw, nowMs = Date.now()) {
+  const s = raw == null ? "" : String(raw).trim();
+  if (s.length > 12 && /^\d+$/.test(s)) return REGISTER_RETRY_AFTER_MAX_MS;
+  return parseRetryAfterMs(raw, nowMs, REGISTER_RETRY_AFTER_MAX_MS);
+}
 
 function createAgentApi(options = {}) {
   let apiBase = String(options.apiBase || "").trim();
@@ -121,11 +133,8 @@ function createAgentApi(options = {}) {
             : data && typeof data === "object"
               ? data.retry_after_seconds
               : null;
-        // L1: register-only cap (1h); heartbeat keeps the default 120s cap.
-        const headerMs = parseRetryAfterMs(
-          headers && (headers["retry-after"] || headers["Retry-After"]),
-          Date.now(),
-          REGISTER_RETRY_AFTER_MAX_MS
+        const headerMs = parseRegisterRetryAfterMs(
+          headers && (headers["retry-after"] || headers["Retry-After"])
         );
         out.code = ERROR_CODES.PAIRING_RATE_LIMITED;
         out.error = { ...error, code: ERROR_CODES.PAIRING_RATE_LIMITED };
@@ -363,4 +372,4 @@ async function defaultAxiosRequest(cfg) {
   });
 }
 
-module.exports = { createAgentApi };
+module.exports = { createAgentApi, parseRegisterRetryAfterMs, REGISTER_RETRY_AFTER_MAX_MS };

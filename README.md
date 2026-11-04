@@ -100,7 +100,7 @@ npm run dist       # Windows zip → dist/ (works on Apple Silicon)
 npm run dist:nsis  # Windows NSIS Setup.exe (needs Rosetta on Apple Silicon, or a Windows PC)
 ```
 
-**Node for the test suite:** `npm test` runs under your system Node, not Electron's. The jsdom DOM test (`test/index-html-pairing-dom.test.js`) uses dev-only `jsdom@29.1.1`, which needs **Node ^20.19.0, ^22.13.0 or >=24.0.0**. On older Node, npm prints an engine warning and that test may fail; the app itself (Electron 29, bundled Node 20.9) is unaffected, so there is deliberately no `engines` field. Don't bump jsdom to 30+ without raising this range (30 needs Node ^22.22.2 / ^24.15 / >=26).
+**Node for the test suite:** `npm test` runs under your system Node, not Electron's. The jsdom DOM test (`test/index-html-pairing-dom.test.js`) uses dev-only `jsdom@29.1.1`, which needs **Node ^20.19.0, ^22.13.0 or >=24.0.0**. On older Node, npm prints an engine warning and that test may fail; the app itself (Electron 29, bundled Node 20.9) is unaffected, so there is deliberately no `engines` field. `npm test` is plain `node --test` (Node's default discovery finds every `test/*.test.js`), because Node 20 does not expand globs such as `test/**/*.test.js`; checked to run the same tests as the old glob (290 at this commit) on Node 20.19.5, 22.13.0, 22.23.4 and 24.22.1. Don't bump jsdom to 30+ without raising this range (30 needs Node ^22.22.2 / ^24.15 / >=26).
 
 Printing and spooler tracking target **Windows** (`pdf-to-printer` + PowerShell).
 
