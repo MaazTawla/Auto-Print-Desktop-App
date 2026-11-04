@@ -27,6 +27,7 @@ const {
   parseRetryAfterMs,
   shouldUnpairImmediately,
 } = require("./agent-http-retry-policy");
+const { retryAfterSeconds } = require("./pairing-errors");
 
 function createAgentApi(options = {}) {
   let apiBase = String(options.apiBase || "").trim();
@@ -90,31 +91,42 @@ function createAgentApi(options = {}) {
   async function register(fields) {
     const body = buildRegisterRequest(fields);
     // No bearer on register (contract §2.1)
-    const { status, data } = await call("POST", ENDPOINTS.register, body, {
+    const { status, data, headers } = await call("POST", ENDPOINTS.register, body, {
       noAuth: true,
     });
     if (status === 409) {
+      // v1.21: only a real host conflict takes the conflict path (credential drop).
+      // PAIRING_BUSY and unknown 409 codes are plain errors (no credential wipe).
       const conflict = parseHostConflictError(data, status);
-      return {
-        ok: false,
-        status,
-        conflict: conflict || {
-          code: ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED,
-          message:
-            "Another device is already configured as print host for this branch.",
-          current_host: null,
-        },
-      };
+      if (conflict) {
+        return { ok: false, status, conflict };
+      }
     }
     if (status < 200 || status >= 300) {
       const error = parseAgentError(data, status);
-      return {
+      const out = {
         ok: false,
         status,
         error,
         code: error.code,
         message: error.message,
       };
+      if (status === 429) {
+        const details = (error && error.details) || {};
+        const bodySec =
+          details.retry_after_seconds != null
+            ? details.retry_after_seconds
+            : data && typeof data === "object"
+              ? data.retry_after_seconds
+              : null;
+        const headerMs = parseRetryAfterMs(
+          headers && (headers["retry-after"] || headers["Retry-After"])
+        );
+        out.code = ERROR_CODES.PAIRING_RATE_LIMITED;
+        out.error = { ...error, code: ERROR_CODES.PAIRING_RATE_LIMITED };
+        out.retryAfterSeconds = retryAfterSeconds(bodySec, headerMs);
+      }
+      return out;
     }
     const parsed = parseRegisterResponse(data);
     if (parsed.token) setToken(parsed.token);

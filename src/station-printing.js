@@ -11,6 +11,7 @@ const { createHostOnlyPolicy } = require("./host-only-policy");
 const { getOrCreateAppId } = require("./app-identity");
 const { createPrinterRegistry } = require("./printer-registry");
 const { createAgentApi } = require("./agent-api");
+const pairingErrors = require("./pairing-errors");
 const {
   ASSUMPTIONS,
   REMAINING_GAPS,
@@ -67,6 +68,9 @@ function createStationPrintingController(deps = {}) {
     request: deps.request,
   });
 
+  const busyRandom = typeof deps.random === "function" ? deps.random : Math.random;
+  const registerSleep = (ms) =>
+    typeof deps.sleep === "function" ? deps.sleep(ms) : new Promise((r) => setTimeout(r, ms));
   let hostConflict = null; // 409 payload for UI
   let lastRegisterError = null; // { code, message } for inline UI
   let needsPairing = false; // prompt UI after token revoke / deregister
@@ -106,7 +110,10 @@ function createStationPrintingController(deps = {}) {
       needsPairing: Boolean(needsPairing),
       pairingPrompt:
         needsPairing
-          ? "Agent token was revoked or cleared. Enter a fresh pairing code, then Save & register."
+          ? lastRegisterError &&
+            pairingErrors.isCodeRejected(401, lastRegisterError.code)
+            ? pairingErrors.MSG_CODE_INVALID
+            : "Agent token was revoked or cleared. Enter a fresh pairing code, then Save & register."
           : null,
       contractVersion: ASSUMPTIONS.contractVersion,
       rabbitQueue: resolveQueueName(readConfig(), readConfig().branch_id),
@@ -287,15 +294,53 @@ function createStationPrintingController(deps = {}) {
    * Register as print host. pairing_code + role print_host required (contract §2.1).
    * On 409, Rabbit must stay idle.
    */
-  async function registerAsHost({ branchId } = {}) {
+  let registerInFlight = null; // single-flight: { promise, sentCode }
+
+  /**
+   * One register at a time. A caller that arrives while one is running waits for it;
+   * if the stored code changed meanwhile (user saved a new one), it runs once more
+   * with the fresh settings instead of reusing the stale result.
+   */
+  async function registerAsHost(opts = {}) {
+    while (registerInFlight) {
+      const running = registerInFlight;
+      let res;
+      try {
+        res = await running.promise;
+      } catch (_) {
+        res = null;
+      }
+      if (registerInFlight === running) registerInFlight = null;
+      const nowCode = String(readConfig().pairing_code || "").trim();
+      if (res && nowCode === running.sentCode) return res;
+    }
+    const sentCode = String(readConfig().pairing_code || "").trim();
+    const entry = { sentCode, promise: null };
+    entry.promise = (async () => {
+      try {
+        return await registerAsHostOnce(opts);
+      } finally {
+        if (registerInFlight === entry) registerInFlight = null;
+      }
+    })();
+    registerInFlight = entry;
+    return entry.promise;
+  }
+
+  function isRegisterInFlight() {
+    return Boolean(registerInFlight);
+  }
+
+  async function registerAsHostOnce({ branchId } = {}) {
     const cfg = readConfig();
+    const sentCode = String(cfg.pairing_code || "").trim();
     api.setApiBase(cfg.agent_api_base || "");
     // Register never sends bearer — pairing_code only
     api.setToken("");
 
     let result;
     try {
-      result = await api.register({
+      result = await pairingErrors.runBusyRetry(() => api.register({
         appId,
         branchId: branchId || cfg.branch_id,
         deviceLabel: cfg.device_label || defaultDeviceLabel(),
@@ -305,7 +350,7 @@ function createStationPrintingController(deps = {}) {
           agentVersion ||
           cfg.agent_version ||
           null,
-      });
+      }), { sleep: registerSleep, random: busyRandom });
     } catch (err) {
       if (
         err &&
@@ -346,6 +391,23 @@ function createStationPrintingController(deps = {}) {
     }
 
     if (!result.ok) {
+      const friendly = pairingErrors.friendlyRegisterError(result);
+      if (pairingErrors.isCodeRejected(result.status, result.code)) {
+        // Dead code: clear only if it is still the code we sent; prompt for a fresh one.
+        if (pairingErrors.shouldClearCode(readConfig().pairing_code, sentCode)) {
+          writeConfig({ pairing_code: "" });
+        }
+        needsPairing = true;
+      }
+      if (friendly) {
+        lastRegisterError = friendly;
+        log(
+          `Register failed: HTTP ${result.status} ${result.code || ""} — ${friendly.message}`.trim(),
+          "❌"
+        );
+        onStateChange(publicHostState());
+        return { ok: false, error: friendly, pairingError: friendly, code: friendly.code, shouldConsume: false };
+      }
       lastRegisterError = result.error || {
         code: "REGISTER_FAILED",
         message: "Register failed",
@@ -1280,6 +1342,7 @@ function createStationPrintingController(deps = {}) {
     handleAuthFailure,
     evaluateAuthFailure: handleAuthFailure,
     registerAsHost,
+    isRegisterInFlight,
     ensureSession,
     heartbeat,
     deregister,
