@@ -101,8 +101,15 @@ function createStationPrintingController(deps = {}) {
   }
   function hostConflictFromSnapshot(snap) {
     if (!snap || typeof snap !== "object") return null;
-    const raw = snap.device_label != null ? String(snap.device_label).trim() : "";
-    const label = raw && !/^(null|undefined)$/i.test(raw) ? raw : "";
+    // R9D-I1: string-only label (match parseHostConflictError) + BE 120 cap.
+    const MAX_LABEL = 120;
+    let label = "";
+    if (typeof snap.device_label === "string") {
+      const raw = snap.device_label.trim();
+      if (raw && !/^(null|undefined)$/i.test(raw)) {
+        label = raw.length > MAX_LABEL ? raw.slice(0, MAX_LABEL) : raw;
+      }
+    }
     const online =
       snap.is_online === true ? true : snap.is_online === false ? false : null;
     return {
@@ -129,11 +136,18 @@ function createStationPrintingController(deps = {}) {
     writeConfig(patch);
   }
   let hostConflict = null; // 409 payload for UI
-  // R8D-L1: restore banner/Join after relaunch when a blocked host-conflict remains.
+  // R8D-L1 + R9D-L1: restore banner/Join after relaunch only when the current
+  // pairing code still hashes to the blocked hash. A code change must never
+  // show a stale host label or an enabled Join for a code that was never sent.
   if (autoRegisterBlockedHash) {
-    const saved = readConfig()[BLOCKED_CONFLICT_KEY];
-    const restored = hostConflictFromSnapshot(saved);
-    if (restored) hostConflict = restored;
+    const currentHash = hashPairingCode(readConfig().pairing_code);
+    if (currentHash && currentHash === autoRegisterBlockedHash) {
+      const saved = readConfig()[BLOCKED_CONFLICT_KEY];
+      const restored = hostConflictFromSnapshot(saved);
+      if (restored) hostConflict = restored;
+    } else {
+      persistBlockedHash("");
+    }
   }
   let lastRegisterError = null; // { code, message } for inline UI
   let needsPairing = false; // prompt UI after token revoke / deregister
@@ -237,7 +251,18 @@ function createStationPrintingController(deps = {}) {
   }
 
   function setPairingCode(code) {
-    writeConfig({ pairing_code: String(code || "").trim() });
+    const next = String(code || "").trim();
+    writeConfig({ pairing_code: next });
+    // R9D-L1: a different code must drop the stale block + conflict snapshot so
+    // a relaunch (or offline) never shows the old host banner / Join.
+    if (autoRegisterBlockedHash) {
+      const nextHash = hashPairingCode(next);
+      if (!nextHash || nextHash !== autoRegisterBlockedHash) {
+        persistBlockedHash("");
+        hostConflict = null;
+        onStateChange(publicHostState());
+      }
+    }
   }
 
   /**
@@ -317,6 +342,11 @@ function createStationPrintingController(deps = {}) {
     consumeEnabled = false;
     needsPairing = true;
     hostConflict = null;
+    // R9D-L2: drop auto-block + conflict snapshot so a relaunch cannot show a
+    // stale banner with an empty pairing code.
+    persistBlockedHash("");
+    lastClearedBlockedHash = "";
+    lastClearedBlockedConflict = null;
     writeConfig({
       ...dropBrokerCredentialsPatch(),
       agent_token: "",
@@ -477,8 +507,16 @@ function createStationPrintingController(deps = {}) {
       }
       // R5D-L2: a manual Retry that throws must re-block so the next timer/HB
       // does not auto-resend (one click must not become 3 requests).
+      // R9D-L3(c): also re-persist + restore the conflict snapshot so the banner
+      // survives both the in-session Retry path (clearHostConflict) and a relaunch.
       if (lastClearedBlockedHash) {
-        persistBlockedHash(lastClearedBlockedHash, lastClearedBlockedConflict);
+        const snap = lastClearedBlockedConflict;
+        persistBlockedHash(lastClearedBlockedHash, snap);
+        const restored = hostConflictFromSnapshot(snap);
+        if (restored) {
+          hostConflict = restored;
+          onStateChange(publicHostState());
+        }
         lastClearedBlockedHash = "";
         lastClearedBlockedConflict = null;
       }
