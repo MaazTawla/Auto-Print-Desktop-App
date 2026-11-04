@@ -212,13 +212,29 @@ function parseRegisterResponse(data) {
 const MAX_HOST_DEVICE_LABEL = 120;
 
 /**
- * R10D-I1/I2: string-only host label, capped at 120 Unicode code points
- * (Array.from — not UTF-16 code units) so emoji never split. Non-strings → "".
+ * R10D-I1/I2 + R11D-I2: string-only host label, capped at 120 graphemes
+ * (Intl.Segmenter when available; else Unicode code points via Array.from).
+ * Non-strings → "".
  */
 function capHostDeviceLabel(label) {
   if (typeof label !== "string") return "";
   const raw = label.trim();
   if (!raw || /^(null|undefined)$/i.test(raw)) return "";
+  if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+    try {
+      const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+      const parts = [];
+      for (const { segment } of seg.segment(raw)) {
+        parts.push(segment);
+        if (parts.length > MAX_HOST_DEVICE_LABEL) {
+          return parts.slice(0, MAX_HOST_DEVICE_LABEL).join("");
+        }
+      }
+      return raw;
+    } catch (_) {
+      /* fall through to code-point cut */
+    }
+  }
   const chars = Array.from(raw);
   return chars.length > MAX_HOST_DEVICE_LABEL
     ? chars.slice(0, MAX_HOST_DEVICE_LABEL).join("")

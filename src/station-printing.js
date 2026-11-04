@@ -80,34 +80,59 @@ function createStationPrintingController(deps = {}) {
   /** R8D-L1: minimal host-conflict snapshot so Join/banner survive relaunch. */
   const BLOCKED_CONFLICT_KEY = "pairing_auto_register_blocked_conflict";
   /**
-   * R10D-L1: match BE normalisation (trim + upper-case) so retyping a blocked
-   * code in a different case still hits the block. Legacy case-sensitive hashes
-   * still match via codeMatchesBlockedHash and are migrated on restore.
+   * R10D-L1 / R11D-I1: BE uses PHP strtoupper (ASCII a-z only). Match that so
+   * ß/ı/é do not over-block against SS/I/É.
    */
+  function asciiUpperPairingCode(code) {
+    return String(code || "")
+      .trim()
+      .replace(/[a-z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 32));
+  }
   function hashPairingCode(code) {
-    const c = String(code || "").trim().toUpperCase();
+    const c = asciiUpperPairingCode(code);
     if (!c) return "";
     return crypto.createHash("sha256").update(c, "utf8").digest("hex");
   }
-  /** Pre-R10D case-sensitive hash — only for matching / migrating old stores. */
-  function hashPairingCodeLegacy(code) {
-    const c = String(code || "").trim();
+  /** sha256 of an already-trimmed form (no further case change). */
+  function hashTrimmedForm(form) {
+    const c = String(form || "");
     if (!c) return "";
     return crypto.createHash("sha256").update(c, "utf8").digest("hex");
+  }
+  /**
+   * R11D-L1: during migration, a legacy stored hash may be of the trimmed raw,
+   * lowercase, or uppercase form of the code that was blocked. Compare all three
+   * so a case-only retype never resends.
+   */
+  function legacyHashForms(code) {
+    const trimmed = String(code || "").trim();
+    if (!trimmed) return [];
+    const forms = [trimmed, trimmed.toLowerCase(), trimmed.toUpperCase()];
+    // Deduplicate while preserving order.
+    return forms.filter((f, i) => forms.indexOf(f) === i);
   }
   function codeMatchesBlockedHash(code, blockedHash) {
     if (!blockedHash) return false;
     const cur = hashPairingCode(code);
     if (cur && cur === blockedHash) return true;
-    const legacy = hashPairingCodeLegacy(code);
-    return !!(legacy && legacy === blockedHash);
+    for (const form of legacyHashForms(code)) {
+      if (hashTrimmedForm(form) === blockedHash) return true;
+    }
+    return false;
   }
-  /** If the stored hash is legacy, rewrite it to the upper-case hash without dropping the snapshot. */
+  /** If the stored hash is a legacy form, rewrite to the ASCII-upper hash without dropping the snapshot. */
   function migrateBlockedHashIfLegacy(code) {
     if (!autoRegisterBlockedHash) return;
     const cur = hashPairingCode(code);
     if (!cur || cur === autoRegisterBlockedHash) return;
-    if (hashPairingCodeLegacy(code) !== autoRegisterBlockedHash) return;
+    let matchedLegacy = false;
+    for (const form of legacyHashForms(code)) {
+      if (hashTrimmedForm(form) === autoRegisterBlockedHash) {
+        matchedLegacy = true;
+        break;
+      }
+    }
+    if (!matchedLegacy) return;
     const saved = readConfig()[BLOCKED_CONFLICT_KEY];
     persistBlockedHash(cur, saved != null ? saved : null);
   }
