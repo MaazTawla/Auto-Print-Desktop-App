@@ -9,12 +9,15 @@ const { createStationPrintingController } = require("../src/station-printing");
 
 function memoryStore(seed = {}) {
   let cfg = { ...seed };
+  const writes = [];
   return {
     readConfig: () => ({ ...cfg }),
     writeConfig: (partial) => {
+      writes.push({ ...partial });
       cfg = { ...cfg, ...partial };
     },
     get: () => cfg,
+    writes,
   };
 }
 
@@ -100,14 +103,17 @@ describe("pairing-errors: pure policy", () => {
     assert.equal(pe.BUSY_MAX_RETRIES, undefined);
   });
 
-  it("v1.23/v1.24: budget failures = BUSY, BRANCH_MISMATCH, host conflict, AGENT_ALREADY_REGISTERED", () => {
+  it("v1.23/R7D-L1: budget failures = ANY 409 + BRANCH_MISMATCH", () => {
     assert.equal(pe.isBudgetFailure(409, "PAIRING_BUSY"), true);
     assert.equal(pe.isBudgetFailure(403, "BRANCH_MISMATCH"), true);
     assert.equal(pe.isBudgetFailure(409, "PRINT_HOST_ALREADY_CONFIGURED"), true);
     assert.equal(pe.isBudgetFailure(409, "PRINT_AGENT_ALREADY_REGISTERED"), true);
+    assert.equal(pe.isBudgetFailure(409, "SOMETHING_ELSE"), true);
+    assert.equal(pe.isBudgetFailure(409, "SYNC_CONFLICT"), true);
+    assert.equal(pe.isBudgetFailure(409, ""), true);
+    assert.equal(pe.isBudgetFailure(409, null), true);
     assert.equal(pe.isBudgetFailure(429, "PAIRING_RATE_LIMITED"), false);
     assert.equal(pe.isBudgetFailure(401, "PAIRING_CODE_INVALID"), false);
-    assert.equal(pe.isBudgetFailure(409, "SOMETHING_ELSE"), false);
   });
 });
 
@@ -1013,7 +1019,7 @@ describe("v1.24: Bearer on re-register, PRINT_AGENT_ALREADY_REGISTERED", () => {
 
   it("PRINT_AGENT_ALREADY_REGISTERED: show server message, block auto-resend, keep credentials", async () => {
     const MSG =
-      "This device is already paired with this branch. Deregister it in Settings → Printing, then pair again.";
+      "This device is already paired with this branch. Ask an admin to deregister it in Settings → Printing → Print devices, then pair again.";
     const store = memoryStore(
       seed({ agent_token: "", pairing_code: "CODE-X", rabbit_host: "mq.local", rabbit_version: "v7" })
     );
@@ -1029,7 +1035,8 @@ describe("v1.24: Bearer on re-register, PRINT_AGENT_ALREADY_REGISTERED", () => {
     assert.equal(r.ok, false);
     assert.equal(calls, 1);
     assert.match(r.pairingError.message, /already paired/);
-    assert.match(r.pairingError.message, /Deregister/);
+    assert.match(r.pairingError.message, /deregister/i);
+    assert.match(r.pairingError.message, /Print devices/);
     // Not a host conflict — broker creds / flags stay
     assert.equal(ctrl.hostConflict, null);
     assert.equal(store.get().rabbit_host, "mq.local");
@@ -1045,13 +1052,16 @@ describe("v1.24: Bearer on re-register, PRINT_AGENT_ALREADY_REGISTERED", () => {
       data: {
         error: {
           code: "PRINT_AGENT_ALREADY_REGISTERED",
-          message: "This device is already paired with this branch. Deregister it in Settings → Printing, then pair again.",
+          message: "This device is already paired with this branch. Ask an admin to deregister it in Settings → Printing → Print devices, then pair again.",
         },
       },
     }));
-    await ctrl.registerAsHost({ branchId: "147" });
+    const r = await ctrl.registerAsHost({ branchId: "147" });
     assert.equal(store.get().agent_token, "keep|ME");
     assert.equal(ctrl.api.getToken(), "keep|ME");
+    // R7D-I1: hint shown even when a (rejected) token was presented
+    assert.match(r.pairingError.message, /Print devices/);
+    assert.match(r.pairingError.message, /lost its login|deregister/i);
   });
 
   it("ensureSession with pairing code + token prefers register (Bearer) over heartbeat", async () => {
@@ -1093,7 +1103,7 @@ describe("v1.24: Bearer on re-register, PRINT_AGENT_ALREADY_REGISTERED", () => {
         data: {
           error: {
             code: "PRINT_AGENT_ALREADY_REGISTERED",
-            message: "This device is already paired with this branch. Deregister it in Settings → Printing, then pair again.",
+            message: "This device is already paired with this branch. Ask an admin to deregister it in Settings → Printing → Print devices, then pair again.",
           },
         },
       };
@@ -1102,5 +1112,231 @@ describe("v1.24: Bearer on re-register, PRINT_AGENT_ALREADY_REGISTERED", () => {
     await ctrl.ensureSession({ branchId: "147" });
     await ctrl.ensureSession({ branchId: "147" });
     assert.equal(calls, 1);
+  });
+});
+
+
+describe("R7D + BE v1.25 pairing fixes", () => {
+  const AE_DEFAULT =
+    "This device is already paired with this branch. Ask an admin to deregister it in Settings → Printing → Print devices, then pair again.";
+
+  it("R7D-L1: any register 409 blocks auto-resend and keeps credentials", async () => {
+    const bodies = [
+      { error: { code: "WHATEVER" } },
+      {},
+      "",
+      { error: { code: "SYNC_CONFLICT" } },
+    ];
+    for (const data of bodies) {
+      const store = memoryStore(seed({ rabbit_host: "mq.keep", rabbit_version: "v7" }));
+      let calls = 0;
+      const { ctrl } = ctrlWith(store, async () => {
+        calls++;
+        return { status: 409, data };
+      });
+      await ctrl.ensureSession({ branchId: "147" });
+      await ctrl.ensureSession({ branchId: "147" });
+      assert.equal(calls, 1, JSON.stringify(data));
+      assert.equal(store.get().rabbit_host, "mq.keep");
+      assert.equal(ctrl.hostConflict, null);
+    }
+  });
+
+  it("R7D-L2: two Retries then network error still re-blocks", async () => {
+    const BUSY = { status: 409, data: { error: { code: "PAIRING_BUSY" } } };
+    let n = 0;
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => {
+      n++;
+      if (n === 1) return BUSY;
+      if (n === 2) throw new Error("ECONNRESET");
+      return BUSY;
+    });
+    await ctrl.ensureSession({ branchId: "147" });
+    assert.match(store.get().pairing_auto_register_blocked_hash, /^[0-9a-f]{64}$/);
+    ctrl.allowManualRegister();
+    ctrl.allowManualRegister(); // second Retry must not wipe restore hash
+    await assert.rejects(() => ctrl.ensureSession({ branchId: "147" }));
+    assert.match(store.get().pairing_auto_register_blocked_hash, /^[0-9a-f]{64}$/);
+    await ctrl.ensureSession({ branchId: "147" });
+    assert.equal(n, 2); // auto attempt blocked
+  });
+
+  it("R7D-L3: parseAgentError string-only for PRINT_AGENT_ALREADY_REGISTERED", () => {
+    const { parseAgentError } = require("../src/agent-contract");
+    for (const m of [{ a: 1 }, 123, "  ", undefined, null]) {
+      const e = parseAgentError(
+        { error: { code: "PRINT_AGENT_ALREADY_REGISTERED", message: m } },
+        409
+      );
+      assert.equal(e.code, "PRINT_AGENT_ALREADY_REGISTERED");
+      assert.equal(e.message, AE_DEFAULT);
+      assert.ok(!/object Object|123/.test(e.message));
+    }
+    const ok = parseAgentError(
+      { error: { code: "PRINT_AGENT_ALREADY_REGISTERED", message: "Server says X." } },
+      409
+    );
+    assert.equal(ok.message, "Server says X.");
+  });
+
+  it("R7D-L3 end-to-end: non-string AE message shows default, never [object Object]", async () => {
+    for (const m of [{ a: 1 }, 123, "  "]) {
+      const store = memoryStore(seed({ agent_token: "" }));
+      const { ctrl } = ctrlWith(store, async () => ({
+        status: 409,
+        data: { error: { code: "PRINT_AGENT_ALREADY_REGISTERED", message: m } },
+      }));
+      const r = await ctrl.ensureSession({ branchId: "147" });
+      assert.ok(!/object Object|123/.test(r.pairingError.message));
+      assert.match(r.pairingError.message, /already paired/);
+      assert.match(r.pairingError.message, /Print devices/);
+    }
+  });
+
+  it("R7D-L4: token + cleared code saved in ONE writeConfig", async () => {
+    const store = memoryStore(seed({ pairing_code: "CODE-X", agent_token: "" }));
+    const { ctrl } = ctrlWith(store, async () => ({
+      status: 200,
+      headers: {},
+      data: {
+        token: "new|SECRET-TOKEN",
+        branch_id: 147,
+        is_print_host: true,
+        host_epoch: 1,
+        heartbeat_interval_seconds: 30,
+        heartbeat_ttl_seconds: 90,
+        rabbit_version: null,
+      },
+    }));
+    await ctrl.registerAsHost({ branchId: "147" });
+    const tokenWrites = store.writes.filter((w) => Object.prototype.hasOwnProperty.call(w, "agent_token"));
+    const codeClears = store.writes.filter((w) => w.pairing_code === "");
+    assert.equal(tokenWrites.length, 1);
+    assert.ok(tokenWrites[0].pairing_code === "");
+    assert.equal(store.get().agent_token, "new|SECRET-TOKEN");
+    assert.equal(store.get().pairing_code, "");
+    // No separate token-only write before the combined one
+    assert.equal(codeClears.length, 1);
+  });
+
+  it("R7D-I1: lost-token hint on AGENT_EXISTS even when a token was presented", async () => {
+    const TOK = "stale|SECRET";
+    const store = memoryStore(seed({ agent_token: TOK, pairing_code: "CODE-X" }));
+    const logs = [];
+    const { ctrl } = ctrlWith(
+      store,
+      async () => ({
+        status: 409,
+        data: { error: { code: "PRINT_AGENT_ALREADY_REGISTERED", message: "Server says X." } },
+      }),
+      { log: (m) => logs.push(String(m)) }
+    );
+    const r = await ctrl.ensureSession({ branchId: "147" });
+    assert.match(r.pairingError.message, /^Server says X\./);
+    assert.match(r.pairingError.message, /Print devices/);
+    assert.equal(store.get().agent_token, TOK);
+  });
+
+  it("R7D-I2: token never in logs; hint NOT added for non-AE errors", async () => {
+    const TOK = "leak|CHECK-ME";
+    const cases = [
+      { status: 409, data: { error: { code: "PAIRING_BUSY" } }, hint: false },
+      { status: 401, data: { error: { code: "PAIRING_CODE_INVALID", message: "nope" } }, hint: false },
+      {
+        status: 409,
+        data: {
+          error: {
+            code: "PRINT_HOST_ALREADY_CONFIGURED",
+            message: "host taken",
+            current_host: { device_label: "Kitchen", is_online: true },
+          },
+        },
+        hint: false,
+      },
+    ];
+    for (const c of cases) {
+      const logs = [];
+      const states = [];
+      const store = memoryStore(seed({ agent_token: TOK, pairing_code: "CODE-X" }));
+      const { ctrl } = ctrlWith(
+        store,
+        async () => c,
+        {
+          log: (m) => logs.push(String(m)),
+          onStateChange: (st) => states.push(JSON.stringify(st)),
+        }
+      );
+      await ctrl.ensureSession({ branchId: "147" }).catch(() => {});
+      const all = logs.join("\n") + states.join("");
+      assert.ok(!all.includes(TOK), "token leaked for " + JSON.stringify(c.data));
+      if (c.hint === false) {
+        const msg =
+          (ctrl.lastRegisterError && ctrl.lastRegisterError.message) ||
+          (ctrl.hostConflict && ctrl.hostConflict.message) ||
+          "";
+        assert.ok(!/lost its login/.test(msg), "hint wrongly added: " + msg);
+      }
+    }
+  });
+
+  it("v1.25: AE default + hint point to Settings → Printing → Print devices", () => {
+    assert.match(pe.MSG_AGENT_ALREADY_REGISTERED, /Print devices/);
+    assert.match(pe.HINT_AGENT_ALREADY_REGISTERED, /Print devices/);
+    const f = pe.friendlyRegisterError({
+      ok: false,
+      status: 409,
+      code: "PRINT_AGENT_ALREADY_REGISTERED",
+      error: { message: "" },
+    });
+    assert.equal(f.message, pe.MSG_AGENT_ALREADY_REGISTERED);
+    assert.match(f.lostTokenHint, /Print devices/);
+  });
+
+  it("v1.25: demoted host 401 clears auth via existing path; fresh code pairs; no AE loop", async () => {
+    // After Change print host the former host's token is revoked → 401 on heartbeat.
+    // clearLocalAuth + needsPairing; next register with a fresh code succeeds (BE deregistered it).
+    const store = memoryStore(
+      seed({ agent_token: "old|HOST", pairing_code: "", is_print_host: true })
+    );
+    let phase = "hb401";
+    let regs = 0;
+    const { ctrl } = ctrlWith(store, async (req) => {
+      const url = String(req.url || "");
+      if (phase === "hb401" && url.includes("/heartbeat")) {
+        return { status: 401, data: { error: { code: "UNAUTHORIZED", message: "revoked" } } };
+      }
+      if (url.includes("/register")) {
+        regs++;
+        return {
+          status: 200,
+          headers: {},
+          data: {
+            token: "new|OBSERVER",
+            branch_id: 147,
+            is_print_host: false,
+            host_epoch: 5,
+            heartbeat_interval_seconds: 30,
+            heartbeat_ttl_seconds: 90,
+            rabbit_version: null,
+          },
+        };
+      }
+      return { status: 200, headers: {}, data: { is_print_host: false, host_epoch: 5 } };
+    });
+    ctrl.api.setToken("old|HOST");
+    const hb = await ctrl.heartbeat({ branchId: "147" });
+    assert.equal(hb.needsPairing || hb.authError, true);
+    assert.equal(store.get().agent_token, "");
+    assert.equal(ctrl.needsPairing, true);
+    // Fresh code — register once, no AE 409 loop
+    store.writeConfig({ pairing_code: "FRESH-CODE" });
+    phase = "reg";
+    const r1 = await ctrl.ensureSession({ branchId: "147" });
+    assert.equal(r1.ok, true);
+    assert.equal(regs, 1);
+    const r2 = await ctrl.ensureSession({ branchId: "147" }); // heartbeat path (code cleared)
+    assert.equal(regs, 1);
+    assert.equal(r2.ok, true);
   });
 });

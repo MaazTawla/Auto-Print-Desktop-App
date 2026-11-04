@@ -30,6 +30,11 @@ const MSG_BRANCH_MISMATCH =
   "This pairing code belongs to a different branch. Get a new QR code or pairing code from Tawla Settings \u2192 Print host on the web, then try again.";
 const MSG_CONFLICT_UNKNOWN =
   "The server could not complete pairing right now. Please try again.";
+/** v1.25 default when the server omits a usable PRINT_AGENT_ALREADY_REGISTERED message. */
+const MSG_AGENT_ALREADY_REGISTERED =
+  "This device is already paired with this branch. Ask an admin to deregister it in Settings \u2192 Printing \u2192 Print devices, then pair again.";
+const HINT_AGENT_ALREADY_REGISTERED =
+  "If this device lost its login, deregister it in Settings \u2192 Printing \u2192 Print devices (or use Change print host), then pair again.";
 
 /** Upper-cased code; parseAgentError's synthetic "HTTP_<status>" counts as no code. */
 function normCode(code) {
@@ -104,13 +109,11 @@ function isRateLimited(status, code) {
  */
 function isBudgetFailure(status, code) {
   const c = normCode(code);
-  return (
-    isBusy(status, c) ||
-    c === CODE_BRANCH_MISMATCH ||
-    (Number(status) === 409 && c === "PRINT_HOST_ALREADY_CONFIGURED") ||
-    // v1.24: both 409s spend the per-code failure budget; never auto-retry.
-    (Number(status) === 409 && c === CODE_AGENT_ALREADY_REGISTERED)
-  );
+  // R7D-L1 / v1.25: ANY register 409 (unknown code, empty body, SYNC_CONFLICT,
+  // AGENT_ALREADY_REGISTERED, host conflict, BUSY, …) spends the budget and
+  // blocks auto-resend. Credentials stay unless the conflict path drops them.
+  if (Number(status) === 409) return true;
+  return c === CODE_BRANCH_MISMATCH;
 }
 
 function isBusy(status, code) {
@@ -165,21 +168,18 @@ function friendlyRegisterError(result) {
   // v1.24: PRINT_AGENT_ALREADY_REGISTERED — show server message verbatim; not a host
   // conflict (credentials stay). Budget failure (no auto-retry).
   if (status === 409 && code === CODE_AGENT_ALREADY_REGISTERED) {
+    // String-only: never String() a non-string into the UI (R7D-L3 / parseAgentError).
     const raw =
       result.error && typeof result.error.message === "string"
         ? result.error.message.trim()
         : typeof result.message === "string"
           ? result.message.trim()
           : "";
-    const hint =
-      " If this device lost its login, deregister it in Settings → Printing (or use Change print host), then pair again.";
     return {
       code: CODE_AGENT_ALREADY_REGISTERED,
-      message:
-        raw ||
-        "This device is already paired with this branch. Deregister it in Settings → Printing, then pair again.",
-      // Callers that know the token was missing can append hint; keep base message clean.
-      lostTokenHint: hint.trim(),
+      message: raw || MSG_AGENT_ALREADY_REGISTERED,
+      // R7D-I1: callers append whenever the 409 is AGENT_EXISTS (token present or not).
+      lostTokenHint: HINT_AGENT_ALREADY_REGISTERED,
     };
   }
   if (status === 409) {
@@ -202,6 +202,8 @@ module.exports = {
   MSG_CODE_INVALID,
   MSG_CONFLICT_UNKNOWN,
   MSG_BRANCH_MISMATCH,
+  MSG_AGENT_ALREADY_REGISTERED,
+  HINT_AGENT_ALREADY_REGISTERED,
   CODE_BRANCH_MISMATCH,
   rateLimitedMessage,
   retryAfterSeconds,

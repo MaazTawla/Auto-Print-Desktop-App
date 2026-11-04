@@ -752,10 +752,26 @@ function parseAgentError(payload, httpStatus) {
     (err && err.code != null && String(err.code)) ||
     (root.code != null && String(root.code)) ||
     "HTTP_" + String(httpStatus || 0);
-  const message =
-    (err && err.message != null && String(err.message).trim()) ||
-    (root.message != null && String(root.message).trim()) ||
-    `Request failed (${httpStatus})`;
+  const CODE_AGENT_ALREADY_REGISTERED = "PRINT_AGENT_ALREADY_REGISTERED";
+  const MSG_AGENT_ALREADY_REGISTERED =
+    "This device is already paired with this branch. Ask an admin to deregister it in Settings \u2192 Printing \u2192 Print devices, then pair again.";
+  // R7D-L3: for PRINT_AGENT_ALREADY_REGISTERED never String()-coerce a non-string
+  // message into the UI (objects became "[object Object]"). Non-blank string only.
+  let message;
+  if (String(code).trim().toUpperCase() === CODE_AGENT_ALREADY_REGISTERED) {
+    const raw =
+      err && typeof err.message === "string"
+        ? err.message.trim()
+        : typeof root.message === "string"
+          ? root.message.trim()
+          : "";
+    message = raw || MSG_AGENT_ALREADY_REGISTERED;
+  } else {
+    message =
+      (err && err.message != null && String(err.message).trim()) ||
+      (root.message != null && String(root.message).trim()) ||
+      `Request failed (${httpStatus})`;
+  }
   return { code, message, status: httpStatus, details: err || root };
 }
 

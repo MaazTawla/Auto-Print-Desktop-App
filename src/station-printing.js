@@ -243,7 +243,11 @@ function createStationPrintingController(deps = {}) {
 
   /** User pressed Retry / Save & register, or branch changed: allow one more register. */
   function allowManualRegister() {
-    lastClearedBlockedHash = autoRegisterBlockedHash;
+    // R7D-L2: only remember a non-empty hash. A second Retry before a network
+    // attempt must not wipe the restore target with "" (2 Retries + throw still blocks).
+    if (autoRegisterBlockedHash) {
+      lastClearedBlockedHash = autoRegisterBlockedHash;
+    }
     persistBlockedHash("");
   }
 
@@ -463,9 +467,11 @@ function createStationPrintingController(deps = {}) {
       }
       if (friendly) {
         let out = friendly;
+        // R7D-I1: show the lost-token / Print devices hint whenever the server
+        // returned PRINT_AGENT_ALREADY_REGISTERED — including when a (stale/revoked)
+        // token was presented. Base it on the 409 response, not local token presence.
         if (
           friendly.code === "PRINT_AGENT_ALREADY_REGISTERED" &&
-          !existingToken &&
           friendly.lostTokenHint
         ) {
           out = {
@@ -497,10 +503,13 @@ function createStationPrintingController(deps = {}) {
     lastRegisterError = null;
     needsPairing = false;
     if (result.token) {
-      writeConfig({ agent_token: result.token });
       api.setToken(result.token);
     }
     const patch = {};
+    // R7D-L4: token + cleared pairing_code (and the rest) in ONE writeConfig.
+    if (result.token) {
+      patch.agent_token = result.token;
+    }
     if (result.heartbeat_interval_seconds) {
       patch.heartbeat_interval_seconds = result.heartbeat_interval_seconds;
       patch.heartbeat_ttl_seconds = result.heartbeat_ttl_seconds || 90;
