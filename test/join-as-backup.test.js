@@ -851,3 +851,35 @@ describe("R12D: ASCII legacy variants, dual cap, survivor guards", () => {
     }
   });
 });
+
+
+describe("R13D-I3: long non-ASCII codes must not Unicode-fold", () => {
+  const crypto = require("node:crypto");
+  const hashLegacy = (c) =>
+    crypto.createHash("sha256").update(String(c).trim(), "utf8").digest("hex");
+
+  it("R13D-I3: straßeabc vs stored STRASSEABC (>8) must not block (kills Unicode >8 fold)", async () => {
+    // "straßeabc".toUpperCase() === "STRASSEABC" under full Unicode folding, but
+    // BE/ASCII upper keeps ß → STRAßEABC. Codes are >8 chars so only 3 ASCII forms.
+    assert.ok("straßeabc".length > 8);
+    assert.equal("straßeabc".toUpperCase(), "STRASSEABC");
+    const store = memoryStore(
+      seed({
+        pairing_code: "straßeabc",
+        pairing_auto_register_blocked_hash: hashLegacy("STRASSEABC"),
+        pairing_auto_register_blocked_conflict: {
+          device_label: "Old",
+          is_online: false,
+        },
+      })
+    );
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return HOST_CONFLICT;
+    });
+    await ctrl.ensureSession({});
+    assert.equal(calls, 1, "must resend — Unicode fold must not match legacy STRASSEABC");
+    assert.equal(ctrl.publicHostState().hostConflict.current_host.device_label, "Front counter");
+  });
+});
