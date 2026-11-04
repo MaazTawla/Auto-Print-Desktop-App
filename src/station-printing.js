@@ -7,6 +7,7 @@
 "use strict";
 
 const os = require("os");
+const crypto = require("crypto");
 const { createHostOnlyPolicy } = require("./host-only-policy");
 const { getOrCreateAppId } = require("./app-identity");
 const { createPrinterRegistry } = require("./printer-registry");
@@ -68,10 +69,26 @@ function createStationPrintingController(deps = {}) {
     request: deps.request,
   });
 
-  // v1.23: code whose last register spent the shared failure budget (BUSY / BRANCH_MISMATCH /
-  // host conflict). Automatic callers (ensureSession on start/reconnect) must not resend it;
-  // only a user Retry/Connect (allowManualRegister) or a different code does.
-  let autoRegisterBlockedCode = "";
+  // v1.23 / R5D-L1: code whose last register spent the shared failure budget (BUSY /
+  // BRANCH_MISMATCH / host conflict / AGENT_ALREADY_REGISTERED). Automatic callers
+  // (ensureSession on start/reconnect) must not resend it; only a user Retry/Connect
+  // (allowManualRegister), a branch change, or a different code does.
+  // Persist a SHA-256 of the blocked code (never the code itself) so a relaunch does
+  // not burn another budget slot (R5D-L1).
+  const BLOCKED_HASH_KEY = "pairing_auto_register_blocked_hash";
+  function hashPairingCode(code) {
+    const c = String(code || "").trim();
+    if (!c) return "";
+    return crypto.createHash("sha256").update(c, "utf8").digest("hex");
+  }
+  let autoRegisterBlockedHash = String(readConfig()[BLOCKED_HASH_KEY] || "").trim();
+  /** Hash cleared by allowManualRegister; restored if that manual attempt throws (R5D-L2). */
+  let lastClearedBlockedHash = "";
+  function persistBlockedHash(hash) {
+    const h = hash ? String(hash).trim() : "";
+    autoRegisterBlockedHash = h;
+    writeConfig({ [BLOCKED_HASH_KEY]: h });
+  }
   let hostConflict = null; // 409 payload for UI
   let lastRegisterError = null; // { code, message } for inline UI
   let needsPairing = false; // prompt UI after token revoke / deregister
@@ -224,9 +241,10 @@ function createStationPrintingController(deps = {}) {
   }
 
 
-  /** User pressed Retry / Save & register: allow one more register with the same code. */
+  /** User pressed Retry / Save & register, or branch changed: allow one more register. */
   function allowManualRegister() {
-    autoRegisterBlockedCode = "";
+    lastClearedBlockedHash = autoRegisterBlockedHash;
+    persistBlockedHash("");
   }
 
   function clearHostConflict() {
@@ -348,23 +366,29 @@ function createStationPrintingController(deps = {}) {
     const cfg = readConfig();
     const sentCode = String(cfg.pairing_code || "").trim();
     api.setApiBase(cfg.agent_api_base || "");
-    // Register never sends bearer — pairing_code only
-    api.setToken("");
+    // v1.24: re-pair of a live app_id needs the current token as Bearer (old one is
+    // revoked on success). First-time pair has no token — pairing_code only.
+    // Never log the token. Keep whatever is already on the api client / config.
+    const existingToken = String(cfg.agent_token || api.getToken() || "").trim();
+    api.setToken(existingToken);
 
     let result;
     try {
       // v1.23: single attempt — no automatic PAIRING_BUSY retry.
-      result = await api.register({
-        appId,
-        branchId: branchId || cfg.branch_id,
-        deviceLabel: cfg.device_label || defaultDeviceLabel(),
-        pairingCode: cfg.pairing_code || "",
-        role: ASSUMPTIONS.registerRole,
-        agentVersion:
-          agentVersion ||
-          cfg.agent_version ||
-          null,
-      });
+      result = await api.register(
+        {
+          appId,
+          branchId: branchId || cfg.branch_id,
+          deviceLabel: cfg.device_label || defaultDeviceLabel(),
+          pairingCode: cfg.pairing_code || "",
+          role: ASSUMPTIONS.registerRole,
+          agentVersion:
+            agentVersion ||
+            cfg.agent_version ||
+            null,
+        },
+        { bearerToken: existingToken || null }
+      );
     } catch (err) {
       if (
         err &&
@@ -378,6 +402,8 @@ function createStationPrintingController(deps = {}) {
         };
         log(`Register validation: ${lastRegisterError.message}`, "❌");
         onStateChange(publicHostState());
+        // Manual attempt consumed without a network throw — drop restore hint.
+        lastClearedBlockedHash = "";
         return {
           ok: false,
           error: lastRegisterError,
@@ -385,15 +411,30 @@ function createStationPrintingController(deps = {}) {
           shouldConsume: false,
         };
       }
+      // R5D-L2: a manual Retry that throws must re-block so the next timer/HB
+      // does not auto-resend (one click must not become 3 requests).
+      if (lastClearedBlockedHash) {
+        persistBlockedHash(lastClearedBlockedHash);
+        lastClearedBlockedHash = "";
+      }
       throw err;
     }
 
-    autoRegisterBlockedCode =
+    // Manual attempt reached the server — do not restore the prior block on a later throw path.
+    lastClearedBlockedHash = "";
+
+    const budgetFail =
       !result.ok &&
       (result.conflict ||
-        pairingErrors.isBudgetFailure(result.status, result.code || (result.error && result.error.code)))
-        ? sentCode
-        : "";
+        pairingErrors.isBudgetFailure(
+          result.status,
+          result.code || (result.error && result.error.code)
+        ));
+    if (budgetFail) {
+      persistBlockedHash(hashPairingCode(sentCode));
+    } else if (result.ok) {
+      persistBlockedHash("");
+    }
 
     if (!result.ok && result.conflict) {
       hostConflict = result.conflict;
@@ -421,13 +462,24 @@ function createStationPrintingController(deps = {}) {
         needsPairing = true;
       }
       if (friendly) {
-        lastRegisterError = friendly;
+        let out = friendly;
+        if (
+          friendly.code === "PRINT_AGENT_ALREADY_REGISTERED" &&
+          !existingToken &&
+          friendly.lostTokenHint
+        ) {
+          out = {
+            ...friendly,
+            message: `${friendly.message} ${friendly.lostTokenHint}`.trim(),
+          };
+        }
+        lastRegisterError = out;
         log(
-          `Register failed: HTTP ${result.status} ${result.code || ""} — ${friendly.message}`.trim(),
+          `Register failed: HTTP ${result.status} ${result.code || ""} — ${out.message}`.trim(),
           "❌"
         );
         onStateChange(publicHostState());
-        return { ok: false, error: friendly, pairingError: friendly, code: friendly.code, shouldConsume: false };
+        return { ok: false, error: out, pairingError: out, code: out.code, shouldConsume: false };
       }
       lastRegisterError = result.error || {
         code: "REGISTER_FAILED",
@@ -949,8 +1001,12 @@ function createStationPrintingController(deps = {}) {
   async function ensureSession({ branchId } = {}) {
     const cfg = readConfig();
     api.setApiBase(cfg.agent_api_base || "");
-    const token = api.getToken() || cfg.agent_token || "";
-    if (token && String(token).trim()) {
+    const token = String(api.getToken() || cfg.agent_token || "").trim();
+    const code = String(cfg.pairing_code || "").trim();
+    // v1.24: a non-empty pairing code means the user wants to (re)pair. Prefer
+    // register (sending Bearer when we still have a token) over heartbeat resume.
+    // After a successful register the code is cleared, so normal restarts heartbeat.
+    if (token && !code) {
       api.setToken(token);
       const hb = await heartbeat({ branchId });
       if (hb.authError || hb.needsPairing) {
@@ -983,10 +1039,10 @@ function createStationPrintingController(deps = {}) {
         flushPending: hb.flushPending || flushPending,
       };
     }
-    // No token — must register with pairing code.
-    // v1.23: never auto-resend a code whose last register spent the failure budget.
-    const code = String(cfg.pairing_code || "").trim();
-    if (code && autoRegisterBlockedCode && code === autoRegisterBlockedCode) {
+    // Register with pairing code (Bearer attached inside registerAsHostOnce when present).
+    // v1.23 / R5D-L1: never auto-resend a code whose hash matches the persisted block.
+    const codeHash = hashPairingCode(code);
+    if (code && autoRegisterBlockedHash && codeHash === autoRegisterBlockedHash) {
       log("Register not retried automatically for this pairing code — use Retry or enter a new code.", "ℹ️");
       return {
         ok: false,

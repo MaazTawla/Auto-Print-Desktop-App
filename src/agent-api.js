@@ -1,6 +1,6 @@
 /**
  * Print-agent HTTP client: register / heartbeat / deregister / printers-sync / ack / status.
- * Contract v1.0 — flat success bodies; register uses pairing_code (no bearer).
+ * Contract v1.24 — flat success bodies; register uses pairing_code; Bearer on re-pair.
  */
 
 "use strict";
@@ -102,12 +102,18 @@ function createAgentApi(options = {}) {
     };
   }
 
-  async function register(fields) {
+  async function register(fields, opts = {}) {
     const body = buildRegisterRequest(fields);
-    // No bearer on register (contract §2.1)
-    const { status, data, headers } = await call("POST", ENDPOINTS.register, body, {
-      noAuth: true,
-    });
+    // v1.24: first pair = pairing_code only (noAuth). Re-pair of the same app_id must
+    // send Authorization: Bearer <current token>; server rotates it. Never log the token.
+    const bearer =
+      opts && opts.bearerToken != null && String(opts.bearerToken).trim()
+        ? String(opts.bearerToken).trim()
+        : "";
+    const callOpts = bearer
+      ? { noAuth: false, token: bearer }
+      : { noAuth: true };
+    const { status, data, headers } = await call("POST", ENDPOINTS.register, body, callOpts);
     if (status === 409) {
       // v1.21: only a real host conflict takes the conflict path (credential drop).
       // PAIRING_BUSY and unknown 409 codes are plain errors (no credential wipe).

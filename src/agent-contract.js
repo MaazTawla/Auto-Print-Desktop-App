@@ -13,6 +13,7 @@ const PLATFORM = "desktop";
 
 const ERROR_CODES = Object.freeze({
   PRINT_HOST_ALREADY_CONFIGURED: "PRINT_HOST_ALREADY_CONFIGURED",
+  PRINT_AGENT_ALREADY_REGISTERED: "PRINT_AGENT_ALREADY_REGISTERED",
   SYNC_CONFLICT: "SYNC_CONFLICT",
   PAIRING_CODE_INVALID: "PAIRING_CODE_INVALID",
   PAIRING_CODE_EXPIRED: "PAIRING_CODE_EXPIRED",
@@ -231,10 +232,12 @@ function parseHostConflictError(payload, _httpStatus) {
       is_online: typeof on === "boolean" ? on : null,
     };
   }
+  // R5D-I1: only a non-blank string message; objects/`123` must not become "[object Object]".
+  const rawMsg = typeof err.message === "string" ? err.message.trim() : "";
   return {
     code: ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED,
     message:
-      (err.message != null && String(err.message).trim()) ||
+      rawMsg ||
       "Another device is already configured as print host for this branch.",
     current_host,
   };

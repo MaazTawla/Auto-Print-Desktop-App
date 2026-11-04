@@ -1838,6 +1838,10 @@ ipcMain.handle("set-branch-id", async (_e, rawId) => {
     state.branchId = "";
     state.channel = "";
     saveUserConfig({ branch_id: "" });
+    try {
+      const sp = getStationPrinting();
+      if (sp && typeof sp.allowManualRegister === "function") sp.allowManualRegister();
+    } catch (_) {}
     log("Branch ID cleared — set a branch before consuming orders.", "📌");
     pushState();
     resetRabbitReconnectBackoff();
@@ -3388,6 +3392,12 @@ async function applyBranchId(id) {
   state.branchId = id;
   state.channel = resolveRoutingKey(getRoutingKeyTemplate(), id);
   saveUserConfig({ branch_id: id });
+  // R5D-L3: a branch change unblocks auto-register so a BRANCH_MISMATCH user
+  // who fixed the branch does not also have to tap Retry.
+  try {
+    const sp = getStationPrinting();
+    if (sp && typeof sp.allowManualRegister === "function") sp.allowManualRegister();
+  } catch (_) {}
   log(`Branch ID set to ${id} — listening on ${state.channel || "(set routing key)"}`, "📌");
   pushState();
   // Nested call from startRabbit (or race while rabbitStarting): state already synced;

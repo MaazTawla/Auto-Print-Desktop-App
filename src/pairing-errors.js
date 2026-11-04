@@ -19,6 +19,7 @@ const CODE_EXPIRED = "PAIRING_CODE_EXPIRED";
 const CODE_IN_FLIGHT = "REGISTER_IN_FLIGHT";
 const CODE_BRANCH_MISMATCH = "BRANCH_MISMATCH";
 const CODE_REGISTER_CONFLICT_UNKNOWN = "REGISTER_CONFLICT";
+const CODE_AGENT_ALREADY_REGISTERED = "PRINT_AGENT_ALREADY_REGISTERED";
 
 
 const MSG_SERVER_BUSY = "Server busy, please try again.";
@@ -106,7 +107,9 @@ function isBudgetFailure(status, code) {
   return (
     isBusy(status, c) ||
     c === CODE_BRANCH_MISMATCH ||
-    (Number(status) === 409 && c === "PRINT_HOST_ALREADY_CONFIGURED")
+    (Number(status) === 409 && c === "PRINT_HOST_ALREADY_CONFIGURED") ||
+    // v1.24: both 409s spend the per-code failure budget; never auto-retry.
+    (Number(status) === 409 && c === CODE_AGENT_ALREADY_REGISTERED)
   );
 }
 
@@ -159,6 +162,26 @@ function friendlyRegisterError(result) {
   if (isCodeRejected(status, code)) {
     return { code: code || CODE_INVALID, message: MSG_CODE_INVALID };
   }
+  // v1.24: PRINT_AGENT_ALREADY_REGISTERED — show server message verbatim; not a host
+  // conflict (credentials stay). Budget failure (no auto-retry).
+  if (status === 409 && code === CODE_AGENT_ALREADY_REGISTERED) {
+    const raw =
+      result.error && typeof result.error.message === "string"
+        ? result.error.message.trim()
+        : typeof result.message === "string"
+          ? result.message.trim()
+          : "";
+    const hint =
+      " If this device lost its login, deregister it in Settings → Printing (or use Change print host), then pair again.";
+    return {
+      code: CODE_AGENT_ALREADY_REGISTERED,
+      message:
+        raw ||
+        "This device is already paired with this branch. Deregister it in Settings → Printing, then pair again.",
+      // Callers that know the token was missing can append hint; keep base message clean.
+      lostTokenHint: hint.trim(),
+    };
+  }
   if (status === 409) {
     return { code: code || CODE_REGISTER_CONFLICT_UNKNOWN, message: MSG_CONFLICT_UNKNOWN };
   }
@@ -172,6 +195,7 @@ module.exports = {
   CODE_EXPIRED,
   CODE_IN_FLIGHT,
   CODE_REGISTER_CONFLICT_UNKNOWN,
+  CODE_AGENT_ALREADY_REGISTERED,
   RATE_LIMIT_MAX_SECONDS,
   HOURS_FROM_SECONDS,
   MSG_SERVER_BUSY,
