@@ -80,59 +80,100 @@ function createStationPrintingController(deps = {}) {
   /** R8D-L1: minimal host-conflict snapshot so Join/banner survive relaunch. */
   const BLOCKED_CONFLICT_KEY = "pairing_auto_register_blocked_conflict";
   /**
-   * R10D-L1 / R11D-I1: BE uses PHP strtoupper (ASCII a-z only). Match that so
-   * ß/ı/é do not over-block against SS/I/É.
+   * R10D-L1 / R11D-I1 / R12D-L1: BE uses PHP strtoupper (ASCII a-z only).
+   * Extra case forms for legacy hashes also use ASCII-only folding — never
+   * Unicode toLowerCase/toUpperCase — so é/É and straße/STRASSE stay distinct.
    */
   function asciiUpperPairingCode(code) {
     return String(code || "")
       .trim()
       .replace(/[a-z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 32));
   }
+  function asciiLowerForm(s) {
+    return String(s).replace(/[A-Z]/g, (ch) =>
+      String.fromCharCode(ch.charCodeAt(0) + 32)
+    );
+  }
+  function asciiUpperForm(s) {
+    return String(s).replace(/[a-z]/g, (ch) =>
+      String.fromCharCode(ch.charCodeAt(0) - 32)
+    );
+  }
   function hashPairingCode(code) {
     const c = asciiUpperPairingCode(code);
     if (!c) return "";
     return crypto.createHash("sha256").update(c, "utf8").digest("hex");
   }
-  /** sha256 of an already-trimmed form (no further case change). */
+  /** sha256 of an already-formed string (no further case change). */
   function hashTrimmedForm(form) {
     const c = String(form || "");
     if (!c) return "";
     return crypto.createHash("sha256").update(c, "utf8").digest("hex");
   }
   /**
-   * R11D-L1: during migration, a legacy stored hash may be of the trimmed raw,
-   * lowercase, or uppercase form of the code that was blocked. Compare all three
-   * so a case-only retype never resends.
+   * R12D-L1/L2: legacy (pre-normalisation) hash candidates only.
+   * Pairing codes are 8 chars → enumerate every ASCII-letter case variant
+   * (≤256). If length or letter count exceeds 8, fall back to the 3 ASCII
+   * forms (raw / ascii-lower / ascii-upper). Never Unicode case folding.
    */
   function legacyHashForms(code) {
     const trimmed = String(code || "").trim();
     if (!trimmed) return [];
-    const forms = [trimmed, trimmed.toLowerCase(), trimmed.toUpperCase()];
-    // Deduplicate while preserving order.
-    return forms.filter((f, i) => forms.indexOf(f) === i);
+    const letterIdx = [];
+    for (let i = 0; i < trimmed.length; i++) {
+      const c = trimmed.charCodeAt(i);
+      if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) letterIdx.push(i);
+    }
+    const n = letterIdx.length;
+    if (trimmed.length > 8 || n > 8) {
+      const forms = [trimmed, asciiLowerForm(trimmed), asciiUpperForm(trimmed)];
+      return forms.filter((f, i) => forms.indexOf(f) === i);
+    }
+    if (n === 0) return [trimmed];
+    const out = [];
+    const total = 1 << n;
+    for (let mask = 0; mask < total; mask++) {
+      let s = "";
+      let bit = 0;
+      for (let i = 0; i < trimmed.length; i++) {
+        const c = trimmed.charCodeAt(i);
+        const isLetter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+        if (!isLetter) {
+          s += trimmed[i];
+          continue;
+        }
+        const base = c >= 97 ? c - 32 : c;
+        const upper = (mask & (1 << bit)) !== 0;
+        bit++;
+        s += String.fromCharCode(upper ? base : base + 32);
+      }
+      out.push(s);
+    }
+    return out;
   }
-  function codeMatchesBlockedHash(code, blockedHash) {
+  function legacyHashMatches(code, blockedHash) {
     if (!blockedHash) return false;
-    const cur = hashPairingCode(code);
-    if (cur && cur === blockedHash) return true;
     for (const form of legacyHashForms(code)) {
       if (hashTrimmedForm(form) === blockedHash) return true;
     }
     return false;
+  }
+  function codeMatchesBlockedHash(code, blockedHash) {
+    if (!blockedHash) return false;
+    // Current-format hash (ASCII-upper normalisation) — never run legacy forms
+    // against this path (R12D-L1).
+    const cur = hashPairingCode(code);
+    if (cur && cur === blockedHash) return true;
+    return legacyHashMatches(code, blockedHash);
   }
   /** If the stored hash is a legacy form, rewrite to the ASCII-upper hash without dropping the snapshot. */
   function migrateBlockedHashIfLegacy(code) {
     if (!autoRegisterBlockedHash) return;
     const cur = hashPairingCode(code);
     if (!cur || cur === autoRegisterBlockedHash) return;
-    let matchedLegacy = false;
-    for (const form of legacyHashForms(code)) {
-      if (hashTrimmedForm(form) === autoRegisterBlockedHash) {
-        matchedLegacy = true;
-        break;
-      }
-    }
-    if (!matchedLegacy) return;
+    // Only migrate when the stored hash matched via the legacy path, not when
+    // it already is the current-format hash of this code.
+    if (!legacyHashMatches(code, autoRegisterBlockedHash)) return;
     const saved = readConfig()[BLOCKED_CONFLICT_KEY];
     persistBlockedHash(cur, saved != null ? saved : null);
   }

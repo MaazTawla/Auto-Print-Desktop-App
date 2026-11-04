@@ -212,10 +212,17 @@ function parseRegisterResponse(data) {
 const MAX_HOST_DEVICE_LABEL = 120;
 
 /**
- * R10D-I1/I2 + R11D-I2: string-only host label, capped at 120 graphemes
- * (Intl.Segmenter when available; else Unicode code points via Array.from).
- * Non-strings → "".
+ * R10D-I1/I2 + R11D-I2 + R12D-I1: string-only host label, capped at 120
+ * graphemes AND 120 code points (whichever prefix is shorter), matching BE
+ * mb_strlen. Intl.Segmenter when available; else code-point cut via Array.from
+ * (never UTF-16 string.slice). Non-strings → "".
  */
+function capHostDeviceLabelByCodePoints(raw) {
+  const chars = Array.from(raw);
+  return chars.length > MAX_HOST_DEVICE_LABEL
+    ? chars.slice(0, MAX_HOST_DEVICE_LABEL).join("")
+    : raw;
+}
 function capHostDeviceLabel(label) {
   if (typeof label !== "string") return "";
   const raw = label.trim();
@@ -224,21 +231,22 @@ function capHostDeviceLabel(label) {
     try {
       const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
       const parts = [];
+      let cps = 0;
       for (const { segment } of seg.segment(raw)) {
-        parts.push(segment);
-        if (parts.length > MAX_HOST_DEVICE_LABEL) {
-          return parts.slice(0, MAX_HOST_DEVICE_LABEL).join("");
+        const segCp = Array.from(segment).length;
+        // R12D-I1: stop when another grapheme would exceed 120 graphemes OR 120 code points.
+        if (parts.length + 1 > MAX_HOST_DEVICE_LABEL || cps + segCp > MAX_HOST_DEVICE_LABEL) {
+          break;
         }
+        parts.push(segment);
+        cps += segCp;
       }
-      return raw;
+      return parts.join("");
     } catch (_) {
-      /* fall through to code-point cut */
+      /* fall through to code-point cut (never return raw uncut) */
     }
   }
-  const chars = Array.from(raw);
-  return chars.length > MAX_HOST_DEVICE_LABEL
-    ? chars.slice(0, MAX_HOST_DEVICE_LABEL).join("")
-    : raw;
+  return capHostDeviceLabelByCodePoints(raw);
 }
 
 function parseHostConflictError(payload, _httpStatus) {
