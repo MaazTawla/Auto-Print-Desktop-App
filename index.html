@@ -3929,13 +3929,7 @@
         const meta = document.getElementById('host-conflict-meta');
         if (msg) msg.textContent = conflict.message || 'Another device is already configured as print host for this branch.';
         if (meta) {
-          const host = conflict.current_host;
-          if (host) {
-            const online = host.is_online ? 'online' : 'offline';
-            meta.textContent = 'Current host: ' + (host.device_label || host.app_id || '—') + ' (' + online + '). If you reinstalled this app, your app id changed — admin must Change print host to this PC.';
-          } else {
-            meta.textContent = 'If you reinstalled this app, your app id changed — admin must Change print host to this PC, then tap Retry.';
-          }
+          meta.textContent = window.PairingUiPolicy.hostConflictMeta(conflict.current_host);
         }
       }
     }

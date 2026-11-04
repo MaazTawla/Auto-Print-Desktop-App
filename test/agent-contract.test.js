@@ -309,7 +309,8 @@ describe("SYNC_CONFLICT vs PRINT_HOST_ALREADY_CONFIGURED", () => {
       409
     );
     assert.equal(h.code, ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED);
-    assert.equal(h.current_host.app_id, "other");
+    assert.equal(h.current_host.app_id, undefined);
+    assert.equal(h.current_host.device_label, "Old");
   });
 
   it("syncConflictBackoffMs is short and jittered", () => {

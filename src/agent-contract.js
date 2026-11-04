@@ -217,30 +217,26 @@ function parseHostConflictError(payload, _httpStatus) {
   // A 409 with no code gets the generic friendly error (no credential drop).
   if (code !== ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED) return null;
 
-  const current = err.current_host || err.currentHost || null;
+  // v1.23: BE sends only device_label + is_online. app_id / last_heartbeat_at are never
+  // read, stored or logged (security), even if an older server still sends them.
+  const raw = err.current_host || err.currentHost;
+  const current = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  let current_host = null;
+  if (current) {
+    const lbl = current.device_label != null ? current.device_label : current.deviceLabel;
+    const label = typeof lbl === "string" ? lbl.trim() : "";
+    const on = current.is_online !== undefined ? current.is_online : current.isOnline;
+    current_host = {
+      device_label: label,
+      is_online: typeof on === "boolean" ? on : null,
+    };
+  }
   return {
     code: ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED,
     message:
       (err.message != null && String(err.message).trim()) ||
       "Another device is already configured as print host for this branch.",
-    current_host: current
-      ? {
-          app_id: current.app_id != null ? String(current.app_id) : "",
-          device_label:
-            current.device_label != null
-              ? String(current.device_label)
-              : current.deviceLabel != null
-                ? String(current.deviceLabel)
-                : "",
-          last_heartbeat_at:
-            current.last_heartbeat_at != null
-              ? String(current.last_heartbeat_at)
-              : current.lastHeartbeatAt != null
-                ? String(current.lastHeartbeatAt)
-                : null,
-          is_online: Boolean(current.is_online ?? current.isOnline ?? false),
-        }
-      : null,
+    current_host,
   };
 }
 

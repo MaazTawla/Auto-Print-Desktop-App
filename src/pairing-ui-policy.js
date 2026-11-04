@@ -45,5 +45,27 @@
     return fallback || "";
   }
 
-  return { isFreshPairingPrompt, shouldClearField, createFieldClearTracker, errorText };
+  /**
+   * v1.23: host-conflict banner line. Uses only device_label + is_online; never an id,
+   * never "null"/"undefined". Blank/missing label → "another device"; unknown online → omitted.
+   */
+  const GENERIC_HOST_LABEL = "another device";
+  function hostConflictMeta(host) {
+    const tail = "If you reinstalled this app, admin must Change print host to this PC, then tap Retry.";
+    if (!host || typeof host !== "object") return tail;
+    const raw = typeof host.device_label === "string" ? host.device_label.trim() : "";
+    const label = raw && !/^(null|undefined)$/i.test(raw) ? raw : GENERIC_HOST_LABEL;
+    const online =
+      host.is_online === true ? " (online)" : host.is_online === false ? " (offline)" : "";
+    return "Current host: " + label + online + ". " + tail;
+  }
+
+  return {
+    isFreshPairingPrompt,
+    shouldClearField,
+    createFieldClearTracker,
+    errorText,
+    hostConflictMeta,
+    GENERIC_HOST_LABEL,
+  };
 });

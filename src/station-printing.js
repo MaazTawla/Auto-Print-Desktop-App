@@ -68,9 +68,10 @@ function createStationPrintingController(deps = {}) {
     request: deps.request,
   });
 
-  const busyRandom = typeof deps.random === "function" ? deps.random : Math.random;
-  const registerSleep = (ms) =>
-    typeof deps.sleep === "function" ? deps.sleep(ms) : new Promise((r) => setTimeout(r, ms));
+  // v1.23: code whose last register spent the shared failure budget (BUSY / BRANCH_MISMATCH /
+  // host conflict). Automatic callers (ensureSession on start/reconnect) must not resend it;
+  // only a user Retry/Connect (allowManualRegister) or a different code does.
+  let autoRegisterBlockedCode = "";
   let hostConflict = null; // 409 payload for UI
   let lastRegisterError = null; // { code, message } for inline UI
   let needsPairing = false; // prompt UI after token revoke / deregister
@@ -223,6 +224,11 @@ function createStationPrintingController(deps = {}) {
   }
 
 
+  /** User pressed Retry / Save & register: allow one more register with the same code. */
+  function allowManualRegister() {
+    autoRegisterBlockedCode = "";
+  }
+
   function clearHostConflict() {
     hostConflict = null;
     onStateChange(publicHostState());
@@ -347,7 +353,8 @@ function createStationPrintingController(deps = {}) {
 
     let result;
     try {
-      result = await pairingErrors.runBusyRetry(() => api.register({
+      // v1.23: single attempt — no automatic PAIRING_BUSY retry.
+      result = await api.register({
         appId,
         branchId: branchId || cfg.branch_id,
         deviceLabel: cfg.device_label || defaultDeviceLabel(),
@@ -357,7 +364,7 @@ function createStationPrintingController(deps = {}) {
           agentVersion ||
           cfg.agent_version ||
           null,
-      }), { sleep: registerSleep, random: busyRandom });
+      });
     } catch (err) {
       if (
         err &&
@@ -380,6 +387,13 @@ function createStationPrintingController(deps = {}) {
       }
       throw err;
     }
+
+    autoRegisterBlockedCode =
+      !result.ok &&
+      (result.conflict ||
+        pairingErrors.isBudgetFailure(result.status, result.code || (result.error && result.error.code)))
+        ? sentCode
+        : "";
 
     if (!result.ok && result.conflict) {
       hostConflict = result.conflict;
@@ -969,7 +983,20 @@ function createStationPrintingController(deps = {}) {
         flushPending: hb.flushPending || flushPending,
       };
     }
-    // No token — must register with pairing code
+    // No token — must register with pairing code.
+    // v1.23: never auto-resend a code whose last register spent the failure budget.
+    const code = String(cfg.pairing_code || "").trim();
+    if (code && autoRegisterBlockedCode && code === autoRegisterBlockedCode) {
+      log("Register not retried automatically for this pairing code — use Retry or enter a new code.", "ℹ️");
+      return {
+        ok: false,
+        resumed: false,
+        autoRetryBlocked: true,
+        pairingError: lastRegisterError,
+        error: lastRegisterError,
+        shouldConsume: false,
+      };
+    }
     const reg = await registerAsHost({ branchId });
     return { ...reg, resumed: false };
   }
@@ -1349,6 +1376,7 @@ function createStationPrintingController(deps = {}) {
     handleAuthFailure,
     evaluateAuthFailure: handleAuthFailure,
     registerAsHost,
+    allowManualRegister,
     isRegisterInFlight,
     ensureSession,
     heartbeat,

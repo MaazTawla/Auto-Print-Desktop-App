@@ -94,48 +94,19 @@ describe("pairing-errors: pure policy", () => {
     assert.equal(pe.shouldClearCode("", ""), false);
   });
 
-  it("jitter stays within 500–1500ms", () => {
-    assert.equal(pe.jitterDelayMs(() => 0), 500);
-    assert.equal(pe.jitterDelayMs(() => 1), 1500);
-    assert.equal(pe.jitterDelayMs(() => 0.5), 1000);
+  it("v1.23: dead retry helpers are gone", () => {
+    assert.equal(pe.runBusyRetry, undefined);
+    assert.equal(pe.jitterDelayMs, undefined);
+    assert.equal(pe.BUSY_MAX_RETRIES, undefined);
   });
 
-  it("busy retry: exactly 4 calls and 3 pauses when always busy", async () => {
-    let calls = 0;
-    const sleeps = [];
-    const r = await pe.runBusyRetry(
-      async () => {
-        calls++;
-        return { ok: false, status: 409, code: "PAIRING_BUSY" };
-      },
-      { sleep: async (ms) => sleeps.push(ms), random: () => 0.25 }
-    );
-    assert.equal(calls, 4);
-    assert.equal(sleeps.length, 3);
-    for (const ms of sleeps) assert.ok(ms >= 500 && ms <= 1500);
-    assert.equal(r.code, "PAIRING_BUSY");
-  });
-
-  it("busy retry stops on first non-busy result", async () => {
-    let calls = 0;
-    const r = await pe.runBusyRetry(
-      async () => (++calls < 2 ? { ok: false, status: 409, code: "PAIRING_BUSY" } : { ok: true }),
-      { sleep: async () => {} }
-    );
-    assert.equal(calls, 2);
-    assert.equal(r.ok, true);
-  });
-
-  it("busy retry does not retry a non-409 PAIRING_BUSY-like result", async () => {
-    let calls = 0;
-    await pe.runBusyRetry(
-      async () => {
-        calls++;
-        return { ok: false, status: 429, code: "PAIRING_RATE_LIMITED" };
-      },
-      { sleep: async () => {} }
-    );
-    assert.equal(calls, 1);
+  it("v1.23: budget failures = BUSY, BRANCH_MISMATCH, 409 host conflict", () => {
+    assert.equal(pe.isBudgetFailure(409, "PAIRING_BUSY"), true);
+    assert.equal(pe.isBudgetFailure(403, "BRANCH_MISMATCH"), true);
+    assert.equal(pe.isBudgetFailure(409, "PRINT_HOST_ALREADY_CONFIGURED"), true);
+    assert.equal(pe.isBudgetFailure(429, "PAIRING_RATE_LIMITED"), false);
+    assert.equal(pe.isBudgetFailure(401, "PAIRING_CODE_INVALID"), false);
+    assert.equal(pe.isBudgetFailure(409, "SOMETHING_ELSE"), false);
   });
 });
 
@@ -230,7 +201,7 @@ describe("station-printing register: pairing errors", () => {
     assert.ok(!JSON.stringify(st.lastRegisterError).includes(RAW));
   });
 
-  it("409 PAIRING_BUSY: 4 calls, 3 jittered pauses, friendly message, no credential wipe", async () => {
+  it("409 PAIRING_BUSY: exactly 1 call, no pauses, friendly message, no credential wipe", async () => {
     const store = memoryStore(seed());
     let calls = 0;
     const { ctrl, sleeps } = ctrlWith(store, async () => {
@@ -238,9 +209,8 @@ describe("station-printing register: pairing errors", () => {
       return { status: 409, data: { error: { code: "PAIRING_BUSY", message: RAW } } };
     });
     const r = await ctrl.registerAsHost({ branchId: "147" });
-    assert.equal(calls, 4);
-    assert.equal(sleeps.length, 3);
-    for (const ms of sleeps) assert.ok(ms >= 500 && ms <= 1500);
+    assert.equal(calls, 1);
+    assert.equal(sleeps.length, 0);
     assert.equal(r.ok, false);
     assert.equal(r.conflict, undefined);
     assert.equal(r.error.code, "PAIRING_BUSY");
@@ -251,17 +221,20 @@ describe("station-printing register: pairing errors", () => {
     assert.equal(ctrl.publicHostState().hostConflict, null);
   });
 
-  it("409 PAIRING_BUSY then success registers", async () => {
+  it("409 PAIRING_BUSY then a manual retry succeeds (2 calls, one per user action)", async () => {
     const store = memoryStore(seed());
     let calls = 0;
     const { ctrl } = ctrlWith(store, async () => {
       calls++;
-      if (calls < 3) return { status: 409, data: { error: { code: "PAIRING_BUSY" } } };
+      if (calls < 2) return { status: 409, data: { error: { code: "PAIRING_BUSY" } } };
       return { status: 200, data: { token: "t", is_print_host: true, host_epoch: 2, branch_id: 147 } };
     });
-    const r = await ctrl.registerAsHost({ branchId: "147" });
-    assert.equal(calls, 3);
-    assert.equal(r.ok, true);
+    const r1 = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(calls, 1);
+    assert.equal(r1.ok, false);
+    const r2 = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(calls, 2);
+    assert.equal(r2.ok, true);
   });
 
   it("409 unknown code: generic friendly error, no credential wipe, no conflict", async () => {
@@ -703,5 +676,210 @@ describe("QA 52c60f69: Android cross-check (L1, I1, I2)", () => {
     assert.equal(g.message, W("5 seconds"));
     const h = pe.friendlyRegisterError({ ok: false, status: 403, code: "BRANCH_MISMATCH" });
     assert.equal(h.code, "BRANCH_MISMATCH");
+  });
+});
+
+describe("v1.23: shared failure budget — no automatic resend", () => {
+  const cases = [
+    ["409 PAIRING_BUSY", { status: 409, data: { error: { code: "PAIRING_BUSY" } } }],
+    ["403 BRANCH_MISMATCH", { status: 403, data: { error: { code: "BRANCH_MISMATCH" } } }],
+    ["409 PRINT_HOST_ALREADY_CONFIGURED", { status: 409, data: { error: { code: "PRINT_HOST_ALREADY_CONFIGURED", message: "x" } } }],
+  ];
+  for (const [name, resp] of cases) {
+    it(`${name}: ensureSession (auto resume) does not resend the same code`, async () => {
+      const store = memoryStore(seed());
+      let calls = 0;
+      const { ctrl, sleeps } = ctrlWith(store, async () => {
+        calls++;
+        return resp;
+      });
+      await ctrl.ensureSession({ branchId: "147" });
+      assert.equal(calls, 1);
+      const again = await ctrl.ensureSession({ branchId: "147" });
+      await ctrl.ensureSession({ branchId: "147" });
+      assert.equal(calls, 1);
+      assert.equal(sleeps.length, 0);
+      assert.equal(again.ok, false);
+      assert.equal(again.autoRetryBlocked, true);
+    });
+  }
+
+  it("busy message on the blocked result is the friendly one", async () => {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => ({ status: 409, data: { error: { code: "PAIRING_BUSY", message: RAW } } }));
+    await ctrl.ensureSession({ branchId: "147" });
+    const again = await ctrl.ensureSession({ branchId: "147" });
+    assert.equal(again.pairingError.message, pe.MSG_SERVER_BUSY);
+    assert.ok(!JSON.stringify(again).includes(RAW));
+  });
+
+  it("allowManualRegister (user Retry) lets exactly one more attempt through", async () => {
+    const store = memoryStore(seed());
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return { status: 409, data: { error: { code: "PAIRING_BUSY" } } };
+    });
+    await ctrl.ensureSession({ branchId: "147" });
+    ctrl.allowManualRegister();
+    await ctrl.ensureSession({ branchId: "147" });
+    assert.equal(calls, 2);
+    await ctrl.ensureSession({ branchId: "147" });
+    assert.equal(calls, 2);
+  });
+
+  it("a new code is sent automatically", async () => {
+    const store = memoryStore(seed());
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return { status: 409, data: { error: { code: "PAIRING_BUSY" } } };
+    });
+    await ctrl.ensureSession({ branchId: "147" });
+    store.writeConfig({ pairing_code: "CODE-Y" });
+    await ctrl.ensureSession({ branchId: "147" });
+    assert.equal(calls, 2);
+  });
+
+  it("429 and network errors are not budget failures: auto resume may resend", async () => {
+    const store = memoryStore(seed());
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return { status: 429, data: { error: { code: "PAIRING_RATE_LIMITED", retry_after_seconds: 5 } } };
+    });
+    await ctrl.ensureSession({ branchId: "147" });
+    await ctrl.ensureSession({ branchId: "147" });
+    assert.equal(calls, 2);
+  });
+
+  it("after the budget runs out, the 401 INVALID (via manual retry) clears the code", async () => {
+    const store = memoryStore(seed());
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      if (calls === 1) return { status: 409, data: { error: { code: "PAIRING_BUSY" } } };
+      return { status: 401, data: { error: { code: "PAIRING_CODE_INVALID" } } };
+    });
+    await ctrl.ensureSession({ branchId: "147" });
+    ctrl.allowManualRegister();
+    const r = await ctrl.ensureSession({ branchId: "147" });
+    assert.equal(calls, 2);
+    assert.equal(r.ok, false);
+    assert.equal(ctrl.publicHostState().needsPairing, true);
+    assert.equal(String(store.get().pairing_code || ""), "");
+  });
+
+  it("main.js retry handler re-allows a manual register", () => {
+    const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "src", "main.js"), "utf8");
+    assert.match(src, /sp\.clearHostConflict\(\);\s*\/\/[^\n]*\n\s*sp\.allowManualRegister\(\);/);
+  });
+});
+
+describe("v1.23: 400-digit Retry-After pins the 12-digit rule", () => {
+  const { parseRegisterRetryAfterMs, REGISTER_RETRY_AFTER_MAX_MS } = require("../src/agent-api");
+  it("400 digits → cap and 'try again later'", async () => {
+    const huge = "9".repeat(400);
+    assert.equal(parseRegisterRetryAfterMs(huge), REGISTER_RETRY_AFTER_MAX_MS);
+    const huge1 = "1" + "0".repeat(399);
+    assert.equal(parseRegisterRetryAfterMs(huge1), REGISTER_RETRY_AFTER_MAX_MS);
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => ({
+      status: 429,
+      headers: { "retry-after": huge },
+      data: { error: { code: "PAIRING_RATE_LIMITED" } },
+    }));
+    const r = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(r.error.code, "PAIRING_RATE_LIMITED");
+    assert.equal(r.error.message, pe.rateLimitedMessage(86401));
+  });
+});
+
+describe("v1.23: 409 current_host is only device_label + is_online", () => {
+  const { parseHostConflictError } = require("../src/agent-contract");
+  const ui = require("../src/pairing-ui-policy");
+  const C = (current_host) =>
+    parseHostConflictError(
+      { error: { code: "PRINT_HOST_ALREADY_CONFIGURED", message: "taken", ...(current_host === undefined ? {} : { current_host }) } },
+      409
+    );
+  const SECRET_ID = "app-0f9e-SECRET-ID";
+
+  it("new shape: no app_id / last_heartbeat_at", () => {
+    const h = C({ device_label: "Front PC", is_online: true });
+    assert.deepEqual(h.current_host, { device_label: "Front PC", is_online: true });
+  });
+
+  it("old server still sending app_id / last_heartbeat_at: both dropped", () => {
+    const h = C({ app_id: SECRET_ID, last_heartbeat_at: "2026-11-04T10:00:00Z", device_label: "X", is_online: false });
+    assert.deepEqual(Object.keys(h.current_host).sort(), ["device_label", "is_online"]);
+    assert.ok(!JSON.stringify(h).includes(SECRET_ID));
+  });
+
+  for (const [name, lbl] of [["null", null], ["blank", "   "], ["missing", undefined], ["number", 7], ["object", {}]]) {
+    it(`device_label ${name} → "" and banner says "another device"`, () => {
+      const h = C(lbl === undefined ? { is_online: true } : { device_label: lbl, is_online: true });
+      assert.equal(h.current_host.device_label, "");
+      const t = ui.hostConflictMeta(h.current_host);
+      assert.match(t, /^Current host: another device \(online\)\. /);
+      assert.ok(!/null|undefined|\[object/.test(t));
+    });
+  }
+
+  it("is_online missing or non-boolean → null, banner omits status", () => {
+    for (const on of [undefined, null, "yes", 1]) {
+      const h = C(on === undefined ? { device_label: "Bar" } : { device_label: "Bar", is_online: on });
+      assert.equal(h.current_host.is_online, null);
+      assert.equal(ui.hostConflictMeta(h.current_host).startsWith("Current host: Bar. "), true);
+    }
+    assert.match(ui.hostConflictMeta({ device_label: "Bar", is_online: false }), /Bar \(offline\)/);
+  });
+
+  it("no current_host / null / non-object → null, generic banner, no crash", () => {
+    for (const v of [undefined, null, "str", 5, ["a"]]) {
+      const h = C(v);
+      assert.equal(h.current_host, null);
+      const t = ui.hostConflictMeta(h.current_host);
+      assert.ok(!t.startsWith("Current host"));
+      assert.ok(!/null|undefined/.test(t));
+    }
+  });
+
+  it("hostConflictMeta on a non-object host gives the generic line", () => {
+    for (const v of ["str", 5, true]) assert.ok(!ui.hostConflictMeta(v).startsWith("Current host"));
+  });
+
+  it("literal 'null' label is not shown", () => {
+    assert.match(ui.hostConflictMeta({ device_label: "null", is_online: true }), /another device/);
+  });
+
+  it("banner never shows an id even if one is passed in", () => {
+    const t = ui.hostConflictMeta({ app_id: SECRET_ID, device_label: "", is_online: true });
+    assert.ok(!t.includes(SECRET_ID));
+  });
+
+  it("controller: app_id is not stored, logged or exposed", async () => {
+    const store = memoryStore(seed());
+    const logs = [];
+    const ctrl = createStationPrintingController({
+      ...store,
+      log: (...a) => logs.push(a.join(" ")),
+      request: async () => ({
+        status: 409,
+        headers: {},
+        data: { error: { code: "PRINT_HOST_ALREADY_CONFIGURED", current_host: { app_id: SECRET_ID, last_heartbeat_at: "t", is_online: true } } },
+      }),
+    });
+    const r = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(r.ok, false);
+    const everything = JSON.stringify([store.get(), ctrl.publicHostState(), ctrl.hostConflict, r, logs]);
+    assert.ok(!everything.includes(SECRET_ID));
+    assert.ok(!everything.includes("last_heartbeat_at"));
+  });
+
+  it("index.html banner uses hostConflictMeta and never reads host.app_id", () => {
+    const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "index.html"), "utf8");
+    assert.match(src, /PairingUiPolicy\.hostConflictMeta\(conflict\.current_host\)/);
+    assert.ok(!/current_host[^;\n]*app_id|host\.app_id/.test(src));
   });
 });

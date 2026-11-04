@@ -2028,6 +2028,8 @@ ipcMain.handle("retry-print-host-register", async () => {
   try {
     const sp = getStationPrinting();
     sp.clearHostConflict();
+    // v1.23: a user Retry/Connect may resend a code that auto-resume will not.
+    sp.allowManualRegister();
     const cfg = readUserConfig();
     if (!(cfg.pairing_code && String(cfg.pairing_code).trim())) {
       const pairingError = {

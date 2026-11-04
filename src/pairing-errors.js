@@ -3,7 +3,9 @@
  * (PairingErrorMapper, PairingBusyRetry, PairingCodeClear).
  *
  * - 429 PAIRING_RATE_LIMITED: friendly wait message; never a bad code; never clears the code.
- * - 409 PAIRING_BUSY: temporary; retried with jitter (4 calls max, 3 pauses of 0.5–1.5s).
+ * - 409 PAIRING_BUSY: one attempt, "Server busy, please try again."; never auto-retried (v1.23:
+ *   BUSY, BRANCH_MISMATCH and PRINT_HOST_ALREADY_CONFIGURED share a 5-failure budget per code,
+ *   after which the code returns 401 PAIRING_CODE_INVALID). The user retries by hand.
  * - 401 PAIRING_CODE_INVALID / PAIRING_CODE_EXPIRED / 401 with no code: the code is dead.
  * - Backend messages are never shown for these cases.
  */
@@ -18,14 +20,11 @@ const CODE_IN_FLIGHT = "REGISTER_IN_FLIGHT";
 const CODE_BRANCH_MISMATCH = "BRANCH_MISMATCH";
 const CODE_REGISTER_CONFLICT_UNKNOWN = "REGISTER_CONFLICT";
 
-const BUSY_MAX_RETRIES = 3;
-const BUSY_MIN_DELAY_MS = 500;
-const BUSY_MAX_DELAY_MS = 1500;
 
 const MSG_SERVER_BUSY = "Server busy, please try again.";
 const MSG_CODE_INVALID =
   "This pairing code is expired or already used. Generate a new code in Tawla Settings \u2192 Print host on the web, then enter it again.";
-/** v1.22: never auto-retried; code is kept (5th mismatch → later 401 INVALID clears it). */
+/** v1.22/v1.23: never auto-retried; code is kept (budget exhausted → later 401 INVALID clears it). */
 const MSG_BRANCH_MISMATCH =
   "This pairing code belongs to a different branch. Get a new QR code or pairing code from Tawla Settings \u2192 Print host on the web, then try again.";
 const MSG_CONFLICT_UNKNOWN =
@@ -98,6 +97,19 @@ function isRateLimited(status, code) {
   return Number(status) === 429 || normCode(code) === CODE_RATE_LIMITED;
 }
 
+/**
+ * v1.23: failures that spend the code's shared 5-failure budget. Never auto-retried
+ * with the same code; only a user Retry/Connect (or a new code) sends it again.
+ */
+function isBudgetFailure(status, code) {
+  const c = normCode(code);
+  return (
+    isBusy(status, c) ||
+    c === CODE_BRANCH_MISMATCH ||
+    (Number(status) === 409 && c === "PRINT_HOST_ALREADY_CONFIGURED")
+  );
+}
+
 function isBusy(status, code) {
   return Number(status) === 409 && normCode(code) === CODE_BUSY;
 }
@@ -118,27 +130,6 @@ function shouldClearCode(storedCode, sentCode) {
   const sent = sentCode == null ? "" : String(sentCode).trim();
   const stored = storedCode == null ? "" : String(storedCode).trim();
   return sent !== "" && stored === sent;
-}
-
-function jitterDelayMs(randomFn = Math.random) {
-  const r = Number(randomFn());
-  const u = Number.isFinite(r) ? Math.min(Math.max(r, 0), 1) : 0.5;
-  return Math.round(BUSY_MIN_DELAY_MS + u * (BUSY_MAX_DELAY_MS - BUSY_MIN_DELAY_MS));
-}
-
-/** Runs attempt once, then up to maxRetries more times while it returns 409 PAIRING_BUSY. */
-async function runBusyRetry(attempt, opts = {}) {
-  const maxRetries = opts.maxRetries != null ? opts.maxRetries : BUSY_MAX_RETRIES;
-  const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
-  const delayMs = opts.delayMs || (() => jitterDelayMs(opts.random));
-  let result = await attempt();
-  let retries = 0;
-  while (result && !result.ok && isBusy(result.status, result.code) && retries < maxRetries) {
-    await sleep(delayMs());
-    retries++;
-    result = await attempt();
-  }
-  return result;
 }
 
 /**
@@ -181,11 +172,8 @@ module.exports = {
   CODE_EXPIRED,
   CODE_IN_FLIGHT,
   CODE_REGISTER_CONFLICT_UNKNOWN,
-  BUSY_MAX_RETRIES,
   RATE_LIMIT_MAX_SECONDS,
   HOURS_FROM_SECONDS,
-  BUSY_MIN_DELAY_MS,
-  BUSY_MAX_DELAY_MS,
   MSG_SERVER_BUSY,
   MSG_CODE_INVALID,
   MSG_CONFLICT_UNKNOWN,
@@ -195,9 +183,8 @@ module.exports = {
   retryAfterSeconds,
   isRateLimited,
   isBusy,
+  isBudgetFailure,
   isCodeRejected,
   shouldClearCode,
-  jitterDelayMs,
-  runBusyRetry,
   friendlyRegisterError,
 };
