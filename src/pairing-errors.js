@@ -35,11 +35,30 @@ function normCode(code) {
 
 /** Above this, the wait is not meaningful — show "try again later". */
 const RATE_LIMIT_MAX_SECONDS = 86400;
+/**
+ * Minutes→hours switch. Minutes use N = round(s/60), so anything from 3570s
+ * would round to "60 minutes"; switching to hours at 3570 guarantees the
+ * minutes branch says at most "about 59 minutes" (3569s), and 3570–5399s
+ * read "about 1 hour".
+ */
+const HOURS_FROM_SECONDS = 3570;
 
+/**
+ * Wait text (shared spec with Android). s = ceil(seconds) for the seconds branch.
+ *   s < 60            → "N seconds" (1 → "second")
+ *   60 ≤ s < 3570     → "about N minutes", N = max(1, round(s/60)), 1 → "minute"
+ *   3570 ≤ s ≤ 86400  → "about N hours", N = max(1, round(s/3600)), 1 → "hour"
+ *   s > 86400         → "Please try again later."
+ *   non-finite, ≤ 0, text, missing → "wait a moment"
+ */
 function rateLimitedMessage(retryAfterSeconds) {
-  const n = Number(retryAfterSeconds);
-  const valid = retryAfterSeconds != null && Number.isFinite(n) && n > 0;
-  if (!valid) {
+  const n =
+    typeof retryAfterSeconds === "number"
+      ? retryAfterSeconds
+      : typeof retryAfterSeconds === "string" && retryAfterSeconds.trim() !== ""
+        ? Number(retryAfterSeconds)
+        : NaN;
+  if (!Number.isFinite(n) || n <= 0) {
     return "Too many pairing attempts. Please wait a moment, then try again.";
   }
   if (n > RATE_LIMIT_MAX_SECONDS) {
@@ -49,11 +68,11 @@ function rateLimitedMessage(retryAfterSeconds) {
   if (s < 60) {
     return `Too many pairing attempts. Please wait ${s} second${s === 1 ? "" : "s"}, then try again.`;
   }
-  if (s <= 3600) {
-    const m = Math.ceil(s / 60);
+  if (s < HOURS_FROM_SECONDS) {
+    const m = Math.max(1, Math.round(s / 60));
     return `Too many pairing attempts. Please wait about ${m} minute${m === 1 ? "" : "s"}, then try again.`;
   }
-  const h = Math.ceil(s / 3600);
+  const h = Math.max(1, Math.round(s / 3600));
   return `Too many pairing attempts. Please wait about ${h} hour${h === 1 ? "" : "s"}, then try again.`;
 }
 
@@ -150,6 +169,7 @@ module.exports = {
   CODE_REGISTER_CONFLICT_UNKNOWN,
   BUSY_MAX_RETRIES,
   RATE_LIMIT_MAX_SECONDS,
+  HOURS_FROM_SECONDS,
   BUSY_MIN_DELAY_MS,
   BUSY_MAX_DELAY_MS,
   MSG_SERVER_BUSY,

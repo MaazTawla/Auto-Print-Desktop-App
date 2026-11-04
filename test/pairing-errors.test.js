@@ -474,8 +474,8 @@ describe("QA 451a1ca9 follow-up: L1, L2, I1", () => {
   });
 
   it("L2: hours, later, and unsafe values", () => {
-    assert.match(pe.rateLimitedMessage(3600), /about 60 minutes/);
-    assert.match(pe.rateLimitedMessage(3601), /about 2 hours/);
+    assert.match(pe.rateLimitedMessage(3600), /about 1 hour,/);
+    assert.match(pe.rateLimitedMessage(3601), /about 1 hour,/);
     assert.match(pe.rateLimitedMessage(7200), /about 2 hours,/);
     assert.match(pe.rateLimitedMessage(86400), /about 24 hours/);
     assert.equal(pe.rateLimitedMessage(86401), "Too many pairing attempts. Please try again later.");
@@ -535,5 +535,42 @@ describe("QA 451a1ca9 follow-up: L1, L2, I1", () => {
     const rb = await b;
     assert.deepEqual(sent, ["CODE-X", "CODE-Y"]);
     assert.equal(rb.error.code, "PAIRING_RATE_LIMITED");
+  });
+});
+
+describe("wait-text final spec boundaries", () => {
+  const W = (t) => `Too many pairing attempts. Please wait ${t}, then try again.`;
+  const cases = [
+    [1, W("1 second")],
+    [59, W("59 seconds")],
+    [59.2, W("about 1 minute")], // ceil → 60s → minutes branch
+    [60, W("about 1 minute")],
+    [61, W("about 1 minute")],
+    [89, W("about 1 minute")],
+    [90, W("about 2 minutes")],
+    [3569, W("about 59 minutes")],
+    [3570, W("about 1 hour")],
+    [3599, W("about 1 hour")],
+    [3600, W("about 1 hour")],
+    [3601, W("about 1 hour")],
+    [5399, W("about 1 hour")],
+    [5400, W("about 2 hours")],
+    [86400, W("about 24 hours")],
+    [86401, "Too many pairing attempts. Please try again later."],
+    [1e12, "Too many pairing attempts. Please try again later."],
+    ["90", W("about 2 minutes")],
+  ];
+  for (const [s, want] of cases) {
+    it(`${s} → ${want}`, () => assert.equal(pe.rateLimitedMessage(s), want));
+  }
+  it("minutes branch never says 60", () => {
+    for (let s = 60; s <= 86400; s++) {
+      assert.doesNotMatch(pe.rateLimitedMessage(s), /about 60 minutes/, String(s));
+    }
+  });
+  it("unsafe values → wait a moment", () => {
+    for (const v of [0, -1, -0.5, NaN, Infinity, -Infinity, "abc", "", "  ", null, undefined, {}, [], true]) {
+      assert.equal(pe.rateLimitedMessage(v), W("a moment"), String(v));
+    }
   });
 });
