@@ -2646,7 +2646,7 @@
                 <div class="field">
                   <label for="settings-pairing-code">Pairing code</label>
                   <input type="text" id="settings-pairing-code" placeholder="From merchant / branch" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
-                  <div class="field-hint">From Settings → Printing → Generate pairing code. Blank codes are blocked.</div>
+                  <div class="field-hint">From Settings → Printing → Print devices (Generate pairing code). Blank codes are blocked.</div>
                 </div>
                 <div class="field-hint">App ID: <span class="mono" id="settings-app-id">—</span></div>
                 <div class="err-text" id="settings-agent-err"></div>
@@ -4465,7 +4465,7 @@
         }
         showToast(
           (res && res.message) ||
-            'Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing.'
+            'Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices.'
         );
       } catch (err) {
         hostJoinBackupBtn.disabled = false;

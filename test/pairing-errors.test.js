@@ -1329,6 +1329,12 @@ describe("R7D + BE v1.25 pairing fixes", () => {
     assert.equal(hb.needsPairing || hb.authError, true);
     assert.equal(store.get().agent_token, "");
     assert.equal(ctrl.needsPairing, true);
+    // Demoted host 401 must stop Rabbit/AMQP (clearLocalAuth → consumeEnabled false + broker wipe).
+    assert.equal(hb.shouldConsume, false);
+    assert.equal(ctrl.shouldConsume(), false);
+    assert.equal(store.get().rabbit_host, "");
+    assert.equal(store.get().rabbit_password || "", "");
+    assert.equal(store.get().rabbit_version || "", "");
     // Fresh code — register once, no AE 409 loop
     store.writeConfig({ pairing_code: "FRESH-CODE" });
     phase = "reg";

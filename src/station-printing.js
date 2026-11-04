@@ -76,6 +76,8 @@ function createStationPrintingController(deps = {}) {
   // Persist a SHA-256 of the blocked code (never the code itself) so a relaunch does
   // not burn another budget slot (R5D-L1).
   const BLOCKED_HASH_KEY = "pairing_auto_register_blocked_hash";
+  /** R8D-L1: minimal host-conflict snapshot so Join/banner survive relaunch. */
+  const BLOCKED_CONFLICT_KEY = "pairing_auto_register_blocked_conflict";
   function hashPairingCode(code) {
     const c = String(code || "").trim();
     if (!c) return "";
@@ -84,12 +86,55 @@ function createStationPrintingController(deps = {}) {
   let autoRegisterBlockedHash = String(readConfig()[BLOCKED_HASH_KEY] || "").trim();
   /** Hash cleared by allowManualRegister; restored if that manual attempt throws (R5D-L2). */
   let lastClearedBlockedHash = "";
-  function persistBlockedHash(hash) {
+  let lastClearedBlockedConflict = null;
+  function conflictSnapshotFrom(conflict) {
+    if (!conflict || typeof conflict !== "object") return null;
+    const host = conflict.current_host;
+    if (!host || typeof host !== "object") {
+      return { device_label: "", is_online: null };
+    }
+    const raw = host.device_label != null ? String(host.device_label).trim() : "";
+    const label = raw && !/^(null|undefined)$/i.test(raw) ? raw : "";
+    const online =
+      host.is_online === true ? true : host.is_online === false ? false : null;
+    return { device_label: label, is_online: online };
+  }
+  function hostConflictFromSnapshot(snap) {
+    if (!snap || typeof snap !== "object") return null;
+    const raw = snap.device_label != null ? String(snap.device_label).trim() : "";
+    const label = raw && !/^(null|undefined)$/i.test(raw) ? raw : "";
+    const online =
+      snap.is_online === true ? true : snap.is_online === false ? false : null;
+    return {
+      code: "PRINT_HOST_ALREADY_CONFIGURED",
+      message:
+        "Another device is already configured as print host for this branch.",
+      current_host: { device_label: label, is_online: online },
+    };
+  }
+  /**
+   * Persist the auto-block hash. When clearing (empty hash), also drop the
+   * conflict snapshot. When blocking with a host conflict, pass its snapshot
+   * so a relaunch can restore the banner + Join (R8D-L1).
+   */
+  function persistBlockedHash(hash, conflictSnapshot) {
     const h = hash ? String(hash).trim() : "";
     autoRegisterBlockedHash = h;
-    writeConfig({ [BLOCKED_HASH_KEY]: h });
+    const patch = { [BLOCKED_HASH_KEY]: h };
+    if (!h) {
+      patch[BLOCKED_CONFLICT_KEY] = null;
+    } else if (conflictSnapshot !== undefined) {
+      patch[BLOCKED_CONFLICT_KEY] = conflictSnapshot;
+    }
+    writeConfig(patch);
   }
   let hostConflict = null; // 409 payload for UI
+  // R8D-L1: restore banner/Join after relaunch when a blocked host-conflict remains.
+  if (autoRegisterBlockedHash) {
+    const saved = readConfig()[BLOCKED_CONFLICT_KEY];
+    const restored = hostConflictFromSnapshot(saved);
+    if (restored) hostConflict = restored;
+  }
   let lastRegisterError = null; // { code, message } for inline UI
   let needsPairing = false; // prompt UI after token revoke / deregister
   let lastHeartbeatAt = null;
@@ -247,6 +292,11 @@ function createStationPrintingController(deps = {}) {
     // attempt must not wipe the restore target with "" (2 Retries + throw still blocks).
     if (autoRegisterBlockedHash) {
       lastClearedBlockedHash = autoRegisterBlockedHash;
+      const saved = readConfig()[BLOCKED_CONFLICT_KEY];
+      lastClearedBlockedConflict =
+        saved && typeof saved === "object"
+          ? saved
+          : conflictSnapshotFrom(hostConflict);
     }
     persistBlockedHash("");
   }
@@ -417,6 +467,7 @@ function createStationPrintingController(deps = {}) {
         onStateChange(publicHostState());
         // Manual attempt consumed without a network throw — drop restore hint.
         lastClearedBlockedHash = "";
+        lastClearedBlockedConflict = null;
         return {
           ok: false,
           error: lastRegisterError,
@@ -427,24 +478,33 @@ function createStationPrintingController(deps = {}) {
       // R5D-L2: a manual Retry that throws must re-block so the next timer/HB
       // does not auto-resend (one click must not become 3 requests).
       if (lastClearedBlockedHash) {
-        persistBlockedHash(lastClearedBlockedHash);
+        persistBlockedHash(lastClearedBlockedHash, lastClearedBlockedConflict);
         lastClearedBlockedHash = "";
+        lastClearedBlockedConflict = null;
       }
       throw err;
     }
 
     // Manual attempt reached the server — do not restore the prior block on a later throw path.
     lastClearedBlockedHash = "";
+    lastClearedBlockedConflict = null;
 
+    // R8D-L2: also block on 422 (e.g. device_label > 120) so a timer cannot
+    // auto-send print_host with the same code after a failed Join.
+    const statusNum = Number(result.status);
     const budgetFail =
       !result.ok &&
       (result.conflict ||
+        statusNum === 422 ||
         pairingErrors.isBudgetFailure(
           result.status,
           result.code || (result.error && result.error.code)
         ));
     if (budgetFail) {
-      persistBlockedHash(hashPairingCode(sentCode));
+      persistBlockedHash(
+        hashPairingCode(sentCode),
+        result.conflict ? conflictSnapshotFrom(result.conflict) : null
+      );
     } else if (result.ok) {
       persistBlockedHash("");
     }
@@ -619,7 +679,7 @@ function createStationPrintingController(deps = {}) {
     log(
       result.is_print_host
         ? `Registered as print host (epoch ${result.host_epoch}).`
-        : "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing.",
+        : "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices.",
       result.is_print_host ? "✅" : "ℹ️"
     );
     return {
@@ -636,7 +696,7 @@ function createStationPrintingController(deps = {}) {
       branch_id: result.branch_id != null ? String(result.branch_id) : afterCfg.branch_id || null,
       message: result.is_print_host
         ? null
-        : "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing.",
+        : "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices.",
     };
   }
 

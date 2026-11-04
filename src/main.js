@@ -2074,7 +2074,7 @@ ipcMain.handle("join-as-backup-device", async () => {
       isPrintHost: false,
       message:
         result.message ||
-        "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing.",
+        "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices.",
       stationPrinting: st,
     };
   } catch (err) {
@@ -3145,7 +3145,7 @@ async function startRabbit() {
           if (sess && sess.conflict) {
             state.rabbitmq = "idle";
             log(
-              "RabbitMQ consumer idle — another device is print host (or this is a reinstall with a new app_id). Ask admin to Change print host in Settings → Printing to this device, then Retry.",
+              "RabbitMQ consumer idle — another device is print host (or this is a reinstall with a new app_id). Ask admin to Change print host in Settings → Printing → Print devices to this device, then Retry.",
               "⚠️"
             );
             pushState();

@@ -109,7 +109,7 @@ describe("Join as backup device (observer)", () => {
     assert.equal(r.isPrintHost, false);
     assert.equal(
       r.message,
-      "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing."
+      "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices."
     );
     assert.equal(bodies.length, 2);
     assert.equal(bodies[1].role, "observer");
@@ -301,5 +301,99 @@ describe("Join as backup device (observer)", () => {
     assert.equal(st.isPrintHost, false);
     assert.equal(st.agentTokenConfigured, true);
     assert.equal(st.hostConflict, null);
+  });
+});
+
+
+describe("R8D: relaunch conflict, 422 block, mixed in-flight", () => {
+  it("R8D-L1: after relaunch, conflict banner + Join still offered from persisted snapshot", async () => {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => HOST_CONFLICT);
+    await ctrl.ensureSession({ branchId: "1" });
+    assert.ok(ctrl.hostConflict);
+    assert.equal(ctrl.hostConflict.current_host.device_label, "Front counter");
+    const snap = store.get().pairing_auto_register_blocked_conflict;
+    assert.ok(snap);
+    assert.equal(snap.device_label, "Front counter");
+    assert.equal(snap.is_online, true);
+    assert.match(store.get().pairing_auto_register_blocked_hash, /^[0-9a-f]{64}$/);
+
+    // Relaunch: new controller, same config — no register, banner restored
+    const store2 = memoryStore(store.get());
+    const { ctrl: ctrl2 } = ctrlWith(store2, async () => {
+      throw new Error("should not register on relaunch while blocked");
+    });
+    const st = ctrl2.publicHostState();
+    assert.ok(st.hostConflict, "hostConflict restored");
+    assert.equal(st.hostConflict.current_host.device_label, "Front counter");
+    assert.equal(st.hostConflict.current_host.is_online, true);
+    const s = await ctrl2.ensureSession({ branchId: "1" });
+    assert.equal(s.autoRetryBlocked, true);
+    assert.equal(s.ok, false);
+    // Join still works after allowManual
+    let joined = false;
+    const store3 = memoryStore(store2.get());
+    const { ctrl: ctrl3 } = ctrlWith(store3, async (req) => {
+      if (String(req.url || "").includes("/register")) {
+        assert.equal(req.data.role, "observer");
+        joined = true;
+        return OBSERVER_OK;
+      }
+      return { status: 200, headers: {}, data: {} };
+    });
+    assert.ok(ctrl3.hostConflict);
+    const r = await ctrl3.joinAsBackupDevice({ branchId: "1" });
+    assert.equal(r.ok, true);
+    assert.equal(joined, true);
+    assert.equal(ctrl3.hostConflict, null);
+  });
+
+  it("R8D-L2: Join 422 blocks the code so timer does not auto print_host", async () => {
+    const store = memoryStore(seed({ device_label: "x".repeat(121) }));
+    let roles = [];
+    const { ctrl } = ctrlWith(store, async (req) => {
+      if (String(req.url || "").includes("/register")) {
+        roles.push(req.data && req.data.role);
+        return {
+          status: 422,
+          data: { error: { code: "VALIDATION_ERROR", message: "device label too long" } },
+        };
+      }
+      return { status: 200, headers: {}, data: {} };
+    });
+    const r = await ctrl.joinAsBackupDevice({ branchId: "1" });
+    assert.equal(r.ok, false);
+    assert.equal(store.get().pairing_code, "CODE-JOIN");
+    assert.match(store.get().pairing_auto_register_blocked_hash, /^[0-9a-f]{64}$/);
+    await ctrl.ensureSession({ branchId: "1" });
+    await ctrl.ensureSession({ branchId: "1" });
+    assert.deepEqual(roles, ["observer"]); // no automatic print_host
+  });
+
+  it("R8D-I1: host Retry in flight + Join do NOT share — two requests, print_host then observer", async () => {
+    const store = memoryStore(seed());
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const roles = [];
+    let n = 0;
+    const { ctrl } = ctrlWith(store, async (req) => {
+      if (!String(req.url || "").includes("/register")) {
+        return { status: 200, headers: {}, data: {} };
+      }
+      roles.push(req.data && req.data.role);
+      n++;
+      await gate;
+      if (req.data && req.data.role === "observer") return OBSERVER_OK;
+      return HOST_CONFLICT;
+    });
+    const hostP = ctrl.registerAsHost({ branchId: "1" }); // print_host
+    const joinP = ctrl.joinAsBackupDevice({ branchId: "1" }); // observer
+    release();
+    const [hostR, joinR] = await Promise.all([hostP, joinP]);
+    assert.equal(hostR.ok, false);
+    assert.ok(hostR.conflict || ctrl.hostConflict === null || joinR.ok);
+    assert.equal(joinR.ok, true);
+    assert.deepEqual(roles, ["print_host", "observer"]);
+    assert.equal(n, 2);
   });
 });
