@@ -736,14 +736,15 @@ describe("R11D: legacy case forms, ASCII upper, grapheme cap", () => {
     assert.equal(calls, 2, "STRASSE is a different code under ASCII upper");
   });
 
-  it("R11D-I2: cap at 120 graphemes (ZWJ family stays intact; Segmenter path)", () => {
+  it("R11D-I2: cap at 120 graphemes under dual code-point limit", () => {
     const family = "👨‍👩‍👧‍👦";
     assert.ok(Array.from(family).length > 1, "family emoji is multiple code points");
     const capped = capHostDeviceLabel(family.repeat(200));
     assert.ok(typeof Intl !== "undefined" && typeof Intl.Segmenter === "function");
     const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-    assert.equal([...seg.segment(capped)].length, 120);
-    assert.equal(capped, family.repeat(120));
+    assert.ok([...seg.segment(capped)].length <= 120);
+    assert.ok(Array.from(capped).length <= 120);
+    assert.equal(capped, family.repeat(Math.floor(120 / Array.from(family).length)));
     const live = parseHostConflictError(
       {
         error: {
@@ -753,6 +754,100 @@ describe("R11D: legacy case forms, ASCII upper, grapheme cap", () => {
       },
       409
     );
-    assert.equal(live.current_host.device_label, family.repeat(120));
+    assert.equal(live.current_host.device_label, capped);
+  });
+});
+
+
+describe("R12D: ASCII legacy variants, dual cap, survivor guards", () => {
+  const crypto = require("node:crypto");
+  const { capHostDeviceLabel } = require("../src/agent-contract");
+  const asciiUpper = (c) =>
+    String(c).trim().replace(/[a-z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 32));
+  const hashUpper = (c) =>
+    crypto.createHash("sha256").update(asciiUpper(c), "utf8").digest("hex");
+  const hashLegacy = (c) =>
+    crypto.createHash("sha256").update(String(c).trim(), "utf8").digest("hex");
+
+  it("R12D-L1: é/É stay distinct; b3c770a STRASSE hash does not block straße; no flip", async () => {
+    // Current-format hash of "é" must not match typed "É"
+    const store = memoryStore(
+      seed({
+        pairing_code: "É",
+        pairing_auto_register_blocked_hash: hashUpper("é"),
+        pairing_auto_register_blocked_conflict: { device_label: "X", is_online: false },
+      })
+    );
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return HOST_CONFLICT;
+    });
+    assert.equal(ctrl.publicHostState().hostConflict, null);
+    await ctrl.ensureSession({});
+    assert.equal(calls, 1);
+    // Retype opposite accent must not flip the stored hash back and forth
+    const after = store.get().pairing_auto_register_blocked_hash;
+    assert.equal(after, hashUpper("É"));
+    ctrl.setPairingCode("é");
+    assert.equal(store.get().pairing_auto_register_blocked_hash, "");
+
+    // b3c770a unicode-upper STRASSE must not block straße
+    const store2 = memoryStore(
+      seed({
+        pairing_code: "straße",
+        pairing_auto_register_blocked_hash: hashLegacy("STRASSE"),
+        pairing_auto_register_blocked_conflict: { device_label: "Y", is_online: true },
+      })
+    );
+    let calls2 = 0;
+    const { ctrl: ctrl2 } = ctrlWith(store2, async () => {
+      calls2++;
+      return HOST_CONFLICT;
+    });
+    await ctrl2.ensureSession({});
+    assert.equal(calls2, 1, "STRASSE legacy must not block straße");
+  });
+
+  it("R12D-L2: mixed-case legacy AbC123 matches abc123 via ASCII enumeration", async () => {
+    const legacy = hashLegacy("AbC123");
+    const store = memoryStore(
+      seed({
+        pairing_code: "abc123",
+        pairing_auto_register_blocked_hash: legacy,
+        pairing_auto_register_blocked_conflict: { device_label: "Z", is_online: false },
+      })
+    );
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return HOST_CONFLICT;
+    });
+    assert.ok(ctrl.publicHostState().hostConflict);
+    assert.equal(store.get().pairing_auto_register_blocked_hash, hashUpper("abc123"));
+    await ctrl.ensureSession({});
+    assert.equal(calls, 0);
+  });
+
+  it("R12D-I3 FE survivors: cap121, Segmenter throw, UTF-16 fallback", () => {
+    assert.equal(capHostDeviceLabel("A".repeat(121)).length, 120);
+    const S = Intl.Segmenter;
+    try {
+      Intl.Segmenter = function () {
+        throw new Error("x");
+      };
+      assert.equal(Array.from(capHostDeviceLabel("😀".repeat(200))).length, 120);
+    } finally {
+      Intl.Segmenter = S;
+    }
+    try {
+      Intl.Segmenter = undefined;
+      const huge = "😀".repeat(200);
+      const capped = capHostDeviceLabel(huge);
+      assert.equal(Array.from(capped).length, 120);
+      assert.notEqual(capped, huge.slice(0, 120));
+    } finally {
+      Intl.Segmenter = S;
+    }
   });
 });
