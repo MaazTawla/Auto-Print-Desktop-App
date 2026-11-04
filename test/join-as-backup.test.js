@@ -107,8 +107,10 @@ describe("Join as backup device (observer)", () => {
     assert.equal(r.ok, true);
     assert.equal(r.role, "observer");
     assert.equal(r.isPrintHost, false);
-    assert.match(r.message, /backup device/i);
-    assert.match(r.message, /Settings → Printing/);
+    assert.equal(
+      r.message,
+      "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing."
+    );
     assert.equal(bodies.length, 2);
     assert.equal(bodies[1].role, "observer");
     assert.equal(bodies[1].pairing_code, "CODE-JOIN");
@@ -137,6 +139,14 @@ describe("Join as backup device (observer)", () => {
   it("Join is manual: passes persisted block; throw restores block", async () => {
     const store = memoryStore(seed());
     let n = 0;
+    const hashWrites = [];
+    const origWrite = store.writeConfig;
+    store.writeConfig = (partial) => {
+      if (Object.prototype.hasOwnProperty.call(partial, "pairing_auto_register_blocked_hash")) {
+        hashWrites.push(partial.pairing_auto_register_blocked_hash);
+      }
+      return origWrite(partial);
+    };
     const { ctrl } = ctrlWith(store, async (req) => {
       if (!String(req.url || "").includes("/register")) {
         return { status: 200, headers: {}, data: {} };
@@ -147,10 +157,12 @@ describe("Join as backup device (observer)", () => {
       return OBSERVER_OK;
     });
     await ctrl.ensureSession({ branchId: "1" });
-    assert.match(store.get().pairing_auto_register_blocked_hash, /^[0-9a-f]{64}$/);
+    const blocked = store.get().pairing_auto_register_blocked_hash;
+    assert.match(blocked, /^[0-9a-f]{64}$/);
     await assert.rejects(() => ctrl.joinAsBackupDevice({ branchId: "1" }));
-    assert.match(store.get().pairing_auto_register_blocked_hash, /^[0-9a-f]{64}$/);
-    // Auto still blocked
+    // allowManualRegister cleared the hash before the attempt, throw restored it
+    assert.ok(hashWrites.includes(""), "Join must clear block via allowManualRegister before attempt");
+    assert.equal(store.get().pairing_auto_register_blocked_hash, blocked);
     await ctrl.ensureSession({ branchId: "1" });
     assert.equal(n, 2);
   });
@@ -270,6 +282,15 @@ describe("Join as backup device (observer)", () => {
     assert.match(main, /join-as-backup-device/);
     const preload = fs.readFileSync(path.join(__dirname, "..", "src", "preload.js"), "utf8");
     assert.match(preload, /joinAsBackupDevice/);
+    const sp = fs.readFileSync(path.join(__dirname, "..", "src", "station-printing.js"), "utf8");
+    assert.match(
+      sp,
+      /async function joinAsBackupDevice[\s\S]*?allowManualRegister\(\)[\s\S]*?role:\s*"observer"/
+    );
+    assert.match(
+      sp,
+      /joinAsBackupDevice[\s\S]*?hostConflict = null/
+    );
   });
 
   it("publicHostState after Join reports not print host / backup", async () => {
