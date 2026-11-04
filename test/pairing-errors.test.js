@@ -574,3 +574,61 @@ describe("wait-text final spec boundaries", () => {
     }
   });
 });
+
+describe("v1.22 BRANCH_MISMATCH on register", () => {
+  const MSG =
+    "This pairing code belongs to a different branch. Get a new QR code or pairing code from Tawla Settings \u2192 Print host on the web, then try again.";
+
+  it("maps to the Android message (any status, any case)", () => {
+    assert.equal(pe.MSG_BRANCH_MISMATCH, MSG);
+    for (const [status, code] of [[403, "BRANCH_MISMATCH"], [409, "branch_mismatch"], [422, "BRANCH_MISMATCH"]]) {
+      const f = pe.friendlyRegisterError({ ok: false, status, code, message: RAW });
+      assert.deepEqual(f, { code: "BRANCH_MISMATCH", message: MSG });
+    }
+    assert.equal(pe.isCodeRejected(403, "BRANCH_MISMATCH"), false);
+    assert.equal(pe.isBusy(403, "BRANCH_MISMATCH"), false);
+  });
+
+  for (const status of [403, 409]) {
+    it(`${status} BRANCH_MISMATCH: exactly 1 request, no pause, code and creds kept, no conflict`, async () => {
+      const store = memoryStore(seed());
+      let calls = 0;
+      const { ctrl, sleeps } = ctrlWith(store, async () => {
+        calls++;
+        return { status, data: { error: { code: "BRANCH_MISMATCH", message: RAW } }, headers: {} };
+      });
+      const r = await ctrl.registerAsHost({ branchId: "147" });
+      assert.equal(calls, 1);
+      assert.equal(sleeps.length, 0);
+      assert.equal(r.ok, false);
+      assert.equal(r.conflict, undefined);
+      assert.equal(r.error.code, "BRANCH_MISMATCH");
+      assert.equal(r.error.message, MSG);
+      assert.equal(store.get().pairing_code, "CODE-X");
+      assert.equal(store.get().rabbit_host, "mq.local");
+      const st = ctrl.publicHostState();
+      assert.equal(st.needsPairing, false);
+      assert.equal(st.hostConflict, null);
+      assert.ok(!JSON.stringify(st).includes(RAW));
+    });
+  }
+
+  it("after the 5th mismatch, the next 401 INVALID clears the code", async () => {
+    const store = memoryStore(seed());
+    let n = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      n++;
+      return n <= 5
+        ? { status: 403, data: { error: { code: "BRANCH_MISMATCH" } } }
+        : { status: 401, data: { error: { code: "PAIRING_CODE_INVALID" } } };
+    });
+    for (let i = 0; i < 5; i++) {
+      await ctrl.registerAsHost({ branchId: "147" });
+      assert.equal(store.get().pairing_code, "CODE-X");
+    }
+    const r = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(n, 6);
+    assert.equal(r.error.message, pe.MSG_CODE_INVALID);
+    assert.equal(store.get().pairing_code, "");
+  });
+});

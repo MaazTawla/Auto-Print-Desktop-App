@@ -15,6 +15,7 @@ const CODE_BUSY = "PAIRING_BUSY";
 const CODE_INVALID = "PAIRING_CODE_INVALID";
 const CODE_EXPIRED = "PAIRING_CODE_EXPIRED";
 const CODE_IN_FLIGHT = "REGISTER_IN_FLIGHT";
+const CODE_BRANCH_MISMATCH = "BRANCH_MISMATCH";
 const CODE_REGISTER_CONFLICT_UNKNOWN = "REGISTER_CONFLICT";
 
 const BUSY_MAX_RETRIES = 3;
@@ -24,6 +25,9 @@ const BUSY_MAX_DELAY_MS = 1500;
 const MSG_SERVER_BUSY = "Server busy, please try again.";
 const MSG_CODE_INVALID =
   "This pairing code is expired or already used. Generate a new code in Tawla Settings \u2192 Print host on the web, then enter it again.";
+/** v1.22: never auto-retried; code is kept (5th mismatch → later 401 INVALID clears it). */
+const MSG_BRANCH_MISMATCH =
+  "This pairing code belongs to a different branch. Get a new QR code or pairing code from Tawla Settings \u2192 Print host on the web, then try again.";
 const MSG_CONFLICT_UNKNOWN =
   "The server could not complete pairing right now. Please try again.";
 
@@ -144,6 +148,9 @@ function friendlyRegisterError(result) {
     return { code: CODE_IN_FLIGHT, message: "Pairing is already in progress. Please wait." };
   }
   if (isBusy(status, code)) return { code: CODE_BUSY, message: MSG_SERVER_BUSY };
+  if (code === CODE_BRANCH_MISMATCH) {
+    return { code: CODE_BRANCH_MISMATCH, message: MSG_BRANCH_MISMATCH };
+  }
   if (isRateLimited(status, code)) {
     return {
       code: CODE_RATE_LIMITED,
@@ -175,6 +182,8 @@ module.exports = {
   MSG_SERVER_BUSY,
   MSG_CODE_INVALID,
   MSG_CONFLICT_UNKNOWN,
+  MSG_BRANCH_MISMATCH,
+  CODE_BRANCH_MISMATCH,
   rateLimitedMessage,
   retryAfterSeconds,
   isRateLimited,
