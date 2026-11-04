@@ -330,6 +330,7 @@ function createStationPrintingController(deps = {}) {
    * with the fresh settings instead of reusing the stale result.
    */
   async function registerAsHost(opts = {}) {
+    const role = String((opts && opts.role) || ASSUMPTIONS.registerRole).trim() || ASSUMPTIONS.registerRole;
     while (registerInFlight) {
       const running = registerInFlight;
       let res;
@@ -343,17 +344,23 @@ function createStationPrintingController(deps = {}) {
       }
       if (registerInFlight === running) registerInFlight = null;
       const nowCode = String(readConfig().pairing_code || "").trim();
-      // I1: same code → share the outcome (result or error); only a changed code re-runs.
-      if (nowCode === running.sentCode) {
-        if (threw) throw error;
-        return res;
+      // Same role + (same code, or code cleared by this successful register) → share.
+      // A mid-flight code edit to a different value, or a different role, re-runs.
+      if (role === running.role) {
+        const sameCode = nowCode === running.sentCode;
+        const clearedBySuccess =
+          Boolean(res && res.ok) && Boolean(running.sentCode) && nowCode === "";
+        if (sameCode || clearedBySuccess) {
+          if (threw) throw error;
+          return res;
+        }
       }
     }
     const sentCode = String(readConfig().pairing_code || "").trim();
-    const entry = { sentCode, promise: null };
+    const entry = { sentCode, role, promise: null };
     entry.promise = (async () => {
       try {
-        return await registerAsHostOnce(opts);
+        return await registerAsHostOnce({ ...opts, role });
       } finally {
         if (registerInFlight === entry) registerInFlight = null;
       }
@@ -366,9 +373,11 @@ function createStationPrintingController(deps = {}) {
     return Boolean(registerInFlight);
   }
 
-  async function registerAsHostOnce({ branchId } = {}) {
+  async function registerAsHostOnce({ branchId, role } = {}) {
     const cfg = readConfig();
     const sentCode = String(cfg.pairing_code || "").trim();
+    const registerRole =
+      String(role || ASSUMPTIONS.registerRole).trim() || ASSUMPTIONS.registerRole;
     api.setApiBase(cfg.agent_api_base || "");
     // v1.24: re-pair of a live app_id needs the current token as Bearer (old one is
     // revoked on success). First-time pair has no token — pairing_code only.
@@ -385,7 +394,7 @@ function createStationPrintingController(deps = {}) {
           branchId: branchId || cfg.branch_id,
           deviceLabel: cfg.device_label || defaultDeviceLabel(),
           pairingCode: cfg.pairing_code || "",
-          role: ASSUMPTIONS.registerRole,
+          role: registerRole,
           agentVersion:
             agentVersion ||
             cfg.agent_version ||
@@ -601,7 +610,7 @@ function createStationPrintingController(deps = {}) {
     if (applied.promoted && consumeEnabled) flushPending = true;
     if (!result.is_print_host) {
       log(
-        "Not the print host — Rabbit credentials are only sent to the print host. Consumer stays idle.",
+        "Connected as backup device — Rabbit credentials stay with the print host. Consumer idle until promoted.",
         "ℹ️"
       );
     }
@@ -610,12 +619,14 @@ function createStationPrintingController(deps = {}) {
     log(
       result.is_print_host
         ? `Registered as print host (epoch ${result.host_epoch}).`
-        : "Registered — not print host; Rabbit consumer stays idle.",
+        : "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing.",
       result.is_print_host ? "✅" : "ℹ️"
     );
     return {
       ok: true,
       shouldConsume: consumeEnabled,
+      isPrintHost: Boolean(result.is_print_host),
+      role: result.is_print_host ? "print_host" : "observer",
       promoted: applied.promoted,
       revoked: applied.revoked,
       rabbit: result.rabbit || null,
@@ -623,7 +634,27 @@ function createStationPrintingController(deps = {}) {
       rabbitChanged: Boolean(rabbitChanged),
       waitingForRabbitCreds: waitingForCreds,
       branch_id: result.branch_id != null ? String(result.branch_id) : afterCfg.branch_id || null,
+      message: result.is_print_host
+        ? null
+        : "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing.",
     };
+  }
+
+  /**
+   * Manual Join as backup (observer) after a PRINT_HOST_ALREADY_CONFIGURED 409.
+   * Never called from ensureSession / auto-resume. Same pairing code + app_id,
+   * role=observer; Bearer sent when a token is stored. Passes the persisted block
+   * (allowManualRegister); a throw restores it. Success clears hostConflict.
+   * Double-click shares one in-flight request (registerAsHost key = code+role).
+   */
+  async function joinAsBackupDevice(opts = {}) {
+    allowManualRegister();
+    const result = await registerAsHost({ ...opts, role: "observer" });
+    if (result && result.ok) {
+      hostConflict = null;
+      onStateChange(publicHostState());
+    }
+    return result;
   }
 
   const sleep =
@@ -1442,6 +1473,7 @@ function createStationPrintingController(deps = {}) {
     evaluateAuthFailure: handleAuthFailure,
     registerAsHost,
     allowManualRegister,
+    joinAsBackupDevice,
     isRegisterInFlight,
     ensureSession,
     heartbeat,

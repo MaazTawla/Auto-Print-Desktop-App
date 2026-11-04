@@ -837,6 +837,26 @@
       opacity: 0.45;
       cursor: not-allowed;
     }
+    .btn-secondary {
+      padding: 10px 18px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-secondary:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: var(--surface-hi);
+    }
+    .btn-secondary:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
     .inline-actions {
       display: flex;
       flex-wrap: wrap;
@@ -2384,10 +2404,11 @@
       <div class="hc-title">Print host already configured</div>
       <div class="hc-msg" id="host-conflict-message"></div>
       <div class="hc-meta" id="host-conflict-meta"></div>
-      <div class="hc-meta">Ask admin to Change print host in Settings → Printing.</div>
+      <div class="hc-meta">Join as a backup device with this pairing code, or ask an admin to Change print host / enter a different code.</div>
     </div>
     <div class="hc-actions">
-      <button type="button" class="btn-primary" id="host-conflict-retry">Retry</button>
+      <button type="button" class="btn-primary" id="host-conflict-join-backup">Join as backup device</button>
+      <button type="button" class="btn-secondary" id="host-conflict-retry">Retry as print host</button>
     </div>
   </div>
   <div id="queue-precondition-banner" role="status" aria-live="polite">
@@ -3931,6 +3952,9 @@
         if (meta) {
           meta.textContent = window.PairingUiPolicy.hostConflictMeta(conflict.current_host);
         }
+        const joinBtn = document.getElementById('host-conflict-join-backup');
+        // Fresh conflict + code still present → Join available (never auto).
+        if (joinBtn && sp.pairingCodeConfigured) joinBtn.disabled = false;
       }
     }
     if (pairingBanner) {
@@ -4172,7 +4196,7 @@
         const q = rabbit === 'error' ? ' · queue offline' : (rabbit === 'idle' ? ' · queue idle' : '');
         status.innerHTML = '<span class="host-status-pill on">Connected as print host</span> epoch ' + escHtml(String(sp.hostEpoch)) + branchNote + q;
       } else if (sp.agentTokenConfigured) {
-        status.innerHTML = '<span class="host-status-pill off">Registered</span> Not print host — consumer idle.';
+        status.innerHTML = '<span class="host-status-pill on">Backup device</span> Connected as backup — no print queue (heartbeats only).' + branchNote;
       } else if (sp.needsPairing) {
         status.innerHTML = '<span class="host-status-pill off">Offline</span> Enter a fresh pairing code, then Connect.';
       } else {
@@ -4419,6 +4443,37 @@
   }
 
   
+  const hostJoinBackupBtn = document.getElementById('host-conflict-join-backup');
+  if (hostJoinBackupBtn) {
+    hostJoinBackupBtn.addEventListener('click', async () => {
+      // Success consumes the pairing code — disable after one tap so a second Join
+      // cannot fire the same (now-dead) code → 401 PAIRING_CODE_INVALID.
+      if (hostJoinBackupBtn.disabled) return;
+      hostJoinBackupBtn.disabled = true;
+      try {
+        const res = await window.api.joinAsBackupDevice();
+        if (!res || !res.ok) {
+          showToast((res && res.error) || 'Could not join as backup device.', 'error', 3400);
+          // Re-enable only when the code is still configured (conflict kept / error path).
+          const still =
+            res &&
+            res.stationPrinting &&
+            res.stationPrinting.pairingCodeConfigured &&
+            res.stationPrinting.hostConflict;
+          hostJoinBackupBtn.disabled = !still;
+          return;
+        }
+        showToast(
+          (res && res.message) ||
+            'Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing.'
+        );
+      } catch (err) {
+        hostJoinBackupBtn.disabled = false;
+        showToast((err && err.message) || 'Could not join as backup device.', 'error', 3400);
+      }
+    });
+  }
+
   const hostRetryBtn = document.getElementById('host-conflict-retry');
   if (hostRetryBtn) {
     hostRetryBtn.addEventListener('click', async () => {

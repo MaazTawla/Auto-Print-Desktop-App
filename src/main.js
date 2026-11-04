@@ -2028,6 +2028,60 @@ ipcMain.handle("set-agent-api-settings", async (_e, opts) => {
   }
 });
 
+ipcMain.handle("join-as-backup-device", async () => {
+  try {
+    const sp = getStationPrinting();
+    // Manual only — never from ensureSession. allowManualRegister is inside joinAsBackupDevice.
+    const cfg = readUserConfig();
+    if (!(cfg.pairing_code && String(cfg.pairing_code).trim())) {
+      const pairingError = {
+        code: "PAIRING_CODE_REQUIRED",
+        message: "Pairing code is required.",
+      };
+      pushState();
+      return {
+        ok: false,
+        error: pairingError.message,
+        code: pairingError.code,
+        pairingError,
+        stationPrinting: sp.publicHostState(),
+      };
+    }
+    const result = await sp.joinAsBackupDevice({ branchId: cfg.branch_id });
+    pushState();
+    const st = sp.publicHostState();
+    if (!result || !result.ok) {
+      return {
+        ok: false,
+        error:
+          (result && result.pairingError && result.pairingError.message) ||
+          (result && result.error && result.error.message) ||
+          (st.lastRegisterError && st.lastRegisterError.message) ||
+          (st.hostConflict && st.hostConflict.message) ||
+          "Could not join as backup device.",
+        code:
+          (result && (result.code || (result.pairingError && result.pairingError.code))) ||
+          (st.lastRegisterError && st.lastRegisterError.code) ||
+          (st.hostConflict && st.hostConflict.code) ||
+          "JOIN_BACKUP_FAILED",
+        pairingError: (result && result.pairingError) || st.lastRegisterError || null,
+        stationPrinting: st,
+      };
+    }
+    return {
+      ok: true,
+      role: "observer",
+      isPrintHost: false,
+      message:
+        result.message ||
+        "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing.",
+      stationPrinting: st,
+    };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+
 ipcMain.handle("retry-print-host-register", async () => {
   try {
     const sp = getStationPrinting();
