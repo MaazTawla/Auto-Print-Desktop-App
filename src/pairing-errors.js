@@ -33,17 +33,28 @@ function normCode(code) {
   return /^HTTP_\d+$/.test(c) ? "" : c;
 }
 
+/** Above this, the wait is not meaningful — show "try again later". */
+const RATE_LIMIT_MAX_SECONDS = 86400;
+
 function rateLimitedMessage(retryAfterSeconds) {
   const n = Number(retryAfterSeconds);
-  const s = Number.isFinite(n) && n > 0 ? Math.ceil(n) : null;
-  if (s == null) {
+  const valid = retryAfterSeconds != null && Number.isFinite(n) && n > 0;
+  if (!valid) {
     return "Too many pairing attempts. Please wait a moment, then try again.";
   }
+  if (n > RATE_LIMIT_MAX_SECONDS) {
+    return "Too many pairing attempts. Please try again later.";
+  }
+  const s = Math.ceil(n);
   if (s < 60) {
     return `Too many pairing attempts. Please wait ${s} second${s === 1 ? "" : "s"}, then try again.`;
   }
-  const m = Math.ceil(s / 60);
-  return `Too many pairing attempts. Please wait about ${m} minute${m === 1 ? "" : "s"}, then try again.`;
+  if (s <= 3600) {
+    const m = Math.ceil(s / 60);
+    return `Too many pairing attempts. Please wait about ${m} minute${m === 1 ? "" : "s"}, then try again.`;
+  }
+  const h = Math.ceil(s / 3600);
+  return `Too many pairing attempts. Please wait about ${h} hour${h === 1 ? "" : "s"}, then try again.`;
 }
 
 /** Body retry_after_seconds wins; else Retry-After header (ms → s, rounded up). */
@@ -138,6 +149,7 @@ module.exports = {
   CODE_IN_FLIGHT,
   CODE_REGISTER_CONFLICT_UNKNOWN,
   BUSY_MAX_RETRIES,
+  RATE_LIMIT_MAX_SECONDS,
   BUSY_MIN_DELAY_MS,
   BUSY_MAX_DELAY_MS,
   MSG_SERVER_BUSY,

@@ -29,6 +29,8 @@ const {
 } = require("./agent-http-retry-policy");
 const { retryAfterSeconds } = require("./pairing-errors");
 
+const REGISTER_RETRY_AFTER_MAX_MS = 3600000;
+
 function createAgentApi(options = {}) {
   let apiBase = String(options.apiBase || "").trim();
   let token = options.token != null ? String(options.token) : "";
@@ -119,8 +121,11 @@ function createAgentApi(options = {}) {
             : data && typeof data === "object"
               ? data.retry_after_seconds
               : null;
+        // L1: register-only cap (1h); heartbeat keeps the default 120s cap.
         const headerMs = parseRetryAfterMs(
-          headers && (headers["retry-after"] || headers["Retry-After"])
+          headers && (headers["retry-after"] || headers["Retry-After"]),
+          Date.now(),
+          REGISTER_RETRY_AFTER_MAX_MS
         );
         out.code = ERROR_CODES.PAIRING_RATE_LIMITED;
         out.error = { ...error, code: ERROR_CODES.PAIRING_RATE_LIMITED };

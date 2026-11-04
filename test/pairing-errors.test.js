@@ -445,3 +445,95 @@ describe("v1.21 follow-up: no-code 409, UI text, field clear", () => {
     assert.equal(t.update(ctrl.publicHostState(), false), false);
   });
 });
+
+describe("QA 451a1ca9 follow-up: L1, L2, I1", () => {
+  const { parseRetryAfterMs } = require("../src/agent-http-retry-policy");
+  const fields = { appId: "a", branchId: "1", deviceLabel: "Desk", pairingCode: "C", role: "print_host" };
+
+  it("L1: register honours a header-only Retry-After above 120s", async () => {
+    const api = createAgentApi({
+      apiBase: "https://tawla.io/merchant/api/v1/print-agent",
+      request: async () => ({ status: 429, data: { error: { code: "PAIRING_RATE_LIMITED" } }, headers: { "retry-after": "900" } }),
+    });
+    const r = await api.register(fields);
+    assert.equal(r.retryAfterSeconds, 900);
+    assert.match(pe.rateLimitedMessage(r.retryAfterSeconds), /about 15 minutes/);
+  });
+
+  it("L1: register header cap is 1 hour", async () => {
+    const api = createAgentApi({
+      apiBase: "https://tawla.io/merchant/api/v1/print-agent",
+      request: async () => ({ status: 429, data: {}, headers: { "retry-after": "99999" } }),
+    });
+    const r = await api.register(fields);
+    assert.equal(r.retryAfterSeconds, 3600);
+  });
+
+  it("L1: default (heartbeat) parseRetryAfterMs cap stays 120s", () => {
+    assert.equal(parseRetryAfterMs("900"), 120000);
+  });
+
+  it("L2: hours, later, and unsafe values", () => {
+    assert.match(pe.rateLimitedMessage(3600), /about 60 minutes/);
+    assert.match(pe.rateLimitedMessage(3601), /about 2 hours/);
+    assert.match(pe.rateLimitedMessage(7200), /about 2 hours,/);
+    assert.match(pe.rateLimitedMessage(86400), /about 24 hours/);
+    assert.equal(pe.rateLimitedMessage(86401), "Too many pairing attempts. Please try again later.");
+    assert.equal(pe.rateLimitedMessage(1e12), "Too many pairing attempts. Please try again later.");
+    for (const v of [Infinity, -Infinity, NaN, -5, 0, "abc", null, undefined]) {
+      assert.match(pe.rateLimitedMessage(v), /wait a moment/, String(v));
+    }
+  });
+
+  it("L2: body 1e12 through register gives 'try again later'", async () => {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => ({ status: 429, data: { error: { code: "PAIRING_RATE_LIMITED", retry_after_seconds: 1e12 } }, headers: {} }));
+    const r = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(r.error.message, "Too many pairing attempts. Please try again later.");
+  });
+
+  it("I1: a throw is shared with same-code waiters (1 request)", async () => {
+    const store = memoryStore(seed());
+    let calls = 0;
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      await gate;
+      throw new Error("network down");
+    });
+    const a = ctrl.registerAsHost({ branchId: "147" });
+    const b = ctrl.registerAsHost({ branchId: "147" });
+    release();
+    const ra = await a.then(() => null, (e) => e);
+    const rb = await b.then(() => null, (e) => e);
+    assert.equal(calls, 1);
+    assert.equal(ra.message, "network down");
+    assert.equal(rb, ra);
+    assert.equal(ctrl.isRegisterInFlight(), false);
+  });
+
+  it("I1: after a throw, a waiter whose code changed runs again", async () => {
+    const store = memoryStore(seed());
+    const sent = [];
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const { ctrl } = ctrlWith(store, async (cfg) => {
+      sent.push(cfg.data.pairing_code);
+      if (sent.length === 1) {
+        await gate;
+        throw new Error("network down");
+      }
+      return { status: 429, data: { error: { code: "PAIRING_RATE_LIMITED", retry_after_seconds: 2 } } };
+    });
+    const a = ctrl.registerAsHost({ branchId: "147" }).catch((e) => e);
+    await new Promise((r) => setImmediate(r));
+    store.writeConfig({ pairing_code: "CODE-Y" });
+    const b = ctrl.registerAsHost({ branchId: "147" });
+    release();
+    await a;
+    const rb = await b;
+    assert.deepEqual(sent, ["CODE-X", "CODE-Y"]);
+    assert.equal(rb.error.code, "PAIRING_RATE_LIMITED");
+  });
+});

@@ -305,14 +305,21 @@ function createStationPrintingController(deps = {}) {
     while (registerInFlight) {
       const running = registerInFlight;
       let res;
+      let threw = false;
+      let error;
       try {
         res = await running.promise;
-      } catch (_) {
-        res = null;
+      } catch (err) {
+        threw = true;
+        error = err;
       }
       if (registerInFlight === running) registerInFlight = null;
       const nowCode = String(readConfig().pairing_code || "").trim();
-      if (res && nowCode === running.sentCode) return res;
+      // I1: same code → share the outcome (result or error); only a changed code re-runs.
+      if (nowCode === running.sentCode) {
+        if (threw) throw error;
+        return res;
+      }
     }
     const sentCode = String(readConfig().pairing_code || "").trim();
     const entry = { sentCode, promise: null };
