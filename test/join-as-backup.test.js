@@ -397,3 +397,168 @@ describe("R8D: relaunch conflict, 422 block, mixed in-flight", () => {
     assert.equal(n, 2);
   });
 });
+
+
+describe("R9D: stale snapshot, clearLocalAuth, throw restore, stopRabbit", () => {
+  it("R9D-L1: code change clears block+snapshot; relaunch shows no banner/Join", async () => {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => HOST_CONFLICT);
+    await ctrl.ensureSession({ branchId: "1" });
+    assert.ok(store.get().pairing_auto_register_blocked_conflict);
+    assert.ok(ctrl.hostConflict);
+    ctrl.setPairingCode("CODE-OTHER");
+    assert.equal(store.get().pairing_auto_register_blocked_hash, "");
+    assert.equal(store.get().pairing_auto_register_blocked_conflict, null);
+    assert.equal(ctrl.publicHostState().hostConflict, null);
+    // Relaunch with the new code must not resurrect the old host label
+    const store2 = memoryStore({
+      ...store.get(),
+      // Simulate a stale leftover that somehow remained (should still be ignored
+      // once hash is cleared; also verify hash-mismatch path).
+      pairing_auto_register_blocked_hash: require("node:crypto")
+        .createHash("sha256")
+        .update("CODE-JOIN", "utf8")
+        .digest("hex"),
+      pairing_auto_register_blocked_conflict: {
+        device_label: "Front counter",
+        is_online: false,
+      },
+      pairing_code: "CODE-OTHER",
+    });
+    const { ctrl: ctrl2 } = ctrlWith(store2, async () => HOST_CONFLICT);
+    assert.equal(ctrl2.publicHostState().hostConflict, null);
+    assert.equal(store2.get().pairing_auto_register_blocked_hash, "");
+    assert.equal(store2.get().pairing_auto_register_blocked_conflict, null);
+  });
+
+  it("R9D-L1: matching hash still restores banner after relaunch", async () => {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => HOST_CONFLICT);
+    await ctrl.ensureSession({ branchId: "1" });
+    const store2 = memoryStore(store.get());
+    const { ctrl: ctrl2 } = ctrlWith(store2, async () => {
+      throw new Error("should not register");
+    });
+    assert.ok(ctrl2.publicHostState().hostConflict);
+    assert.equal(
+      ctrl2.publicHostState().hostConflict.current_host.device_label,
+      "Front counter"
+    );
+  });
+
+  it("R9D-L2: clearLocalAuth / deregister clears block + snapshot", async () => {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => HOST_CONFLICT);
+    await ctrl.ensureSession({ branchId: "1" });
+    assert.ok(store.get().pairing_auto_register_blocked_conflict);
+    ctrl.clearLocalAuth("deregister");
+    assert.equal(store.get().pairing_auto_register_blocked_hash, "");
+    assert.equal(store.get().pairing_auto_register_blocked_conflict, null);
+    const store2 = memoryStore(store.get());
+    const { ctrl: ctrl2 } = ctrlWith(store2, async () => HOST_CONFLICT);
+    assert.equal(ctrl2.publicHostState().hostConflict, null);
+  });
+
+  it("R9D-L3(c): Retry clearHostConflict + network throw restores snapshot for relaunch", async () => {
+    let n = 0;
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => {
+      n += 1;
+      if (n === 1) return HOST_CONFLICT;
+      throw new Error("ECONNRESET");
+    });
+    await ctrl.ensureSession({ branchId: "1" });
+    // main.js Retry path: clearHostConflict then allowManualRegister
+    ctrl.clearHostConflict();
+    ctrl.allowManualRegister();
+    assert.equal(ctrl.publicHostState().hostConflict, null);
+    await assert.rejects(() => ctrl.registerAsHost({ branchId: "1" }), /ECONNRESET/);
+    // Banner restored in-session
+    assert.ok(ctrl.publicHostState().hostConflict);
+    assert.equal(
+      ctrl.publicHostState().hostConflict.current_host.device_label,
+      "Front counter"
+    );
+    assert.ok(store.get().pairing_auto_register_blocked_conflict);
+    assert.equal(
+      store.get().pairing_auto_register_blocked_conflict.device_label,
+      "Front counter"
+    );
+    // And after relaunch
+    const store2 = memoryStore(store.get());
+    const { ctrl: ctrl2 } = ctrlWith(store2, async () => {
+      throw new Error("blocked");
+    });
+    assert.ok(ctrl2.publicHostState().hostConflict);
+    assert.equal(
+      ctrl2.publicHostState().hostConflict.current_host.device_label,
+      "Front counter"
+    );
+  });
+
+  it("R9D-L3(c): Join network throw restores snapshot for relaunch", async () => {
+    let n = 0;
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => {
+      n += 1;
+      if (n === 1) return HOST_CONFLICT;
+      throw new Error("ENETUNREACH");
+    });
+    await ctrl.ensureSession({ branchId: "1" });
+    await assert.rejects(() => ctrl.joinAsBackupDevice({ branchId: "1" }), /ENETUNREACH/);
+    assert.ok(store.get().pairing_auto_register_blocked_conflict);
+    assert.ok(ctrl.publicHostState().hostConflict);
+    const store2 = memoryStore(store.get());
+    const { ctrl: ctrl2 } = ctrlWith(store2, async () => {
+      throw new Error("blocked");
+    });
+    assert.ok(ctrl2.publicHostState().hostConflict);
+  });
+
+  it("R9D-I1: snapshot label must be a string ≤120; else Another device", () => {
+    const crypto = require("node:crypto");
+    const hash = crypto.createHash("sha256").update("CODE-JOIN", "utf8").digest("hex");
+    const ui = require("../src/pairing-ui-policy");
+    for (const [label, expectLabel] of [
+      [{ device_label: { x: 1 }, is_online: true }, ""], // non-string → empty → UI says Another device
+      [{ device_label: 42, is_online: true }, ""],
+      [{ device_label: "A".repeat(200), is_online: false }, "A".repeat(120)],
+      [{ device_label: "OK-Host", is_online: true }, "OK-Host"],
+    ]) {
+      const store = memoryStore(
+        seed({
+          pairing_auto_register_blocked_hash: hash,
+          pairing_auto_register_blocked_conflict: label,
+        })
+      );
+      const { ctrl } = ctrlWith(store, async () => HOST_CONFLICT);
+      const hc = ctrl.publicHostState().hostConflict;
+      assert.ok(hc);
+      assert.equal(hc.current_host.device_label, expectLabel);
+      const meta = ui.hostConflictMeta(hc.current_host);
+      if (!expectLabel) {
+        assert.match(meta, /Another device/);
+      } else if (expectLabel.length === 120) {
+        assert.equal(hc.current_host.device_label.length, 120);
+        assert.ok(!meta.includes("A".repeat(121)));
+      } else {
+        assert.match(meta, /OK-Host/);
+      }
+    }
+  });
+
+  it("R9D-L3(a): main.js heartbeat authError path awaits stopRabbit", () => {
+    const main = fs.readFileSync(path.join(__dirname, "..", "src", "main.js"), "utf8");
+    // Pin the demoted-host / token-reject path: authError|needsPairing → await stopRabbit().
+    assert.match(
+      main,
+      /if\s*\(\s*result\.authError\s*\|\|\s*result\.needsPairing\s*\)\s*\{[\s\S]*?await\s+stopRabbit\s*\(\s*\)\s*;/
+    );
+    // Must not be only on the revoked branch.
+    const authIdx = main.search(/result\.authError\s*\|\|\s*result\.needsPairing/);
+    const revokedIdx = main.search(/if\s*\(\s*result\.revoked\s*\)/);
+    assert.ok(authIdx > 0 && revokedIdx > authIdx);
+    const authBlock = main.slice(authIdx, revokedIdx);
+    assert.match(authBlock, /await\s+stopRabbit\s*\(\s*\)/);
+  });
+});
