@@ -3023,6 +3023,7 @@
   </div>
 </div>
 
+<script src="src/pairing-ui-policy.js"></script>
 <script>
   let currentTab = 'home';
   let isRestarting = false;
@@ -4126,8 +4127,15 @@
     if (details) details.open = false;
   }
 
+  const pairingFieldClearTracker = window.PairingUiPolicy.createFieldClearTracker();
   function applyPrintHostForm(s) {
     const sp = s && s.stationPrinting;
+    {
+      // R4-I3: clear the dead code from the field once when fresh pairing is newly requested.
+      const pairingInput = document.getElementById('settings-pairing-code');
+      const typing = !!(pairingInput && document.activeElement === pairingInput);
+      if (pairingFieldClearTracker.update(sp, typing) && pairingInput) pairingInput.value = '';
+    }
     const secureWarn = document.getElementById('secure-storage-warning');
     if (secureWarn) {
       if (sp && sp.secretsEncryptionUnavailable) {
@@ -4194,7 +4202,7 @@
     const errEl = document.getElementById('settings-agent-err');
     if (errEl && sp && sp.lastRegisterError && !editing) {
       const e = sp.lastRegisterError;
-      errEl.textContent = (e.code ? e.code + ': ' : '') + (e.message || '');
+      errEl.textContent = window.PairingUiPolicy.errorText(e);
     }
   }
 
@@ -4441,7 +4449,8 @@
           (res && res.error) ||
           'Retry failed.';
         const code = res && (res.code || (res.pairingError && res.pairingError.code));
-        if (errEl) errEl.textContent = code ? `${code}: ${msg}` : msg;
+        if (code) console.warn('Pairing/register error', code);
+        if (errEl) errEl.textContent = msg;
         showToast(msg, 'error', 3400);
         return;
       }
@@ -4490,7 +4499,8 @@
           (reg && reg.error) ||
           'Connect failed.';
         const code = reg && (reg.code || (reg.pairingError && reg.pairingError.code));
-        if (errEl) errEl.textContent = code ? `${code}: ${msg}` : msg;
+        if (code) console.warn('Pairing/register error', code);
+        if (errEl) errEl.textContent = msg;
         showToast(msg, 'error', 3400);
         return;
       }

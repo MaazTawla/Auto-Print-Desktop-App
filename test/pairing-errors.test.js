@@ -366,3 +366,82 @@ describe("station-printing register: pairing errors", () => {
     assert.deepEqual(sent, ["CODE-X", "CODE-Y"]);
   });
 });
+
+describe("v1.21 follow-up: no-code 409, UI text, field clear", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const ui = require("../src/pairing-ui-policy");
+  const { parseHostConflictError } = require("../src/agent-contract");
+  const html = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
+
+  it("parseHostConflictError: 409 with no code is not a conflict", () => {
+    assert.equal(parseHostConflictError({}, 409), null);
+    assert.equal(parseHostConflictError({ error: { message: "x" } }, 409), null);
+    assert.equal(
+      parseHostConflictError({ error: { code: "PRINT_HOST_ALREADY_CONFIGURED" } }, 409).code,
+      "PRINT_HOST_ALREADY_CONFIGURED"
+    );
+  });
+
+  it("register 409 with no code: generic friendly error, broker creds kept", async () => {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => ({ status: 409, data: { error: { message: RAW } } }));
+    const r = await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(r.conflict, undefined);
+    assert.equal(r.error.message, pe.MSG_CONFLICT_UNKNOWN);
+    assert.equal(store.get().rabbit_host, "mq.local");
+    assert.equal(store.get().rabbit_version, "v7");
+    assert.equal(ctrl.publicHostState().hostConflict, null);
+  });
+
+  it("errorText shows only the friendly message", () => {
+    assert.equal(ui.errorText({ code: "PAIRING_BUSY", message: "Server busy" }), "Server busy");
+    assert.equal(ui.errorText("plain"), "plain");
+    assert.equal(ui.errorText(null, "Retry failed."), "Retry failed.");
+  });
+
+  it("index.html no longer prefixes the code on pairing errors and loads the policy", () => {
+    assert.doesNotMatch(html, /code \? `\$\{code\}: \$\{msg\}`/);
+    assert.doesNotMatch(html, /e\.code \? e\.code \+ ': '/);
+    assert.match(html, /<script src="src\/pairing-ui-policy\.js"><\/script>/);
+    assert.match(html, /PairingUiPolicy\.errorText\(e\)/);
+    assert.match(html, /pairingFieldClearTracker\.update\(sp, typing\)/);
+  });
+
+  it("fresh prompt = needsPairing with no saved code", () => {
+    assert.equal(ui.isFreshPairingPrompt({ needsPairing: true, pairingCodeConfigured: false }), true);
+    assert.equal(ui.isFreshPairingPrompt({ needsPairing: true, pairingCodeConfigured: true }), false);
+    assert.equal(ui.isFreshPairingPrompt({ needsPairing: false }), false);
+    assert.equal(ui.isFreshPairingPrompt(null), false);
+  });
+
+  it("field clears once on false→true, not again while the prompt stays", () => {
+    const t = ui.createFieldClearTracker();
+    const off = { needsPairing: false, pairingCodeConfigured: true };
+    const on = { needsPairing: true, pairingCodeConfigured: false };
+    assert.equal(t.update(off, false), false);
+    assert.equal(t.update(on, false), true);
+    assert.equal(t.update(on, false), false);
+    assert.equal(t.update(on, false), false);
+    assert.equal(t.update(off, false), false);
+    assert.equal(t.update(on, false), true);
+  });
+
+  it("field is not cleared while the user is typing, and not later either", () => {
+    const t = ui.createFieldClearTracker();
+    const on = { needsPairing: true, pairingCodeConfigured: false };
+    assert.equal(t.update({ needsPairing: false }, false), false);
+    assert.equal(t.update(on, true), false);
+    assert.equal(t.update(on, false), false);
+  });
+
+  it("dead-code 401 moves controller state into the fresh prompt", async () => {
+    const store = memoryStore(seed());
+    const { ctrl } = ctrlWith(store, async () => ({ status: 401, data: { error: { code: "PAIRING_CODE_EXPIRED" } } }));
+    const t = ui.createFieldClearTracker();
+    assert.equal(t.update(ctrl.publicHostState(), false), false);
+    await ctrl.registerAsHost({ branchId: "147" });
+    assert.equal(t.update(ctrl.publicHostState(), false), true);
+    assert.equal(t.update(ctrl.publicHostState(), false), false);
+  });
+});

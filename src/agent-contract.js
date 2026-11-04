@@ -207,16 +207,15 @@ function parseRegisterResponse(data) {
  * Parse 409 PRINT_HOST_ALREADY_CONFIGURED (contract §2.1).
  * Distinguishes from printers/sync 409 SYNC_CONFLICT by error.code (v1.4).
  */
-function parseHostConflictError(payload, httpStatus) {
+function parseHostConflictError(payload, _httpStatus) {
   const root = payload && typeof payload === "object" ? payload : {};
   const err = root.error && typeof root.error === "object" ? root.error : root;
   const code = err.code != null ? String(err.code) : "";
   // printers/sync M5 — not a host-assignment conflict
   if (code === ERROR_CODES.SYNC_CONFLICT) return null;
-  const isHostConflict =
-    code === ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED ||
-    (httpStatus === 409 && !code);
-  if (!isHostConflict) return null;
+  // v1.21: only an explicit PRINT_HOST_ALREADY_CONFIGURED is a host conflict.
+  // A 409 with no code gets the generic friendly error (no credential drop).
+  if (code !== ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED) return null;
 
   const current = err.current_host || err.currentHost || null;
   return {
