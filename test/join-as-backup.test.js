@@ -562,3 +562,118 @@ describe("R9D: stale snapshot, clearLocalAuth, throw restore, stopRabbit", () =>
     assert.match(authBlock, /await\s+stopRabbit\s*\(\s*\)/);
   });
 });
+
+
+describe("R10D: upper-case hash, code-point label cap, live 409 cap", () => {
+  const crypto = require("node:crypto");
+  const { parseHostConflictError, capHostDeviceLabel } = require("../src/agent-contract");
+  const hashUpper = (c) =>
+    crypto.createHash("sha256").update(String(c).trim().toUpperCase(), "utf8").digest("hex");
+  const hashLegacy = (c) =>
+    crypto.createHash("sha256").update(String(c).trim(), "utf8").digest("hex");
+
+  it("R10D-L1: lower-case retype of blocked code keeps the block (no auto-resend)", async () => {
+    const store = memoryStore(seed({ pairing_code: "ABC123" }));
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return HOST_CONFLICT;
+    });
+    await ctrl.ensureSession({});
+    assert.equal(calls, 1);
+    assert.equal(store.get().pairing_auto_register_blocked_hash, hashUpper("ABC123"));
+    ctrl.setPairingCode("abc123"); // case-only retype
+    assert.equal(store.get().pairing_auto_register_blocked_hash, hashUpper("ABC123"));
+    assert.ok(ctrl.publicHostState().hostConflict);
+    await ctrl.ensureSession({});
+    assert.equal(calls, 1, "must not auto-resend after case-only retype");
+  });
+
+  it("R10D-L1: legacy case-sensitive hash still matches and migrates without dropping block", async () => {
+    const legacy = hashLegacy("abc123"); // pre-R10D stored form
+    assert.notEqual(legacy, hashUpper("abc123"));
+    const store = memoryStore(
+      seed({
+        pairing_code: "abc123",
+        pairing_auto_register_blocked_hash: legacy,
+        pairing_auto_register_blocked_conflict: {
+          device_label: "Kitchen PC",
+          is_online: false,
+        },
+      })
+    );
+    let calls = 0;
+    const { ctrl } = ctrlWith(store, async () => {
+      calls++;
+      return HOST_CONFLICT;
+    });
+    const hc = ctrl.publicHostState().hostConflict;
+    assert.ok(hc, "legacy hash must still restore banner");
+    assert.equal(hc.current_host.device_label, "Kitchen PC");
+    assert.equal(store.get().pairing_auto_register_blocked_hash, hashUpper("abc123"));
+    assert.equal(store.get().pairing_auto_register_blocked_conflict.device_label, "Kitchen PC");
+    await ctrl.ensureSession({});
+    assert.equal(calls, 0, "must stay blocked after migration");
+  });
+
+  it("R10D-I1: emoji label capped at 120 code points without splitting a surrogate", () => {
+    const emoji = "😀";
+    const raw = "a" + emoji.repeat(70); // 71 code points; UTF-16 length > 120
+    assert.equal(Array.from(raw).length, 71);
+    assert.ok(raw.length > 120);
+    assert.equal(Array.from(capHostDeviceLabel(raw)).length, 71);
+    const cappedHuge = capHostDeviceLabel(emoji.repeat(200));
+    assert.equal(Array.from(cappedHuge).length, 120);
+    assert.equal(cappedHuge, emoji.repeat(120));
+    const hash = hashUpper("CODE-JOIN");
+    const store = memoryStore(
+      seed({
+        pairing_auto_register_blocked_hash: hash,
+        pairing_auto_register_blocked_conflict: {
+          device_label: emoji.repeat(200),
+          is_online: true,
+        },
+      })
+    );
+    const { ctrl } = ctrlWith(store, async () => HOST_CONFLICT);
+    const label = ctrl.publicHostState().hostConflict.current_host.device_label;
+    assert.equal(Array.from(label).length, 120);
+    assert.equal(label, emoji.repeat(120));
+  });
+
+  it("R10D-I2: live 409 current_host.device_label gets the same string-only 120 code-point cap", () => {
+    const emoji = "😀";
+    const h = parseHostConflictError(
+      {
+        error: {
+          code: "PRINT_HOST_ALREADY_CONFIGURED",
+          message: "taken",
+          current_host: { device_label: emoji.repeat(200), is_online: true },
+        },
+      },
+      409
+    );
+    assert.equal(Array.from(h.current_host.device_label).length, 120);
+    assert.equal(h.current_host.device_label, emoji.repeat(120));
+    const nonString = parseHostConflictError(
+      {
+        error: {
+          code: "PRINT_HOST_ALREADY_CONFIGURED",
+          current_host: { device_label: { x: 1 }, is_online: false },
+        },
+      },
+      409
+    );
+    assert.equal(nonString.current_host.device_label, "");
+    const longAscii = parseHostConflictError(
+      {
+        error: {
+          code: "PRINT_HOST_ALREADY_CONFIGURED",
+          current_host: { device_label: "B".repeat(200), is_online: true },
+        },
+      },
+      409
+    );
+    assert.equal(longAscii.current_host.device_label, "B".repeat(120));
+  });
+});

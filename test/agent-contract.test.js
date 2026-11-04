@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const crypto = require("crypto");
 const {
   parseHostConflictError,
+  capHostDeviceLabel,
   parseSyncConflictError,
   syncConflictBackoffMs,
   parsePrintMessage,
@@ -323,3 +324,13 @@ describe("SYNC_CONFLICT vs PRINT_HOST_ALREADY_CONFIGURED", () => {
   });
 });
 
+describe("R10D-I2 capHostDeviceLabel / live 409", () => {
+  it("caps at 120 code points and rejects non-strings", () => {
+    assert.equal(capHostDeviceLabel({ x: 1 }), "");
+    assert.equal(capHostDeviceLabel(42), "");
+    assert.equal(capHostDeviceLabel("B".repeat(200)), "B".repeat(120));
+    const emoji = "😀";
+    assert.equal(capHostDeviceLabel(emoji.repeat(200)), emoji.repeat(120));
+    assert.equal(Array.from(capHostDeviceLabel("a" + emoji.repeat(70))).length, 71);
+  });
+});
