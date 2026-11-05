@@ -15,6 +15,8 @@ const {
   validateManualPrinterName,
   rejectMappingIfNameTooLong,
   sanitizePrinterName,
+  resolvePrinterName,
+  normalizeStatusFields,
   sanitizePort,
   validateManualPrinterHost,
   validateManualLanExternalId,
@@ -458,21 +460,43 @@ describe("R21D-L1/L2/L3 registry + wire", () => {
     assert.equal(hit.printer.external_id, "lan:10.0.0.9:9100");
   });
 
-  it("R21D-L2: NBSP/ZWSP-only name falls back to external_id", () => {
-    assert.equal(sanitizePrinterName("\u00a0\u200b\u200c\u200d\u2060\ufeff "), "");
+  it("R21D-L2 / R22D-L2: blank-makers only; keep ZWJ and inner spaces", () => {
+    assert.equal(sanitizePrinterName("\u00a0\u200b\u2060\ufeff "), "");
+    assert.equal(resolvePrinterName("\u00a0\u200b ", "lan:a:9100"), "lan:a:9100");
+    assert.equal(resolvePrinterName("A  B", "id"), "A  B");
+    assert.equal(resolvePrinterName("👨‍👩‍👧", "id"), "👨‍👩‍👧");
+    assert.equal(resolvePrinterName("Kit\u200bchen", "id"), "Kit\u200bchen");
     const r = createPrinterRegistry();
     r.upsert({ external_id: "lan:a:9100", name: "\u00a0\u200b " });
     assert.equal(r.list()[0].name, "lan:a:9100");
-    assert.equal(r.toSyncPayload()[0].name, "lan:a:9100");
+    r.upsert({ external_id: "lan:b:9100", name: "A  B" });
+    assert.equal(r.list().find((p) => p.external_id === "lan:b:9100").name, "A  B");
   });
 
-  it("R21D-L3: status vocab + port omit", () => {
+  it("R22D-L1: out_of_paper keeps Out of paper detail; never null out existing", () => {
+    const a = normalizeStatusFields("out_of_paper", null);
+    assert.equal(a.status, "error");
+    assert.equal(a.status_detail, "Out of paper");
+    const b = normalizeStatusFields("paused", "Door open");
+    assert.equal(b.status, "error");
+    assert.equal(b.status_detail, "Door open");
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "out_of_paper" });
+    const p = r.toSyncPayload()[0];
+    assert.equal(p.status, "error");
+    assert.equal(p.status_detail, "Out of paper");
+  });
+
+  it("R21D-L3 / R22D-L3: status vocab + strict port", () => {
     assert.equal(capStatus("ONLINE"), "online");
     assert.equal(capStatus("paused"), "error");
     assert.equal(capStatus(true), "error");
     assert.equal(sanitizePort(0), undefined);
     assert.equal(sanitizePort(99999), undefined);
     assert.equal(sanitizePort(9100), 9100);
+    assert.equal(sanitizePort(true), undefined);
+    assert.equal(sanitizePort("0x10"), undefined);
+    assert.equal(sanitizePort(9100.5), undefined);
     const r = createPrinterRegistry();
     r.upsert({
       external_id: "lan:b:9100",
@@ -483,5 +507,71 @@ describe("R21D-L1/L2/L3 registry + wire", () => {
     const p = r.toSyncPayload()[0];
     assert.equal(p.status, "online");
     assert.ok(!("port" in p));
+  });
+
+  it("R22D-I1: port boundaries, digit string, keep prior on invalid", () => {
+    assert.equal(sanitizePort(65535), 65535);
+    assert.equal(sanitizePort(65536), undefined);
+    assert.equal(sanitizePort(1), 1);
+    assert.equal(sanitizePort("9100"), 9100);
+    assert.equal(sanitizePort("65535"), 65535);
+    assert.equal(sanitizePort("65536"), undefined);
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:c:9100", name: "n", port: 9100 });
+    assert.equal(r.get("lan:c:9100").port, 9100);
+    r.upsert({ external_id: "lan:c:9100", name: "n", port: 0 });
+    assert.equal(r.get("lan:c:9100").port, 9100);
+    r.upsert({ external_id: "lan:c:9100", name: "n", port: "9100" });
+    assert.equal(r.get("lan:c:9100").port, 9100);
+    r.upsert({ external_id: "lan:c:9100", name: "n", port: 65535 });
+    assert.equal(r.get("lan:c:9100").port, 65535);
+    r.upsert({ external_id: "lan:c:9100", name: "n", port: 65536 });
+    assert.equal(r.get("lan:c:9100").port, 65535);
+  });
+});
+
+describe("R22D mutations (survivor killers)", () => {
+  it("I1: >65535 mutant dies — 65536 rejected, 65535 kept", () => {
+    assert.equal(sanitizePort(65535), 65535);
+    assert.equal(sanitizePort(65536), undefined);
+    assert.equal(sanitizePort("65535"), 65535);
+    assert.equal(sanitizePort("65536"), undefined);
+  });
+
+  it("I1: string-only digit ports kept (raw-number mutant dies)", () => {
+    assert.equal(sanitizePort("9100"), 9100);
+    assert.equal(sanitizePort("1"), 1);
+  });
+
+  it("L3: bool/hex/float rejected; invalid upsert keeps stored port", () => {
+    assert.equal(sanitizePort(true), undefined);
+    assert.equal(sanitizePort(false), undefined);
+    assert.equal(sanitizePort("0x10"), undefined);
+    assert.equal(sanitizePort(9100.5), undefined);
+    assert.equal(sanitizePort("9100.0"), undefined);
+    assert.equal(sanitizePort(" 9100 "), undefined);
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:m:9100", name: "n", port: 9100 });
+    r.upsert({ external_id: "lan:m:9100", name: "n", port: 0 });
+    assert.equal(r.get("lan:m:9100").port, 9100);
+    r.upsert({ external_id: "lan:m:9100", name: "n", port: true });
+    assert.equal(r.get("lan:m:9100").port, 9100);
+  });
+
+  it("L1: known raw status fills detail; never null over existing", () => {
+    const filled = normalizeStatusFields("OUT_OF_PAPER", null);
+    assert.equal(filled.status, "error");
+    assert.equal(filled.status_detail, "Out of paper");
+    const kept = normalizeStatusFields("paused", "Door open");
+    assert.equal(kept.status_detail, "Door open");
+    const onlineKeeps = normalizeStatusFields("online", "Door open");
+    assert.equal(onlineKeeps.status_detail, "Door open");
+  });
+
+  it("L2: ZWJ kept; inner spaces kept; blank-makers only for blank check", () => {
+    assert.equal(resolvePrinterName("👨‍👩‍👧", "id"), "👨‍👩‍👧");
+    assert.equal(resolvePrinterName("A  B", "id"), "A  B");
+    assert.notEqual(resolvePrinterName("\u200c\u200d", "id"), "id"); // ZWNJ+ZWJ alone are NOT blank-makers
+    assert.equal(resolvePrinterName("\u200b\u2060\ufeff", "id"), "id");
   });
 });
