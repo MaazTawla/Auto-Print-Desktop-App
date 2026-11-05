@@ -148,18 +148,22 @@ function capStatus(raw) {
 }
 
 /**
- * Clamp status and preserve/fill detail (R22D-L1). Never replaces an existing
- * non-empty detail with null. out_of_paper → error + "Out of paper".
+ * Clamp status and resolve detail (R22D-L1 / R23D-M1).
+ * - Known raw statuses (out_of_paper, …) → error + default detail when empty.
+ * - opts.detailProvided: explicit status_detail key (including null = clear).
+ *   Absent key → not provided (may keep prior for error; cleared on online/offline).
+ * - online / offline: clear stale detail unless this update provided a fresh one.
  */
-function normalizeStatusFields(status, statusDetail) {
+function normalizeStatusFields(status, statusDetail, opts = {}) {
+  const detailProvided = opts.detailProvided === true;
   const lower =
     status == null ? "" : String(status).trim().toLowerCase();
-  const existing =
+  const incoming =
     statusDetail != null && String(statusDetail).trim() !== ""
       ? String(statusDetail)
       : null;
   let next;
-  let detail = existing;
+  let detail = incoming;
   if (lower === "online" || lower === "offline" || lower === "error") {
     next = lower;
   } else if (KNOWN_STATUS_DETAILS[lower]) {
@@ -168,6 +172,13 @@ function normalizeStatusFields(status, statusDetail) {
   } else {
     next = "error";
   }
+  // R23D-M1: recovery / offline without a fresh detail must not keep stale text.
+  if ((next === "online" || next === "offline") && !detailProvided) {
+    detail = null;
+  }
+  if ((next === "online" || next === "offline") && detailProvided && incoming == null) {
+    detail = null;
+  }
   return {
     status: truncateAtGraphemeBoundary(next, PRINTER_STATUS_MAX),
     status_detail: detail,
@@ -175,8 +186,9 @@ function normalizeStatusFields(status, statusDetail) {
 }
 
 /**
- * Port for the wire / registry: integer number, or digit string /^[0-9]+$/,
- * in 1..65535. Rejects booleans, hex, floats, padded strings (R22D-L3).
+ * Port for the wire / registry: integer number, or digit string
+ * /^[1-9][0-9]{0,4}$/ at most 65535 (R22D-L3 / R23D-L1). Rejects booleans,
+ * hex, floats, leading-zero pads ("009100"), padded strings.
  * L14-I4: empty / whitespace-only string → omitted (undefined); never 0.
  */
 function sanitizePort(raw) {
@@ -187,7 +199,7 @@ function sanitizePort(raw) {
   if (typeof raw === "string") {
     // Empty or whitespace-only → omitted (keep stored; never send 0).
     if (raw.trim() === "") return undefined;
-    if (!/^[0-9]+$/.test(raw)) return undefined;
+    if (!/^[1-9][0-9]{0,4}$/.test(raw)) return undefined;
     const n = Number(raw);
     if (!Number.isInteger(n) || n < 1 || n > 65535) return undefined;
     return n;
@@ -220,7 +232,13 @@ function capSyncPrinterRow(row) {
   if (out.ip_address != null) out.ip_address = capOptionalField(out.ip_address);
   if (out.host != null) out.host = capOptionalField(out.host);
   if (out.status != null || out.status_detail != null) {
-    const n = normalizeStatusFields(out.status, out.status_detail);
+    const detailProvided = Object.prototype.hasOwnProperty.call(
+      out,
+      "status_detail"
+    );
+    const n = normalizeStatusFields(out.status, out.status_detail, {
+      detailProvided,
+    });
     out.status = n.status;
     out.status_detail =
       n.status_detail != null ? capOptionalField(n.status_detail) : null;

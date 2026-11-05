@@ -154,13 +154,21 @@ function createPrinterRegistry(initial = {}) {
       printer.status != null
         ? printer.status
         : (prev && prev.status) || "online";
-    const detailIn =
-      printer.status_detail != null
-        ? String(printer.status_detail)
-        : prev && prev.status_detail != null
-          ? prev.status_detail
-          : null;
-    const statusFields = normalizeStatusFields(statusRaw, detailIn);
+    // R23D-M1: explicit status_detail: null clears; absent key = not provided.
+    const detailProvided = Object.prototype.hasOwnProperty.call(
+      printer,
+      "status_detail"
+    );
+    let detailIn = null;
+    if (detailProvided) {
+      detailIn =
+        printer.status_detail != null ? String(printer.status_detail) : null;
+    } else if (prev && prev.status_detail != null) {
+      detailIn = prev.status_detail;
+    }
+    const statusFields = normalizeStatusFields(statusRaw, detailIn, {
+      detailProvided,
+    });
     // R22D-L3 / L14-I4: invalid or omitted ('' / whitespace) port keeps stored.
     let port = prev && prev.port != null ? prev.port : null;
     if (Object.prototype.hasOwnProperty.call(printer, "port")) {
