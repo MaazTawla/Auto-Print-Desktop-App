@@ -2651,6 +2651,7 @@
                 <div class="field-hint">App ID: <span class="mono" id="settings-app-id">—</span></div>
                 <div class="err-text" id="settings-agent-err"></div>
                 <div class="settings-card-actions settings-card-actions-split">
+                  <button type="button" class="btn-outline" id="settings-agent-sign-out" hidden>Sign out this device</button>
                   <button type="button" class="btn-outline" id="settings-agent-retry">Retry</button>
                   <button type="button" class="btn-primary" id="settings-agent-save">
                     <span class="btn-label" id="settings-agent-save-label">Connect</span>
@@ -4207,6 +4208,12 @@
     if (saveLabel && !saveLabel.dataset.busy) {
       saveLabel.textContent = (sp && sp.agentTokenConfigured) ? 'Reconnect' : 'Connect';
     }
+    const signOutBtn = document.getElementById('settings-agent-sign-out');
+    if (signOutBtn && !signOutBtn.dataset.busy) {
+      const signedIn = !!(sp && sp.agentTokenConfigured);
+      signOutBtn.hidden = !signedIn;
+      signOutBtn.disabled = false;
+    }
     const appIdEl = document.getElementById('settings-app-id');
     if (appIdEl) appIdEl.textContent = (sp && sp.appId) || '—';
     const apiBase = document.getElementById('settings-agent-api-base');
@@ -4506,6 +4513,45 @@
       showToast('Retried print-host registration.');
     });
   }
+
+  document.getElementById('settings-agent-sign-out').addEventListener('click', async () => {
+    const errEl = document.getElementById('settings-agent-err');
+    if (errEl) errEl.textContent = '';
+    const btn = document.getElementById('settings-agent-sign-out');
+    if (btn) {
+      btn.dataset.busy = '1';
+      btn.disabled = true;
+    }
+    try {
+      const res = await window.api.deregisterPrintAgent();
+      try { applyState(await window.api.getState()); } catch (_) {}
+      if (res && res.ok) {
+        if (errEl) errEl.textContent = '';
+        showToast(res.message || 'Signed out of print agent on this device.', 'success', 3400);
+      } else {
+        const msg =
+          (res && res.error) ||
+          "Couldn't sign this device out, please try again";
+        if (errEl) errEl.textContent = msg;
+        showToast(msg, 'error', 4200);
+        // Leave button enabled so the user can retry (R15D-L1 prep).
+        if (btn) {
+          btn.disabled = false;
+          btn.hidden = false;
+        }
+      }
+    } catch (err) {
+      const msg = (err && err.message) || "Couldn't sign this device out, please try again";
+      if (errEl) errEl.textContent = msg;
+      showToast(msg, 'error', 4200);
+      if (btn) {
+        btn.disabled = false;
+        btn.hidden = false;
+      }
+    } finally {
+      if (btn) delete btn.dataset.busy;
+    }
+  });
 
   document.getElementById('settings-agent-save').addEventListener('click', async () => {
     const errEl = document.getElementById('settings-agent-err');

@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld("api", {
   testPrint: () => ipcRenderer.invoke("test-print"),
   setAgentApiSettings: (opts) => ipcRenderer.invoke("set-agent-api-settings", opts),
   retryPrintHostRegister: () => ipcRenderer.invoke("retry-print-host-register"),
+  deregisterPrintAgent: () => ipcRenderer.invoke("deregister-print-agent"),
   joinAsBackupDevice: () => ipcRenderer.invoke("join-as-backup-device"),
   setPrinterMapping: (opts) => ipcRenderer.invoke("set-printer-mapping", opts),
   removePrinter: (opts) => ipcRenderer.invoke("remove-printer", opts),

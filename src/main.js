@@ -2082,6 +2082,42 @@ ipcMain.handle("join-as-backup-device", async () => {
   }
 });
 
+ipcMain.handle("deregister-print-agent", async () => {
+  try {
+    const sp = getStationPrinting();
+    const result = await sp.deregister();
+    pushState();
+    const st = sp.publicHostState();
+    if (!result || !result.ok) {
+      const message =
+        (result && result.message) ||
+        (result && result.error && result.error.message) ||
+        "Couldn't sign this device out, please try again";
+      return {
+        ok: false,
+        error: message,
+        code: (result && result.code) || "DEREGISTER_FAILED",
+        updateConflict: Boolean(result && result.updateConflict),
+        retriesExhausted: Boolean(result && result.retriesExhausted),
+        needsPairing: false,
+        stationPrinting: st,
+      };
+    }
+    return {
+      ok: true,
+      needsPairing: true,
+      message: "Signed out of print agent on this device.",
+      stationPrinting: st,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err.message || String(err) || "Couldn't sign this device out, please try again",
+      code: "DEREGISTER_FAILED",
+    };
+  }
+});
+
 ipcMain.handle("retry-print-host-register", async () => {
   try {
     const sp = getStationPrinting();

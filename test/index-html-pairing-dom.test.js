@@ -11,7 +11,7 @@ const root = path.join(__dirname, "..");
 const tick = () => new Promise((r) => setTimeout(r, 30));
 
 describe("index.html pairing UI (jsdom)", () => {
-  let dom, w, d, stateCb, regRes, errs, inp, err;
+  let dom, w, d, stateCb, regRes, deregRes, errs, inp, err;
   const base = { darkMode: true, printers: [], stationPrinting: { needsPairing: false, pairingCodeConfigured: true } };
   const st = (sp) => stateCb({ ...base, stationPrinting: sp });
 
@@ -34,7 +34,11 @@ describe("index.html pairing UI (jsdom)", () => {
               ? (cb) => { stateCb = cb; }
               : k === "retryPrintHostRegister"
                 ? async () => regRes
-                : async () => ({ ok: true }),
+                : k === "deregisterPrintAgent"
+                  ? async () => deregRes
+                  : k === "getState"
+                    ? async () => ({ ...base, stationPrinting: { needsPairing: false, pairingCodeConfigured: true, agentTokenConfigured: !(deregRes && deregRes.ok) } })
+                    : async () => ({ ok: true }),
         });
         win.matchMedia = win.matchMedia || (() => ({ matches: false, addListener() {}, addEventListener() {} }));
       },
@@ -96,5 +100,24 @@ describe("index.html pairing UI (jsdom)", () => {
 
   it("no renderer script errors", () => {
     assert.deepEqual(errs, []);
+  });
+
+  it("R15D-L1 prep: Sign out this device shows when signed in and keeps enabled on failure", async () => {
+    const btn = d.getElementById("settings-agent-sign-out");
+    assert.ok(btn, "Sign out button must exist");
+    assert.match(btn.textContent, /Sign out this device/i);
+    st({ needsPairing: false, pairingCodeConfigured: false, agentTokenConfigured: true });
+    assert.equal(btn.hidden, false);
+    deregRes = {
+      ok: false,
+      error: "Couldn't sign this device out, please try again",
+      code: "UPDATE_CONFLICT",
+      stationPrinting: { agentTokenConfigured: true, needsPairing: false },
+    };
+    btn.click();
+    await tick();
+    assert.equal(err.textContent, "Couldn't sign this device out, please try again");
+    assert.equal(btn.disabled, false, "button stays enabled after failure");
+    assert.equal(btn.hidden, false);
   });
 });
