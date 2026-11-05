@@ -161,7 +161,7 @@ function createPrinterRegistry(initial = {}) {
           ? prev.status_detail
           : null;
     const statusFields = normalizeStatusFields(statusRaw, detailIn);
-    // R22D-L3: invalid incoming port keeps the previously stored port.
+    // R22D-L3 / L14-I4: invalid or omitted ('' / whitespace) port keeps stored.
     let port = prev && prev.port != null ? prev.port : null;
     if (Object.prototype.hasOwnProperty.call(printer, "port")) {
       const sanitized = sanitizePort(printer.port);

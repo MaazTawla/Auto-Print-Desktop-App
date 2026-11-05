@@ -86,31 +86,35 @@ function capExternalId(raw, maxCodePoints = PRINTER_FIELD_MAX) {
 }
 
 /**
- * Blank-making code points stripped for the blank check only (R22D-L2).
- * ZWJ (U+200D) and ZWNJ (U+200C) are kept so emoji sequences stay intact.
+ * Invisible / blank-making code points stripped for the blank check only
+ * (R22D-L2 / L14-I5). Includes ZWJ/ZWNJ so a ZWJ-only name is blank, while a
+ * real emoji name (visible bases + ZWJ) still passes and we send the original.
  */
 const NAME_BLANK_STRIP_CPS = new Set([
   0x200b, // ZWSP
+  0x200c, // ZWNJ
+  0x200d, // ZWJ
   0x2060, // WJ
   0xfeff, // BOM
+  0x00a0, // NBSP
 ]);
 
 /**
- * Copy used only for the blank check: strip ZWSP/WJ/BOM, treat NBSP as a
- * normal space, then trim. Does not collapse inner spaces on the value we keep.
+ * Copy used only for the blank check: strip ZWSP/ZWNJ/ZWJ/WJ/BOM/NBSP, then
+ * trim whitespace. Does not mutate the value we keep/send.
  */
 function printerNameBlankCheck(raw) {
   if (raw == null) return "";
   return Array.from(String(raw))
     .filter((ch) => !NAME_BLANK_STRIP_CPS.has(ch.codePointAt(0)))
     .join("")
-    .replace(/\u00a0/g, " ")
     .trim();
 }
 
 /**
- * If the blank-check copy is empty, return fallbackId. Otherwise return the
- * original with only end spaces trimmed (no inner collapse; ZWJ/ZWNJ kept).
+ * If the blank-check copy is empty (no visible characters), return fallbackId.
+ * Otherwise return the original with only end spaces trimmed — keep ZWJ in
+ * real emoji sequences; do not collapse inner spaces.
  */
 function resolvePrinterName(raw, fallbackId) {
   const fallback = fallbackId != null ? String(fallbackId) : "";
@@ -173,6 +177,7 @@ function normalizeStatusFields(status, statusDetail) {
 /**
  * Port for the wire / registry: integer number, or digit string /^[0-9]+$/,
  * in 1..65535. Rejects booleans, hex, floats, padded strings (R22D-L3).
+ * L14-I4: empty / whitespace-only string → omitted (undefined); never 0.
  */
 function sanitizePort(raw) {
   if (typeof raw === "number") {
@@ -180,6 +185,8 @@ function sanitizePort(raw) {
     return raw;
   }
   if (typeof raw === "string") {
+    // Empty or whitespace-only → omitted (keep stored; never send 0).
+    if (raw.trim() === "") return undefined;
     if (!/^[0-9]+$/.test(raw)) return undefined;
     const n = Number(raw);
     if (!Number.isInteger(n) || n < 1 || n > 65535) return undefined;
