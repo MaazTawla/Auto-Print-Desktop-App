@@ -565,8 +565,12 @@ describe("R22D mutations (survivor killers)", () => {
     assert.equal(filled.status_detail, "Out of paper");
     const kept = normalizeStatusFields("paused", "Door open");
     assert.equal(kept.status_detail, "Door open");
-    const onlineKeeps = normalizeStatusFields("online", "Door open");
-    assert.equal(onlineKeeps.status_detail, "Door open");
+    const onlineClears = normalizeStatusFields("online", "Door open"); // not provided
+    assert.equal(onlineClears.status_detail, null);
+    const onlineFresh = normalizeStatusFields("online", "OK", {
+      detailProvided: true,
+    });
+    assert.equal(onlineFresh.status_detail, "OK");
   });
 
   it("L2/L14-I5: ZWJ kept in emoji; invisible-only falls back", () => {
@@ -641,5 +645,117 @@ describe("L14 mutations (survivor killers)", () => {
     assert.equal(resolvePrinterName("\u200d\u200c\u200d", "id"), "id");
     // Visible + ZWJ still sends original
     assert.equal(resolvePrinterName("👨\u200d👩", "id"), "👨\u200d👩");
+  });
+});
+
+describe("R23D-M1 / L1 / I1", () => {
+  it("R23D-M1: out_of_paper then ready clears stale detail", () => {
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "out_of_paper" });
+    assert.equal(r.toSyncPayload()[0].status_detail, "Out of paper");
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "online" });
+    assert.equal(r.toSyncPayload()[0].status, "online");
+    assert.equal(r.toSyncPayload()[0].status_detail, null);
+  });
+
+  it("R23D-M1: door-open then ready clears detail", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "error",
+      status_detail: "Door open",
+    });
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "online" });
+    assert.equal(r.toSyncPayload()[0].status_detail, null);
+  });
+
+  it("R23D-M1: explicit status_detail null clears; absent key keeps on error", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "error",
+      status_detail: "Door open",
+    });
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "error",
+      status_detail: null,
+    });
+    assert.equal(r.toSyncPayload()[0].status_detail, null);
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "error",
+      status_detail: "Jam",
+    });
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "error" });
+    assert.equal(r.toSyncPayload()[0].status_detail, "Jam");
+  });
+
+  it("R23D-L1: reject leading-zero port strings; integers still ok", () => {
+    assert.equal(sanitizePort("009100"), undefined);
+    assert.equal(sanitizePort("0009100"), undefined);
+    assert.equal(sanitizePort("9100"), 9100);
+    assert.equal(sanitizePort(9100), 9100);
+    assert.equal(sanitizePort("065535"), undefined);
+    assert.equal(sanitizePort("65535"), 65535);
+  });
+
+  it("R23D-I1: out_of_paper with explicit detail keeps that detail (D_overwrite)", () => {
+    const n = normalizeStatusFields("out_of_paper", "Tray empty", {
+      detailProvided: true,
+    });
+    assert.equal(n.status, "error");
+    assert.equal(n.status_detail, "Tray empty");
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "out_of_paper",
+      status_detail: "Tray empty",
+    });
+    assert.equal(r.toSyncPayload()[0].status_detail, "Tray empty");
+  });
+});
+
+describe("R23D mutations (survivor killers)", () => {
+  it("M1: online without fresh detail must clear (stale-keep mutant dies)", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "error",
+      status_detail: "Out of paper",
+    });
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "online" });
+    assert.equal(r.get("lan:a:9100").status_detail, null);
+  });
+
+  it("M1: offline without fresh detail clears; Windows fresh detail kept", () => {
+    const cleared = normalizeStatusFields("offline", "stale", {
+      detailProvided: false,
+    });
+    assert.equal(cleared.status_detail, null);
+    const fresh = normalizeStatusFields("offline", "offline", {
+      detailProvided: true,
+    });
+    assert.equal(fresh.status_detail, "offline");
+  });
+
+  it("L1: leading-zero pad mutant dies", () => {
+    assert.equal(sanitizePort("009100"), undefined);
+    assert.equal(sanitizePort("0009100"), undefined);
+    assert.equal(sanitizePort("09100"), undefined);
+  });
+
+  it("I1: D_overwrite mutant dies — explicit detail wins over known default", () => {
+    const n = normalizeStatusFields("OUT_OF_PAPER", "Sensor trip", {
+      detailProvided: true,
+    });
+    assert.equal(n.status_detail, "Sensor trip");
+    assert.notEqual(n.status_detail, "Out of paper");
   });
 });
