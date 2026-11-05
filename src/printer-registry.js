@@ -150,15 +150,18 @@ function createPrinterRegistry(initial = {}) {
         ? String(printer.name)
         : windowsName || (prev && prev.name) || "";
     const cleanedName = resolvePrinterName(rawName, externalId);
-    const statusRaw =
-      printer.status != null
-        ? printer.status
-        : (prev && prev.status) || "online";
-    // R23D-M1: explicit status_detail: null clears; absent key = not provided.
+    // R24D: detail changes only when upsert includes status or status_detail.
+    const statusProvided = Object.prototype.hasOwnProperty.call(
+      printer,
+      "status"
+    );
     const detailProvided = Object.prototype.hasOwnProperty.call(
       printer,
       "status_detail"
     );
+    const statusRaw = statusProvided
+      ? printer.status
+      : (prev && prev.status) || "online";
     let detailIn = null;
     if (detailProvided) {
       detailIn =
@@ -168,6 +171,7 @@ function createPrinterRegistry(initial = {}) {
     }
     const statusFields = normalizeStatusFields(statusRaw, detailIn, {
       detailProvided,
+      statusProvided,
     });
     // R22D-L3 / L14-I4: invalid or omitted ('' / whitespace) port keeps stored.
     let port = prev && prev.port != null ? prev.port : null;
@@ -222,14 +226,15 @@ function createPrinterRegistry(initial = {}) {
       const externalId = normalizeExternalId(p.external_id);
       if (!externalId) continue;
       const prev = byExternalId.get(externalId);
-      upsert({
+      // R24D-L1: only pass status_detail when the server sent the field
+      // (undefined → omit key so a local error detail like "jam" is kept).
+      const syncRow = {
         ...(prev || {}),
         external_id: externalId,
         name: p.name || (prev && prev.name) || externalId,
         windows_name: (prev && prev.windows_name) || p.name || externalId,
         connection: p.connection_type || p.connection || (prev && prev.connection),
         status: p.status || (prev && prev.status) || "online",
-        status_detail: p.status_detail,
         is_default:
           p.is_default != null
             ? Boolean(p.is_default)
@@ -238,7 +243,13 @@ function createPrinterRegistry(initial = {}) {
         ip_address: p.ip_address,
         server_id: p.id,
         id: p.id,
-      });
+      };
+      if (p.status_detail !== undefined) {
+        syncRow.status_detail = p.status_detail;
+      } else {
+        delete syncRow.status_detail;
+      }
+      upsert(syncRow);
     }
     return list();
   }

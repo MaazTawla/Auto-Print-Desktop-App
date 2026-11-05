@@ -148,14 +148,17 @@ function capStatus(raw) {
 }
 
 /**
- * Clamp status and resolve detail (R22D-L1 / R23D-M1).
- * - Known raw statuses (out_of_paper, …) → error + default detail when empty.
- * - opts.detailProvided: explicit status_detail key (including null = clear).
- *   Absent key → not provided (may keep prior for error; cleared on online/offline).
- * - online / offline: clear stale detail unless this update provided a fresh one.
+ * Clamp status and resolve detail (R22D-L1 / R23D-M1 / R24D).
+ * One rule: detail is only cleared/changed when the upsert includes `status`
+ * or an explicit `status_detail` (null clears). Neither → leave untouched.
+ * - opts.detailProvided: status_detail key present (null = clear).
+ * - opts.statusProvided: status key present; online/offline clear only then.
+ * - Known raw statuses → error + default detail when empty.
+ * R24D-I1: no separate explicit-null branch (incoming null already clears).
  */
 function normalizeStatusFields(status, statusDetail, opts = {}) {
   const detailProvided = opts.detailProvided === true;
+  const statusProvided = opts.statusProvided === true;
   const lower =
     status == null ? "" : String(status).trim().toLowerCase();
   const incoming =
@@ -172,11 +175,13 @@ function normalizeStatusFields(status, statusDetail, opts = {}) {
   } else {
     next = "error";
   }
-  // R23D-M1: recovery / offline without a fresh detail must not keep stale text.
-  if ((next === "online" || next === "offline") && !detailProvided) {
-    detail = null;
-  }
-  if ((next === "online" || next === "offline") && detailProvided && incoming == null) {
+  // Clear stale detail on online/offline only when this upsert included status
+  // and did not supply a fresh detail (explicit null already yields incoming null).
+  if (
+    statusProvided &&
+    (next === "online" || next === "offline") &&
+    !detailProvided
+  ) {
     detail = null;
   }
   return {
@@ -236,8 +241,10 @@ function capSyncPrinterRow(row) {
       out,
       "status_detail"
     );
+    const statusProvided = Object.prototype.hasOwnProperty.call(out, "status");
     const n = normalizeStatusFields(out.status, out.status_detail, {
       detailProvided,
+      statusProvided,
     });
     out.status = n.status;
     out.status_detail =
