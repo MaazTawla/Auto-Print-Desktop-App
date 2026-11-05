@@ -425,6 +425,39 @@ describe("R21D-L1/L2/L3 registry + wire", () => {
     assert.equal(hit.printer.external_id, capExternalId(raw));
   });
 
+  it("R21D-L1: bare long name resolves via win: form when names were customized", () => {
+    const name = "R".repeat(300);
+    const raw = "win:" + name;
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: raw,
+      name: "CustomLabel",
+      windows_name: "CustomLabel",
+    });
+    // Job still carries the original bare Windows name; name_fallback cannot
+    // match CustomLabel, so the raw→win: path must find the capped row.
+    const hit = r.routeMessage({ printer_external_id: name });
+    assert.equal(hit.ok, true);
+    assert.equal(hit.printer.external_id, capExternalId(raw));
+    assert.equal(hit.matchedBy, "external_id");
+  });
+
+  it("R21D-L1: name_fallback uses ORIGINAL bare name (not hashed id)", () => {
+    // Row is NOT under win:{name} — only windows_name matches the bare id.
+    const name = "Q".repeat(300);
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:10.0.0.9:9100",
+      name: "Front",
+      windows_name: name,
+      connection: "lan",
+    });
+    const hit = r.routeMessage({ printer_external_id: name });
+    assert.equal(hit.ok, true);
+    assert.equal(hit.matchedBy, "name_fallback");
+    assert.equal(hit.printer.external_id, "lan:10.0.0.9:9100");
+  });
+
   it("R21D-L2: NBSP/ZWSP-only name falls back to external_id", () => {
     assert.equal(sanitizePrinterName("\u00a0\u200b\u200c\u200d\u2060\ufeff "), "");
     const r = createPrinterRegistry();

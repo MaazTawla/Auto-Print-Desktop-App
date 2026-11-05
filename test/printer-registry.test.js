@@ -245,3 +245,18 @@ describe("R20D registry external_id boundary", () => {
     assert.notEqual(row.external_id, raw);
   });
 });
+
+
+describe("R21D-I2 alias migration", () => {
+  const { migrateStoredAliases, normalizeExternalId } = require("../src/printer-registry");
+  const { codePointLength } = require("../src/printer-field-limits");
+
+  it("alias migration drops over-255 raw keys on first pass", () => {
+    const raw = "win:" + "Z".repeat(300);
+    const m1 = migrateStoredAliases({ [raw]: "lan:1.2.3.4:9100" });
+    const m2 = migrateStoredAliases(m1);
+    assert.deepEqual(m1, m2);
+    assert.ok(Object.keys(m1).every((k) => codePointLength(k) <= 255));
+    assert.equal(m1[normalizeExternalId(raw).toLowerCase()], "lan:1.2.3.4:9100");
+  });
+});
