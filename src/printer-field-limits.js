@@ -190,28 +190,10 @@ function pickPrinterFromValidationError(error, payload) {
 }
 
 function formatPrinterSyncValidationError(error, payload) {
-  const details = extractValidationFieldDetails(error);
-  const keys = Object.keys(details);
-  const re = /^printers\.(\d+)\.([A-Za-z0-9_]+)$/;
-  let best = null;
-  for (const k of keys) {
-    const m = k.match(re);
-    if (!m) continue;
-    const idx = Number(m[1]);
-    const field = m[2];
-    if (!Number.isInteger(idx) || idx < 0) continue;
-    best = { idx, field, key: k };
-    break;
-  }
-  const list = Array.isArray(payload) ? payload : [];
-  if (best && list[best.idx]) {
-    const row = list[best.idx];
-    const label =
-      (row.name && String(row.name).trim()) ||
-      (row.external_id && String(row.external_id).trim()) ||
-      `printer #${best.idx + 1}`;
-    const fieldLabel = best.field.replace(/_/g, " ");
-    return `Could not sync printer "${label}": ${fieldLabel} was rejected (too long or invalid). Shorten it and try again.`;
+  const hit = pickPrinterFromValidationError(error, payload);
+  if (hit) {
+    const fieldLabel = String(hit.field || "field").replace(/_/g, " ");
+    return `Could not sync printer "${hit.label}": ${fieldLabel} was rejected (too long or invalid). Shorten it and try again.`;
   }
   const base =
     (error && error.message) ||

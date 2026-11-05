@@ -238,6 +238,15 @@ describe("L13-L1 syncPrintersToServer 422 names printer", () => {
 });
 
 
+describe("R20D-G1 code points not graphemes", () => {
+  it("family-emoji name over 255 code points is rejected", () => {
+    // 40 ZWJ family emoji = 40 graphemes but 280 code points.
+    const name = "👨‍👩‍👧‍👦".repeat(40);
+    assert.ok(codePointLength(name) > 255);
+    assert.match(validateManualPrinterName(name), /255/);
+  });
+});
+
 describe("R20D-L2 oversized grapheme", () => {
   it("never returns empty for a single grapheme longer than the budget", () => {
     const huge = "e" + "\u0301".repeat(400);
@@ -276,7 +285,18 @@ describe("R20D-I1 mutant killers (wiring)", () => {
     const src = rd("src/main.js");
     const i = src.indexOf('ipcMain.handle("add-discovered-printer"');
     assert.ok(i >= 0);
-    assert.match(src.slice(i, i + 6000), /sync && sync\.ok === false && !sync\.skipped/);
+    const end = src.indexOf('ipcMain.handle("set-printer-mapping"', i + 1);
+    const slice = src.slice(i, end > i ? end : i + 3500);
+    assert.match(slice, /sync && sync\.ok === false && !sync\.skipped/);
+    assert.match(slice, /added:\s*row/);
+    assert.match(slice, /Printer sync failed/);
+  });
+
+  it("S3: formatPrinterSyncValidationError uses pickPrinterFromValidationError", () => {
+    const src = rd("src/printer-field-limits.js");
+    const i = src.indexOf("function formatPrinterSyncValidationError");
+    assert.ok(i >= 0);
+    assert.match(src.slice(i, i + 500), /pickPrinterFromValidationError/);
   });
 
   it("W3: registry upsert stores capped external_id (fails if upsert skips cap)", () => {
