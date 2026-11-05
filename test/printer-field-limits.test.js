@@ -13,6 +13,9 @@ const {
   capStatus,
   capSyncPrinterRow,
   validateManualPrinterName,
+  rejectMappingIfNameTooLong,
+  sanitizePrinterName,
+  sanitizePort,
   validateManualPrinterHost,
   validateManualLanExternalId,
   formatPrinterSyncValidationError,
@@ -60,10 +63,12 @@ describe("L13-L1 printer field limits", () => {
     assert.notEqual(a, long.slice(0, 255));
   });
 
-  it("capStatus maps out_of_paper and hard-caps at 16", () => {
+  it("capStatus maps out_of_paper and clamps to BE vocab", () => {
     assert.equal(capStatus("out_of_paper"), "error");
     assert.equal(capStatus("online"), "online");
-    assert.equal(codePointLength(capStatus("x".repeat(40))), 16);
+    assert.equal(capStatus("ONLINE"), "online");
+    assert.equal(capStatus("paused"), "error");
+    assert.equal(capStatus("x".repeat(40)), "error");
   });
 
   it("capSyncPrinterRow truncates name/model/status_detail/ip and status", () => {
@@ -80,7 +85,7 @@ describe("L13-L1 printer field limits", () => {
     assert.equal(codePointLength(row.model), 255);
     assert.equal(codePointLength(row.status_detail), 255);
     assert.equal(codePointLength(row.ip_address), 255);
-    assert.equal(codePointLength(row.status), 16);
+    assert.equal(row.status, "error");
   });
 
   it("manual validators: name 255 / host 253 / eid", () => {
@@ -266,13 +271,19 @@ describe("R20D-I1 mutant killers (wiring)", () => {
   const root = path.join(__dirname, "..");
   const rd = (f) => fs.readFileSync(path.join(root, f), "utf8");
 
-  it("W7: set-printer-mapping checks validateManualPrinterName", () => {
+  it("W7: set-printer-mapping rejects a long name via rejectMappingIfNameTooLong", () => {
     const src = rd("src/main.js");
     const i = src.indexOf('ipcMain.handle("set-printer-mapping"');
     assert.ok(i >= 0);
     const slice = src.slice(i, i + 2500);
-    assert.match(slice, /validateManualPrinterName/);
-    assert.match(slice, /FIELD_TOO_LONG/);
+    assert.match(slice, /rejectMappingIfNameTooLong/);
+    assert.match(slice, /if \(nameReject\) return nameReject/);
+    // Behavioral: call the gate with a long name (kills if(false) inside it).
+    const rejected = rejectMappingIfNameTooLong("N".repeat(256));
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.code, "FIELD_TOO_LONG");
+    assert.match(String(rejected.error), /255/);
+    assert.equal(rejectMappingIfNameTooLong("Kitchen"), null);
   });
 
   it("H3: client-side form name check uses codePointLen > 255", () => {
@@ -396,5 +407,48 @@ describe("R20D-I2 persistent sync 422 state", () => {
     );
     assert.match(html, /id="settings-printer-sync-err"/);
     assert.match(html, /printerSyncError/);
+  });
+});
+
+
+describe("R21D-L1/L2/L3 registry + wire", () => {
+  const { createPrinterRegistry } = require("../src/printer-registry");
+
+  it("R21D-L1: bare Windows name over 251 routes to capped win: row", () => {
+    const name = "P".repeat(300);
+    const raw = "win:" + name;
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: raw, name, windows_name: name });
+    const hit = r.routeMessage({ printer_external_id: name });
+    assert.equal(hit.ok, true);
+    assert.equal(hit.printer.windows_name, name);
+    assert.equal(hit.printer.external_id, capExternalId(raw));
+  });
+
+  it("R21D-L2: NBSP/ZWSP-only name falls back to external_id", () => {
+    assert.equal(sanitizePrinterName("\u00a0\u200b\u200c\u200d\u2060\ufeff "), "");
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:a:9100", name: "\u00a0\u200b " });
+    assert.equal(r.list()[0].name, "lan:a:9100");
+    assert.equal(r.toSyncPayload()[0].name, "lan:a:9100");
+  });
+
+  it("R21D-L3: status vocab + port omit", () => {
+    assert.equal(capStatus("ONLINE"), "online");
+    assert.equal(capStatus("paused"), "error");
+    assert.equal(capStatus(true), "error");
+    assert.equal(sanitizePort(0), undefined);
+    assert.equal(sanitizePort(99999), undefined);
+    assert.equal(sanitizePort(9100), 9100);
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:b:9100",
+      name: "ok",
+      status: "ONLINE",
+      port: 0,
+    });
+    const p = r.toSyncPayload()[0];
+    assert.equal(p.status, "online");
+    assert.ok(!("port" in p));
   });
 });
