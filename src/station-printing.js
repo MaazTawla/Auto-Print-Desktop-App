@@ -6,13 +6,13 @@
 
 "use strict";
 
-const os = require("os");
 const crypto = require("crypto");
 const { createHostOnlyPolicy } = require("./host-only-policy");
 const { getOrCreateAppId } = require("./app-identity");
 const { createPrinterRegistry } = require("./printer-registry");
 const { createAgentApi } = require("./agent-api");
 const pairingErrors = require("./pairing-errors");
+const deviceName = require("./device-name");
 const {
   ASSUMPTIONS,
   REMAINING_GAPS,
@@ -274,7 +274,7 @@ function createStationPrintingController(deps = {}) {
       defaultPrinterExternalId: (printers.getDefault() || {}).external_id || null,
       agentTokenConfigured: Boolean(api.getToken()),
       agentApiBase: String(readConfig().agent_api_base || ""),
-      deviceLabel: String(readConfig().device_label || defaultDeviceLabel()),
+      deviceLabel: deviceName.labelOrDefault(readConfig().device_label),
       pairingCodeConfigured: Boolean(String(readConfig().pairing_code || "").trim()),
       pairingError: lastRegisterError,
       lastRegisterError,
@@ -302,13 +302,6 @@ function createStationPrintingController(deps = {}) {
     };
   }
 
-  function defaultDeviceLabel() {
-    try {
-      return `${os.hostname()} - Desktop Print Agent`;
-    } catch {
-      return "Desktop Print Agent";
-    }
-  }
 
   function setApiBase(base) {
     const normalized = normalizeAgentApiBase(base);
@@ -569,7 +562,7 @@ function createStationPrintingController(deps = {}) {
         {
           appId,
           branchId: branchId || cfg.branch_id,
-          deviceLabel: cfg.device_label || defaultDeviceLabel(),
+          deviceLabel: deviceName.labelOrDefault(cfg.device_label),
           pairingCode: cfg.pairing_code || "",
           role: registerRole,
           agentVersion:
