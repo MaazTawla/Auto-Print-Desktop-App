@@ -46,6 +46,9 @@ const {
   createAuthUnpairTracker,
   isAuthRelated,
 } = require("./agent-http-retry-policy");
+const {
+  formatPrinterSyncValidationError,
+} = require("./printer-field-limits");
 
 function createStationPrintingController(deps = {}) {
   const readConfig = deps.readConfig || (() => ({}));
@@ -1456,7 +1459,7 @@ function createStationPrintingController(deps = {}) {
     }
     return withPrinterSyncSingleFlight(() =>
       withSyncConflictRetries("Printers sync", async (_attempt, { timeoutMs }) => {
-        const result = await api.syncPrinters({
+        let result = await api.syncPrinters({
           appId,
           branchId: branchId || cfg.branch_id,
           printers: payload,
@@ -1493,10 +1496,31 @@ function createStationPrintingController(deps = {}) {
           } catch (_) {}
         } else {
           try {
-            const msg =
+            let msg =
               (result && result.error && result.error.message) ||
               (result && result.error) ||
               "Printer sync failed";
+            // L13-L1: 422 VALIDATION_ERROR — name the printer from details.
+            const statusNum = result && result.status != null ? Number(result.status) : null;
+            const code =
+              (result && result.code) ||
+              (result && result.error && result.error.code) ||
+              "";
+            if (
+              statusNum === 422 ||
+              code === "VALIDATION_ERROR" ||
+              code === ERROR_CODES.VALIDATION_ERROR
+            ) {
+              msg = formatPrinterSyncValidationError(result.error || result, payload);
+              result = {
+                ...result,
+                message: msg,
+                error:
+                  result.error && typeof result.error === "object"
+                    ? { ...result.error, message: msg }
+                    : { code: "VALIDATION_ERROR", message: msg },
+              };
+            }
             log(`Printer sync failed: ${msg}`, "⚠️");
           } catch (_) {}
         }

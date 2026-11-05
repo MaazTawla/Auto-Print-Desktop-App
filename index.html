@@ -2815,7 +2815,8 @@
                     <input type="hidden" id="settings-manual-printer-edit-id" value="" />
                     <div class="field">
                       <label for="settings-manual-printer-name">Name</label>
-                      <input type="text" id="settings-manual-printer-name" placeholder="Kitchen" autocomplete="off" />
+                      <input type="text" id="settings-manual-printer-name" placeholder="Kitchen" autocomplete="off" maxlength="255" />
+                      <p class="field-hint" style="margin:4px 0 0;">Max 255 characters.</p>
                     </div>
                     <div class="field" id="settings-manual-printer-eid-field" style="display:none;">
                       <label for="settings-manual-printer-eid">External ID (locked)</label>
@@ -2823,7 +2824,8 @@
                     </div>
                     <div class="field">
                       <label for="settings-manual-printer-host">Host / IP</label>
-                      <input type="text" id="settings-manual-printer-host" placeholder="192.168.1.50" autocomplete="off" />
+                      <input type="text" id="settings-manual-printer-host" placeholder="192.168.1.50" autocomplete="off" maxlength="253" />
+                      <p class="field-hint" style="margin:4px 0 0;">Max 253 characters (DNS limit).</p>
                     </div>
                     <div class="field">
                       <label for="settings-manual-printer-port">Port</label>
@@ -4758,6 +4760,16 @@
       const name = (document.getElementById('settings-manual-printer-name') || {}).value || '';
       const host = String((document.getElementById('settings-manual-printer-host') || {}).value || '').trim();
       const portRaw = (document.getElementById('settings-manual-printer-port') || {}).value;
+      // L13-L1: BE v1.32 field caps (name ≤255, host ≤253).
+      function codePointLen(s) { return Array.from(String(s || '')).length; }
+      if (codePointLen(name) > 255) {
+        if (errEl) errEl.textContent = 'Name must be at most 255 characters.';
+        return;
+      }
+      if (host && codePointLen(host) > 253) {
+        if (errEl) errEl.textContent = 'Host / IP must be at most 253 characters.';
+        return;
+      }
       // Inline validation (mirrors src/lan-host-validation.js / BE v1.6)
       function isIpv6(h) {
         let x = String(h || '').trim();
@@ -4819,6 +4831,10 @@
         return;
       }
       const externalId = 'lan:' + host + ':' + usePort;
+      if (codePointLen(externalId) > 255) {
+        if (errEl) errEl.textContent = 'That host and port make an external id over 255 characters. Shorten the host.';
+        return;
+      }
       if (editingId) {
         if (!window.api || typeof window.api.setPrinterMapping !== 'function') return;
         manualAddBtn.disabled = true;

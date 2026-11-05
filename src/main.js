@@ -2281,9 +2281,21 @@ ipcMain.handle("add-discovered-printer", async (_e, raw) => {
     sp.printers.upsert(row);
     if (makeDefault) sp.setDefaultPrinter(row.external_id);
     try { saveUserConfig({ last_printer_list_sync_hash: "" }); } catch (_) {}
-    await sp.syncPrintersToServer({ branchId: state.branchId, force: true });
+    const sync = await sp.syncPrintersToServer({ branchId: state.branchId, force: true });
     try { await sp.pushPrinterStatusesIfChanged(); } catch (_) {}
     pushState();
+    if (sync && sync.ok === false && !sync.skipped) {
+      return {
+        ok: false,
+        error:
+          (sync.error && sync.error.message) ||
+          sync.message ||
+          sync.error ||
+          "Printer sync failed.",
+        printers: sp.printers.list(),
+        added: row,
+      };
+    }
     return { ok: true, printers: sp.printers.list(), added: row };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
@@ -2299,6 +2311,10 @@ ipcMain.handle("set-printer-mapping", async (_e, opts) => {
       const hostErr = lanHostValidation.assertPrintHostCanAdd(!!pub.isPrintHost);
       if (hostErr) {
         return { ok: false, error: hostErr, code: "NOT_PRINT_HOST" };
+      }
+      const nameLenErr = lanHostValidation.validateManualPrinterName(o.name);
+      if (nameLenErr) {
+        return { ok: false, error: nameLenErr, code: "FIELD_TOO_LONG" };
       }
       let connection = String(o.connection || "lan").trim() || "lan";
       let externalId = String(o.externalId).trim();
