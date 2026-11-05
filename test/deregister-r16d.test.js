@@ -107,11 +107,7 @@ describe("R16D deregister retries and no-token", () => {
   });
 
   it("R16D-I5 mutation: empty token after success does not POST again", async () => {
-    let n = 0;
-    const { ctrl, store, calls } = mk(() => {
-      n += 1;
-      return R(200, {});
-    });
+    const { ctrl, store, calls } = mk(() => R(200, {}));
     assert.equal((await ctrl.deregister()).ok, true);
     assert.equal(store.get().agent_token, "");
     const before = calls.length;
