@@ -15,6 +15,8 @@ const ERROR_CODES = Object.freeze({
   PRINT_HOST_ALREADY_CONFIGURED: "PRINT_HOST_ALREADY_CONFIGURED",
   PRINT_AGENT_ALREADY_REGISTERED: "PRINT_AGENT_ALREADY_REGISTERED",
   SYNC_CONFLICT: "SYNC_CONFLICT",
+  /** v1.29: write-retry exhaustion on deregister / heartbeat / sync / admin routes */
+  UPDATE_CONFLICT: "UPDATE_CONFLICT",
   PAIRING_CODE_INVALID: "PAIRING_CODE_INVALID",
   PAIRING_CODE_EXPIRED: "PAIRING_CODE_EXPIRED",
   PAIRING_CODE_REQUIRED: "PAIRING_CODE_REQUIRED",
@@ -936,6 +938,28 @@ function resolveApiUrl(apiBase, path) {
 }
 
 
+
+/**
+ * Parse 409 UPDATE_CONFLICT (contract v1.29): server write retries exhausted.
+ * Not SYNC_CONFLICT (no auto-retry loop) and not PRINT_HOST_ALREADY_CONFIGURED
+ * (no pairing auto-block). Caller keeps credentials and shows please-try-again.
+ */
+const MSG_UPDATE_CONFLICT = "Please try again.";
+/** Shown after deregister UPDATE_CONFLICT retries are exhausted (v1.29 / L10-I4). */
+const MSG_DEREGISTER_UPDATE_CONFLICT =
+  "Couldn't sign this device out, please try again";
+
+function parseUpdateConflictError(payload, _httpStatus) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const err = root.error && typeof root.error === "object" ? root.error : root;
+  const code = err.code != null ? String(err.code) : "";
+  if (code !== ERROR_CODES.UPDATE_CONFLICT) return null;
+  return {
+    code: ERROR_CODES.UPDATE_CONFLICT,
+    message: MSG_UPDATE_CONFLICT,
+  };
+}
+
 /**
  * Parse printers/sync 409 SYNC_CONFLICT (contract v1.4 §2.4 M5).
  * Distinguished from PRINT_HOST_ALREADY_CONFIGURED by error.code.
@@ -977,6 +1001,9 @@ module.exports = {
   capHostDeviceLabel,
   MAX_HOST_DEVICE_LABEL,
   parseSyncConflictError,
+  parseUpdateConflictError,
+  MSG_UPDATE_CONFLICT,
+  MSG_DEREGISTER_UPDATE_CONFLICT,
   syncConflictBackoffMs,
   buildHeartbeatRequest,
   parseHeartbeatResponse,

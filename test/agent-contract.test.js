@@ -7,6 +7,9 @@ const {
   parseHostConflictError,
   capHostDeviceLabel,
   parseSyncConflictError,
+  parseUpdateConflictError,
+  MSG_UPDATE_CONFLICT,
+  MSG_DEREGISTER_UPDATE_CONFLICT,
   syncConflictBackoffMs,
   parsePrintMessage,
   parseRegisterResponse,
@@ -321,6 +324,65 @@ describe("SYNC_CONFLICT vs PRINT_HOST_ALREADY_CONFIGURED", () => {
     assert.ok(b >= 200 && b < 400);
     const c = syncConflictBackoffMs(2, () => 0);
     assert.equal(c, 500);
+  });
+});
+
+describe("v1.29 UPDATE_CONFLICT", () => {
+  it("ERROR_CODES.UPDATE_CONFLICT is defined", () => {
+    assert.equal(ERROR_CODES.UPDATE_CONFLICT, "UPDATE_CONFLICT");
+  });
+
+  it("parseUpdateConflictError forces please-try-again message", () => {
+    const c = parseUpdateConflictError(
+      {
+        error: {
+          code: "UPDATE_CONFLICT",
+          message: "concurrent change; retry.",
+        },
+      },
+      409
+    );
+    assert.ok(c);
+    assert.equal(c.code, ERROR_CODES.UPDATE_CONFLICT);
+    assert.equal(c.message, MSG_UPDATE_CONFLICT);
+    assert.match(c.message, /please try again/i);
+  });
+
+  it("MSG_DEREGISTER_UPDATE_CONFLICT is the sign-out copy", () => {
+    assert.match(
+      MSG_DEREGISTER_UPDATE_CONFLICT,
+      /Couldn't sign this device out, please try again/i
+    );
+  });
+
+  it("parseSyncConflictError returns null for UPDATE_CONFLICT (no auto-retry)", () => {
+    assert.equal(
+      parseSyncConflictError(
+        { error: { code: "UPDATE_CONFLICT", message: "x" } },
+        409
+      ),
+      null
+    );
+  });
+
+  it("parseHostConflictError returns null for UPDATE_CONFLICT (no pairing auto-block)", () => {
+    assert.equal(
+      parseHostConflictError(
+        { error: { code: "UPDATE_CONFLICT", message: "x" } },
+        409
+      ),
+      null
+    );
+  });
+
+  it("parseUpdateConflictError returns null for SYNC_CONFLICT", () => {
+    assert.equal(
+      parseUpdateConflictError(
+        { error: { code: "SYNC_CONFLICT", message: "x" } },
+        409
+      ),
+      null
+    );
   });
 });
 

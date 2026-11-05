@@ -12,6 +12,7 @@ const {
   parseRegisterResponse,
   parseHostConflictError,
   parseSyncConflictError,
+  parseUpdateConflictError,
   buildHeartbeatRequest,
   parseHeartbeatResponse,
   buildAckRequest,
@@ -185,6 +186,7 @@ function createAgentApi(options = {}) {
       };
     }
     // v1.4 M5: heartbeat printer upsert can return 409 SYNC_CONFLICT (same as printers/sync)
+    // v1.29: UPDATE_CONFLICT is not SYNC_CONFLICT — no auto-retry loop; keep credentials.
     if (status === 409) {
       const syncConflict = parseSyncConflictError(data, status);
       if (syncConflict) {
@@ -195,6 +197,17 @@ function createAgentApi(options = {}) {
           code: ERROR_CODES.SYNC_CONFLICT,
           error: syncConflict,
           message: syncConflict.message,
+        };
+      }
+      const updateConflict = parseUpdateConflictError(data, status);
+      if (updateConflict) {
+        return {
+          ok: false,
+          status,
+          updateConflict: true,
+          code: updateConflict.code,
+          error: updateConflict,
+          message: updateConflict.message,
         };
       }
     }
@@ -226,7 +239,31 @@ function createAgentApi(options = {}) {
         ? { reason: String(fields.reason) }
         : {};
     const { status, data } = await call("POST", ENDPOINTS.deregister, body);
-    return { ok: status >= 200 && status < 300, status, data };
+    if (status >= 200 && status < 300) {
+      return { ok: true, status, data };
+    }
+    // v1.29: 409 UPDATE_CONFLICT — keep credentials; no pairing auto-block; no auto-loop.
+    const updateConflict = parseUpdateConflictError(data, status);
+    if (updateConflict) {
+      return {
+        ok: false,
+        status,
+        updateConflict: true,
+        code: updateConflict.code,
+        error: updateConflict,
+        message: updateConflict.message,
+        data,
+      };
+    }
+    const parsed = parseAgentError(data, status);
+    return {
+      ok: false,
+      status,
+      data,
+      error: parsed,
+      code: parsed.code,
+      message: parsed.message,
+    };
   }
 
   async function syncPrinters(fields) {
@@ -253,6 +290,7 @@ function createAgentApi(options = {}) {
       };
     }
     // v1.4 M5: 409 SYNC_CONFLICT — retryable; not PRINT_HOST_ALREADY_CONFIGURED
+    // v1.29: UPDATE_CONFLICT — not retryable here; please-try-again; keep credentials.
     if (status === 409) {
       const syncConflict = parseSyncConflictError(data, status);
       if (syncConflict) {
@@ -263,6 +301,19 @@ function createAgentApi(options = {}) {
           code: ERROR_CODES.SYNC_CONFLICT,
           error: syncConflict,
           message: syncConflict.message,
+          data,
+          ...parsePrintersSyncResponse({}),
+        };
+      }
+      const updateConflict = parseUpdateConflictError(data, status);
+      if (updateConflict) {
+        return {
+          ok: false,
+          status,
+          updateConflict: true,
+          code: updateConflict.code,
+          error: updateConflict,
+          message: updateConflict.message,
           data,
           ...parsePrintersSyncResponse({}),
         };

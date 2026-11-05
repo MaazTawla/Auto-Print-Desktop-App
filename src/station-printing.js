@@ -19,6 +19,7 @@ const {
   parsePrintMessage,
   ERROR_CODES,
   PLATFORM,
+  MSG_DEREGISTER_UPDATE_CONFLICT,
   syncConflictBackoffMs,
   rabbitConfigToPersistPatch,
   rabbitConnectionFingerprint,
@@ -1071,11 +1072,13 @@ function createStationPrintingController(deps = {}) {
             message: "Heartbeat failed",
           },
         syncConflict: Boolean(live && live.syncConflict),
+        updateConflict: Boolean(live && live.updateConflict),
         retriesExhausted: Boolean(live && live.retriesExhausted),
         shouldConsume: consumeEnabled,
         consecutiveHbFailures,
         retrySoonMs,
         status,
+        code: live && live.code,
       };
     }
     if (consecutiveHbFailures > 0) {
@@ -1212,13 +1215,104 @@ function createStationPrintingController(deps = {}) {
     };
   }
 
+  /**
+   * Sign this device out via POST /deregister.
+   * v1.29 / L10-I4: on 409 UPDATE_CONFLICT retry up to 2 more times with ~1s then
+   * ~3s backoff. If still conflicting, keep credentials/session, show
+   * MSG_DEREGISTER_UPDATE_CONFLICT, leave the UI enabled (no pairing auto-block).
+   * Clear local auth only on 2xx success, 404 AGENT_NOT_FOUND, or 401.
+   */
   async function deregister() {
+    const DEREGISTER_UPDATE_MAX_ATTEMPTS = 3;
+    const DEREGISTER_UPDATE_BACKOFF_MS = [1000, 3000];
+    let result = null;
+    for (let attempt = 1; attempt <= DEREGISTER_UPDATE_MAX_ATTEMPTS; attempt++) {
+      try {
+        result = await api.deregister({ reason: "explicit_deregister" });
+      } catch (_) {
+        result = null;
+      }
+      const isUpdateConflict =
+        result &&
+        (result.updateConflict === true ||
+          result.code === ERROR_CODES.UPDATE_CONFLICT);
+      if (!isUpdateConflict) break;
+      if (attempt >= DEREGISTER_UPDATE_MAX_ATTEMPTS) break;
+      const delay = DEREGISTER_UPDATE_BACKOFF_MS[attempt - 1] || 3000;
+      try {
+        log(
+          `Deregister UPDATE_CONFLICT (attempt ${attempt}/${DEREGISTER_UPDATE_MAX_ATTEMPTS}) — retry in ${delay}ms.`,
+          "⚠️"
+        );
+      } catch (_) {}
+      await sleep(delay);
+    }
+
+    // Success — server confirmed deregister.
+    if (result && result.ok) {
+      clearLocalAuth("deregister");
+      return { ok: true, needsPairing: true };
+    }
+
+    const status = result && result.status != null ? Number(result.status) : null;
+    const code =
+      (result && result.code) ||
+      (result && result.error && result.error.code) ||
+      "";
+
+    // Already gone / token rejected — safe to clear locally.
+    if (
+      status === 401 ||
+      (status === 404 && String(code) === ERROR_CODES.AGENT_NOT_FOUND)
+    ) {
+      clearLocalAuth(
+        status === 401 ? "deregister_unauthorized" : "deregister_not_found"
+      );
+      return { ok: true, needsPairing: true, clearedOn: status };
+    }
+
+    // v1.29: UPDATE_CONFLICT after retries — keep session; please try again.
+    if (
+      result &&
+      (result.updateConflict === true ||
+        result.code === ERROR_CODES.UPDATE_CONFLICT)
+    ) {
+      const message = MSG_DEREGISTER_UPDATE_CONFLICT;
+      try {
+        log(`Deregister conflicted: ${message}`, "⚠️");
+      } catch (_) {}
+      onStateChange(publicHostState());
+      return {
+        ok: false,
+        updateConflict: true,
+        retriesExhausted: true,
+        needsPairing: false,
+        code: ERROR_CODES.UPDATE_CONFLICT,
+        error: {
+          code: ERROR_CODES.UPDATE_CONFLICT,
+          message,
+        },
+        message,
+      };
+    }
+
+    // Any other failure — keep credentials (server may still have the agent).
+    const message =
+      (result && result.error && result.error.message) ||
+      (result && result.message) ||
+      MSG_DEREGISTER_UPDATE_CONFLICT;
     try {
-      await api.deregister({ reason: "explicit_deregister" });
+      log(`Deregister failed (${status || "network"}): ${message}`, "⚠️");
     } catch (_) {}
-    // Explicit deregister revokes token and clears host on server — mirror locally.
-    clearLocalAuth("deregister");
-    return { ok: true, needsPairing: true };
+    onStateChange(publicHostState());
+    return {
+      ok: false,
+      needsPairing: false,
+      status,
+      code: code || "DEREGISTER_FAILED",
+      error: { code: code || "DEREGISTER_FAILED", message },
+      message,
+    };
   }
 
   /**

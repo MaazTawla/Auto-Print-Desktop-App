@@ -205,6 +205,269 @@ describe("station-printing controller", () => {
     assert.equal(reg.error.code, "PAIRING_CODE_REQUIRED");
   });
 
+  it("v1.29 deregister UPDATE_CONFLICT retries then succeeds and clears", async () => {
+    // Mutation: skipping retries would clear on first 409 or never succeed.
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok-retry",
+      pairing_code: "PAIR",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 7,
+    });
+    let calls = 0;
+    const sleeps = [];
+    const request = async () => {
+      calls += 1;
+      if (calls < 3) {
+        return {
+          status: 409,
+          data: {
+            ok: false,
+            error: { code: "UPDATE_CONFLICT", message: "busy" },
+          },
+          headers: {},
+        };
+      }
+      return { status: 200, data: {}, headers: {} };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 7 });
+    const res = await ctrl.deregister();
+    assert.equal(calls, 3);
+    assert.deepEqual(sleeps, [1000, 3000]);
+    assert.equal(res.ok, true);
+    assert.equal(res.needsPairing, true);
+    assert.equal(store.get().agent_token, "");
+    assert.equal(store.get().is_print_host, false);
+    assert.equal(ctrl.api.getToken(), "");
+  });
+
+  it("v1.29 deregister UPDATE_CONFLICT exhausted keeps session + sign-out message", async () => {
+    // Mutation: clearing auth on exhausted 409 leaves agent registered on server.
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok-keep",
+      pairing_code: "PAIR",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 7,
+      pairing_auto_register_blocked_hash: "",
+    });
+    const logs = [];
+    let calls = 0;
+    const sleeps = [];
+    const request = async () => {
+      calls += 1;
+      return {
+        status: 409,
+        data: {
+          ok: false,
+          error: { code: "UPDATE_CONFLICT", message: "retry exhaustion" },
+        },
+        headers: {},
+      };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: (m) => logs.push(String(m)),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 7 });
+    const res = await ctrl.deregister();
+    assert.equal(calls, 3, "initial + 2 retries, then stop (no infinite loop)");
+    assert.deepEqual(sleeps, [1000, 3000]);
+    assert.equal(res.ok, false);
+    assert.equal(res.updateConflict, true);
+    assert.equal(res.retriesExhausted, true);
+    assert.equal(res.needsPairing, false);
+    assert.equal(res.code, "UPDATE_CONFLICT");
+    assert.match(res.message, /Couldn't sign this device out, please try again/i);
+    assert.match(res.error.message, /Couldn't sign this device out, please try again/i);
+    // Credentials + host state unchanged
+    assert.equal(store.get().agent_token, "tok-keep");
+    assert.equal(store.get().pairing_code, "PAIR");
+    assert.equal(store.get().is_print_host, true);
+    assert.equal(store.get().host_epoch, 7);
+    assert.equal(ctrl.api.getToken(), "tok-keep");
+    // Pairing auto-block is for register 409s only — button stays enabled
+    assert.equal(store.get().pairing_auto_register_blocked_hash || "", "");
+    assert.ok(logs.some((l) => /please try again/i.test(l)));
+  });
+
+  it("v1.29 deregister does not clear local auth on a single 409 UPDATE_CONFLICT", async () => {
+    // Mutation: clearLocalAuth before checking UPDATE_CONFLICT drops the session.
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok-one",
+      pairing_code: "CODE",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 2,
+    });
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      // Succeed on 2nd attempt — proves we did not clear after the first 409.
+      if (calls === 1) {
+        return {
+          status: 409,
+          data: {
+            ok: false,
+            error: { code: "UPDATE_CONFLICT", message: "x" },
+          },
+          headers: {},
+        };
+      }
+      return { status: 200, data: {}, headers: {} };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async () => {},
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 2 });
+    const res = await ctrl.deregister();
+    assert.equal(calls, 2);
+    assert.equal(res.ok, true);
+    // Cleared only after success (would have lost Bearer if cleared on first 409)
+    assert.equal(store.get().agent_token, "");
+  });
+
+  it("v1.29 deregister clears on 401 and on 404 AGENT_NOT_FOUND", async () => {
+    for (const [status, data, label] of [
+      [401, { error: { code: "UNAUTHORIZED", message: "nope" } }, "401"],
+      [
+        404,
+        { error: { code: "AGENT_NOT_FOUND", message: "gone" } },
+        "404 AGENT_NOT_FOUND",
+      ],
+    ]) {
+      const store = memoryStore({
+        agent_api_base: "https://api.example.com",
+        agent_token: "tok-" + label,
+        pairing_code: "P",
+        branch_id: "147",
+        is_print_host: true,
+        host_epoch: 5,
+      });
+      const ctrl = createStationPrintingController({
+        ...store,
+        request: async () => ({ status, data, headers: {} }),
+        log: () => {},
+        sleep: async () => {},
+      });
+      ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 5 });
+      const res = await ctrl.deregister();
+      assert.equal(res.ok, true, label);
+      assert.equal(res.needsPairing, true, label);
+      assert.equal(store.get().agent_token, "", label);
+      assert.equal(store.get().is_print_host, false, label);
+    }
+  });
+
+  it("v1.29 sync UPDATE_CONFLICT is one attempt (not SYNC_CONFLICT retry loop)", async () => {
+    // Mutation: treating UPDATE_CONFLICT as SYNC_CONFLICT would call 3 times + sleep.
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 3,
+    });
+    let calls = 0;
+    const sleeps = [];
+    const request = async () => {
+      calls += 1;
+      return {
+        status: 409,
+        data: {
+          ok: false,
+          error: { code: "UPDATE_CONFLICT", message: "write retries out" },
+        },
+        headers: {},
+      };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    ctrl.syncWindowsPrinters([{ name: "Kitchen Printer 1" }]);
+    const res = await ctrl.syncPrintersToServer({ branchId: "147" });
+    assert.equal(res.ok, false);
+    assert.equal(res.updateConflict, true);
+    assert.equal(res.syncConflict, undefined);
+    assert.equal(res.code, "UPDATE_CONFLICT");
+    assert.match(res.message, /please try again/i);
+    assert.equal(calls, 1, "UPDATE_CONFLICT must not enter SYNC_CONFLICT retry loop");
+    assert.equal(sleeps.length, 0);
+    assert.equal(store.get().agent_token, "tok");
+    assert.equal(store.get().is_print_host, true);
+    assert.equal(store.get().host_epoch, 3);
+  });
+
+  it("v1.29 heartbeat UPDATE_CONFLICT keeps credentials and is not syncConflict", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok-hb",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 4,
+      pairing_code: "",
+    });
+    let calls = 0;
+    const request = async (opts) => {
+      calls += 1;
+      const url = opts && opts.url != null ? String(opts.url) : "";
+      if (url.includes("/heartbeat")) {
+        return {
+          status: 409,
+          data: {
+            ok: false,
+            error: { code: "UPDATE_CONFLICT", message: "hb conflict" },
+          },
+          headers: {},
+        };
+      }
+      return { status: 200, data: {}, headers: {} };
+    };
+    const ctrl = createStationPrintingController({
+      ...store,
+      request,
+      log: () => {},
+      sleep: async () => {},
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 4 });
+    const hb = await ctrl.heartbeat({ branchId: "147" });
+    assert.equal(hb.ok, false);
+    assert.equal(hb.updateConflict, true);
+    assert.equal(hb.syncConflict, false);
+    assert.equal(hb.code, "UPDATE_CONFLICT");
+    assert.match(hb.error.message, /please try again/i);
+    // No accelerated retry loop for 409 UPDATE_CONFLICT (4xx terminal)
+    assert.equal(hb.retrySoonMs, null);
+    assert.equal(store.get().agent_token, "tok-hb");
+    assert.equal(store.get().is_print_host, true);
+    assert.equal(store.get().host_epoch, 4);
+    assert.equal(ctrl.api.getToken(), "tok-hb");
+    assert.ok(calls >= 1);
+  });
+
   it("syncPrintersToServer applies server ids", async () => {
     const store = memoryStore({
       agent_api_base: "https://api.example.com",
