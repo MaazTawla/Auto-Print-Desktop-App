@@ -7,7 +7,7 @@ const path = require("path");
 
 const r = (f) => fs.readFileSync(path.join(__dirname, "..", f), "utf8");
 
-it("R16D-I6 wiring: preload → deregister-print-agent → controller.deregister + friendly IPC catch", () => {
+it("R16D-I6 wiring: preload → deregister-print-agent → controller.deregister; quit does not", () => {
   // Mutation B6: remove preload entry.
   assert.match(
     r("src/preload.js"),
@@ -22,4 +22,8 @@ it("R16D-I6 wiring: preload → deregister-print-agent → controller.deregister
   // Friendly IPC catch (R16D-I3) — no raw err.message in catch return.
   const catchSlice = m.slice(i, i + 900);
   assert.match(catchSlice, /Couldn't sign this device out, please try again/);
+  // Quit must not deregister (R15D-L1).
+  const q = m.indexOf('app.on("before-quit"');
+  assert.ok(q > 0);
+  assert.doesNotMatch(m.slice(q, q + 700), /\.deregister\s*\(/);
 });

@@ -2,6 +2,8 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs");
+const path = require("path");
 const { createStationPrintingController } = require("../src/station-printing");
 
 const MSG = "Couldn't sign this device out, please try again";
@@ -117,5 +119,60 @@ describe("R16D deregister retries and no-token", () => {
     assert.equal(r2.ok, true);
     assert.equal(r2.alreadySignedOut, true);
     assert.equal(calls.length, before, "second call must not hit the network");
+  });
+});
+
+describe("R15D-L1 quit must not deregister", () => {
+  it("before-quit handler has no deregister call (mutation: re-adding it fails)", () => {
+    const main = fs.readFileSync(path.join(__dirname, "..", "src", "main.js"), "utf8");
+    const i = main.indexOf('app.on("before-quit"');
+    assert.ok(i > 0);
+    const body = main.slice(i, i + 700);
+    assert.doesNotMatch(body, /\.deregister\s*\(/);
+    assert.match(body, /stopRabbit/);
+    assert.match(body, /R15D-L1/);
+  });
+
+  it("wiring: only Sign out IPC path calls controller.deregister", () => {
+    const main = fs.readFileSync(path.join(__dirname, "..", "src", "main.js"), "utf8");
+    const ipc = main.indexOf('ipcMain.handle("deregister-print-agent"');
+    assert.ok(ipc > 0);
+    assert.match(main.slice(ipc, ipc + 500), /sp\.deregister\(\)/);
+    const quit = main.indexOf('app.on("before-quit"');
+    assert.doesNotMatch(main.slice(quit, quit + 700), /getStationPrinting\(\)\.deregister/);
+  });
+
+  it("credentials survive a quit-shaped lifecycle (no deregister); relaunch resumes", async () => {
+    // Mutation: if before-quit called deregister and cleared on 2xx, token would be gone.
+    // Quit path no longer calls deregister — credentials must remain for ensureSession.
+    let cfg = {
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok-survive",
+      pairing_code: "PAIR",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 3,
+    };
+    let posts = 0;
+    const mkCtrl = () =>
+      createStationPrintingController({
+        readConfig: () => ({ ...cfg }),
+        writeConfig: (partial) => {
+          cfg = { ...cfg, ...partial };
+        },
+        request: async () => {
+          posts += 1;
+          return R(200, { is_print_host: true, host_epoch: 3 });
+        },
+        log: () => {},
+        sleep: async () => {},
+      });
+    const c1 = mkCtrl();
+    assert.equal(c1.api.getToken(), "tok-survive");
+    // Simulate quit: drop controller without calling deregister (matches before-quit).
+    const c2 = mkCtrl();
+    assert.equal(cfg.agent_token, "tok-survive");
+    assert.equal(c2.api.getToken(), "tok-survive");
+    assert.equal(posts, 0, "quit must not have POSTed deregister");
   });
 });

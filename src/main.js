@@ -3060,7 +3060,7 @@ async function runAgentHeartbeat() {
 }
 
 async function stopRabbit() {
-  // Keep heartbeat running while registered; only clear on full quit via clear on before-quit.
+  // Keep heartbeat running while registered. Quit no longer deregisters (R15D-L1).
   clearRabbitHealthCheck();
   if (rabbitReconnectTimer) {
     clearTimeout(rabbitReconnectTimer);
@@ -4078,9 +4078,9 @@ if (!gotSingleInstanceLock) {
     if (diskSpaceCheckTimer) clearInterval(diskSpaceCheckTimer);
     clearNetworkOnlineMonitor();
     stopAgentHeartbeatLoop();
-    try {
-      await getStationPrinting().deregister();
-    } catch (_) {}
+    // R15D-L1 (Maaz): quit must keep the device paired. Do NOT deregister —
+    // credentials survive quit/relaunch so ensureSession resumes without re-pairing.
+    // Only the explicit "Sign out this device" action calls deregister.
     await stopRabbit();
   });
 }
