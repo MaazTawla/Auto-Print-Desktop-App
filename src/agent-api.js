@@ -1,6 +1,6 @@
 /**
  * Print-agent HTTP client: register / heartbeat / deregister / printers-sync / ack / status.
- * Contract v1.0 — flat success bodies; register uses pairing_code (no bearer).
+ * Contract v1.24 — flat success bodies; register uses pairing_code; Bearer on re-pair.
  */
 
 "use strict";
@@ -12,6 +12,7 @@ const {
   parseRegisterResponse,
   parseHostConflictError,
   parseSyncConflictError,
+  parseUpdateConflictError,
   buildHeartbeatRequest,
   parseHeartbeatResponse,
   buildAckRequest,
@@ -27,6 +28,21 @@ const {
   parseRetryAfterMs,
   shouldUnpairImmediately,
 } = require("./agent-http-retry-policy");
+const { retryAfterSeconds } = require("./pairing-errors");
+
+/**
+ * Register-only Retry-After cap for UI text (Android MESSAGE_RETRY_AFTER_MAX_MS):
+ * just over 24h, so a >1-day header reads "try again later" rather than "about 24 hours".
+ * Heartbeat keeps parseRetryAfterMs's default 120s cap.
+ */
+const REGISTER_RETRY_AFTER_MAX_MS = 86401000;
+
+/** Android parseRetryAfterMsForMessage: >12 digits → cap (overflow-safe), else capped parse. */
+function parseRegisterRetryAfterMs(raw, nowMs = Date.now()) {
+  const s = raw == null ? "" : String(raw).trim();
+  if (s.length > 12 && /^\d+$/.test(s)) return REGISTER_RETRY_AFTER_MAX_MS;
+  return parseRetryAfterMs(raw, nowMs, REGISTER_RETRY_AFTER_MAX_MS);
+}
 
 function createAgentApi(options = {}) {
   let apiBase = String(options.apiBase || "").trim();
@@ -87,34 +103,51 @@ function createAgentApi(options = {}) {
     };
   }
 
-  async function register(fields) {
+  async function register(fields, opts = {}) {
     const body = buildRegisterRequest(fields);
-    // No bearer on register (contract §2.1)
-    const { status, data } = await call("POST", ENDPOINTS.register, body, {
-      noAuth: true,
-    });
+    // v1.24: first pair = pairing_code only (noAuth). Re-pair of the same app_id must
+    // send Authorization: Bearer <current token>; server rotates it. Never log the token.
+    const bearer =
+      opts && opts.bearerToken != null && String(opts.bearerToken).trim()
+        ? String(opts.bearerToken).trim()
+        : "";
+    const callOpts = bearer
+      ? { noAuth: false, token: bearer }
+      : { noAuth: true };
+    const { status, data, headers } = await call("POST", ENDPOINTS.register, body, callOpts);
     if (status === 409) {
+      // v1.21: only a real host conflict takes the conflict path (credential drop).
+      // PAIRING_BUSY and unknown 409 codes are plain errors (no credential wipe).
       const conflict = parseHostConflictError(data, status);
-      return {
-        ok: false,
-        status,
-        conflict: conflict || {
-          code: ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED,
-          message:
-            "Another device is already configured as print host for this branch.",
-          current_host: null,
-        },
-      };
+      if (conflict) {
+        return { ok: false, status, conflict };
+      }
     }
     if (status < 200 || status >= 300) {
       const error = parseAgentError(data, status);
-      return {
+      const out = {
         ok: false,
         status,
         error,
         code: error.code,
         message: error.message,
       };
+      if (status === 429) {
+        const details = (error && error.details) || {};
+        const bodySec =
+          details.retry_after_seconds != null
+            ? details.retry_after_seconds
+            : data && typeof data === "object"
+              ? data.retry_after_seconds
+              : null;
+        const headerMs = parseRegisterRetryAfterMs(
+          headers && (headers["retry-after"] || headers["Retry-After"])
+        );
+        out.code = ERROR_CODES.PAIRING_RATE_LIMITED;
+        out.error = { ...error, code: ERROR_CODES.PAIRING_RATE_LIMITED };
+        out.retryAfterSeconds = retryAfterSeconds(bodySec, headerMs);
+      }
+      return out;
     }
     const parsed = parseRegisterResponse(data);
     if (parsed.token) setToken(parsed.token);
@@ -153,6 +186,7 @@ function createAgentApi(options = {}) {
       };
     }
     // v1.4 M5: heartbeat printer upsert can return 409 SYNC_CONFLICT (same as printers/sync)
+    // v1.29: UPDATE_CONFLICT is not SYNC_CONFLICT — no auto-retry loop; keep credentials.
     if (status === 409) {
       const syncConflict = parseSyncConflictError(data, status);
       if (syncConflict) {
@@ -163,6 +197,17 @@ function createAgentApi(options = {}) {
           code: ERROR_CODES.SYNC_CONFLICT,
           error: syncConflict,
           message: syncConflict.message,
+        };
+      }
+      const updateConflict = parseUpdateConflictError(data, status);
+      if (updateConflict) {
+        return {
+          ok: false,
+          status,
+          updateConflict: true,
+          code: updateConflict.code,
+          error: updateConflict,
+          message: updateConflict.message,
         };
       }
     }
@@ -193,8 +238,38 @@ function createAgentApi(options = {}) {
       fields.reason != null
         ? { reason: String(fields.reason) }
         : {};
-    const { status, data } = await call("POST", ENDPOINTS.deregister, body);
-    return { ok: status >= 200 && status < 300, status, data };
+    const { status, data, headers } = await call(
+      "POST",
+      ENDPOINTS.deregister,
+      body
+    );
+    if (status >= 200 && status < 300) {
+      return { ok: true, status, data, headers };
+    }
+    // v1.29: 409 UPDATE_CONFLICT — keep credentials; no pairing auto-block; no auto-loop.
+    const updateConflict = parseUpdateConflictError(data, status);
+    if (updateConflict) {
+      return {
+        ok: false,
+        status,
+        updateConflict: true,
+        code: updateConflict.code,
+        error: updateConflict,
+        message: updateConflict.message,
+        data,
+        headers,
+      };
+    }
+    const parsed = parseAgentError(data, status);
+    return {
+      ok: false,
+      status,
+      data,
+      headers,
+      error: parsed,
+      code: parsed.code,
+      message: parsed.message,
+    };
   }
 
   async function syncPrinters(fields) {
@@ -221,6 +296,7 @@ function createAgentApi(options = {}) {
       };
     }
     // v1.4 M5: 409 SYNC_CONFLICT — retryable; not PRINT_HOST_ALREADY_CONFIGURED
+    // v1.29: UPDATE_CONFLICT — not retryable here; please-try-again; keep credentials.
     if (status === 409) {
       const syncConflict = parseSyncConflictError(data, status);
       if (syncConflict) {
@@ -231,6 +307,19 @@ function createAgentApi(options = {}) {
           code: ERROR_CODES.SYNC_CONFLICT,
           error: syncConflict,
           message: syncConflict.message,
+          data,
+          ...parsePrintersSyncResponse({}),
+        };
+      }
+      const updateConflict = parseUpdateConflictError(data, status);
+      if (updateConflict) {
+        return {
+          ok: false,
+          status,
+          updateConflict: true,
+          code: updateConflict.code,
+          error: updateConflict,
+          message: updateConflict.message,
           data,
           ...parsePrintersSyncResponse({}),
         };
@@ -346,4 +435,4 @@ async function defaultAxiosRequest(cfg) {
   });
 }
 
-module.exports = { createAgentApi };
+module.exports = { createAgentApi, parseRegisterRetryAfterMs, REGISTER_RETRY_AFTER_MAX_MS };

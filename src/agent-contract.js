@@ -13,10 +13,15 @@ const PLATFORM = "desktop";
 
 const ERROR_CODES = Object.freeze({
   PRINT_HOST_ALREADY_CONFIGURED: "PRINT_HOST_ALREADY_CONFIGURED",
+  PRINT_AGENT_ALREADY_REGISTERED: "PRINT_AGENT_ALREADY_REGISTERED",
   SYNC_CONFLICT: "SYNC_CONFLICT",
+  /** v1.29: write-retry exhaustion on deregister / heartbeat / sync / admin routes */
+  UPDATE_CONFLICT: "UPDATE_CONFLICT",
   PAIRING_CODE_INVALID: "PAIRING_CODE_INVALID",
   PAIRING_CODE_EXPIRED: "PAIRING_CODE_EXPIRED",
   PAIRING_CODE_REQUIRED: "PAIRING_CODE_REQUIRED",
+  PAIRING_RATE_LIMITED: "PAIRING_RATE_LIMITED",
+  PAIRING_BUSY: "PAIRING_BUSY",
   NOT_PRINT_HOST: "NOT_PRINT_HOST",
   HOST_EPOCH_MISMATCH: "HOST_EPOCH_MISMATCH",
   BRANCH_MISMATCH: "BRANCH_MISMATCH",
@@ -205,41 +210,78 @@ function parseRegisterResponse(data) {
  * Parse 409 PRINT_HOST_ALREADY_CONFIGURED (contract §2.1).
  * Distinguishes from printers/sync 409 SYNC_CONFLICT by error.code (v1.4).
  */
-function parseHostConflictError(payload, httpStatus) {
+/** BE device_label max (mb_strlen / code points). */
+const MAX_HOST_DEVICE_LABEL = 120;
+
+/**
+ * R10D-I1/I2 + R12D-I1 + R13D-I2: string-only host label, capped at 120
+ * Unicode code points (BE mb_strlen), cut back to a grapheme boundary when
+ * Intl.Segmenter is available. Fallback: Array.from code-point cut (never
+ * UTF-16 string.slice). Non-strings → "".
+ */
+function capHostDeviceLabelByCodePoints(raw) {
+  const chars = Array.from(raw);
+  return chars.length > MAX_HOST_DEVICE_LABEL
+    ? chars.slice(0, MAX_HOST_DEVICE_LABEL).join("")
+    : raw;
+}
+function capHostDeviceLabel(label) {
+  if (typeof label !== "string") return "";
+  const raw = label.trim();
+  if (!raw || /^(null|undefined)$/i.test(raw)) return "";
+  if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+    try {
+      const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+      const parts = [];
+      let cps = 0;
+      for (const { segment } of seg.segment(raw)) {
+        const segCp = Array.from(segment).length;
+        // 120 code points, cut back to a grapheme boundary (R13D-I2).
+        if (cps + segCp > MAX_HOST_DEVICE_LABEL) break;
+        parts.push(segment);
+        cps += segCp;
+      }
+      return parts.join("");
+    } catch (_) {
+      /* fall through to code-point cut (never return raw uncut) */
+    }
+  }
+  return capHostDeviceLabelByCodePoints(raw);
+}
+
+function parseHostConflictError(payload, _httpStatus) {
   const root = payload && typeof payload === "object" ? payload : {};
   const err = root.error && typeof root.error === "object" ? root.error : root;
   const code = err.code != null ? String(err.code) : "";
   // printers/sync M5 — not a host-assignment conflict
   if (code === ERROR_CODES.SYNC_CONFLICT) return null;
-  const isHostConflict =
-    code === ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED ||
-    (httpStatus === 409 && !code);
-  if (!isHostConflict) return null;
+  // v1.21: only an explicit PRINT_HOST_ALREADY_CONFIGURED is a host conflict.
+  // A 409 with no code gets the generic friendly error (no credential drop).
+  if (code !== ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED) return null;
 
-  const current = err.current_host || err.currentHost || null;
+  // v1.23: BE sends only device_label + is_online. app_id / last_heartbeat_at are never
+  // read, stored or logged (security), even if an older server still sends them.
+  const raw = err.current_host || err.currentHost;
+  const current = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  let current_host = null;
+  if (current) {
+    const lbl = current.device_label != null ? current.device_label : current.deviceLabel;
+    // R10D-I2: same string-only 120 code-point cap as snapshot restore.
+    const label = capHostDeviceLabel(lbl);
+    const on = current.is_online !== undefined ? current.is_online : current.isOnline;
+    current_host = {
+      device_label: label,
+      is_online: typeof on === "boolean" ? on : null,
+    };
+  }
+  // R5D-I1: only a non-blank string message; objects/`123` must not become "[object Object]".
+  const rawMsg = typeof err.message === "string" ? err.message.trim() : "";
   return {
     code: ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED,
     message:
-      (err.message != null && String(err.message).trim()) ||
+      rawMsg ||
       "Another device is already configured as print host for this branch.",
-    current_host: current
-      ? {
-          app_id: current.app_id != null ? String(current.app_id) : "",
-          device_label:
-            current.device_label != null
-              ? String(current.device_label)
-              : current.deviceLabel != null
-                ? String(current.deviceLabel)
-                : "",
-          last_heartbeat_at:
-            current.last_heartbeat_at != null
-              ? String(current.last_heartbeat_at)
-              : current.lastHeartbeatAt != null
-                ? String(current.lastHeartbeatAt)
-                : null,
-          is_online: Boolean(current.is_online ?? current.isOnline ?? false),
-        }
-      : null,
+    current_host,
   };
 }
 
@@ -752,10 +794,26 @@ function parseAgentError(payload, httpStatus) {
     (err && err.code != null && String(err.code)) ||
     (root.code != null && String(root.code)) ||
     "HTTP_" + String(httpStatus || 0);
-  const message =
-    (err && err.message != null && String(err.message).trim()) ||
-    (root.message != null && String(root.message).trim()) ||
-    `Request failed (${httpStatus})`;
+  const CODE_AGENT_ALREADY_REGISTERED = "PRINT_AGENT_ALREADY_REGISTERED";
+  const MSG_AGENT_ALREADY_REGISTERED =
+    "This device is already paired with this branch. Ask an admin to deregister it in Settings \u2192 Printing \u2192 Print devices, then pair again.";
+  // R7D-L3: for PRINT_AGENT_ALREADY_REGISTERED never String()-coerce a non-string
+  // message into the UI (objects became "[object Object]"). Non-blank string only.
+  let message;
+  if (String(code).trim().toUpperCase() === CODE_AGENT_ALREADY_REGISTERED) {
+    const raw =
+      err && typeof err.message === "string"
+        ? err.message.trim()
+        : typeof root.message === "string"
+          ? root.message.trim()
+          : "";
+    message = raw || MSG_AGENT_ALREADY_REGISTERED;
+  } else {
+    message =
+      (err && err.message != null && String(err.message).trim()) ||
+      (root.message != null && String(root.message).trim()) ||
+      `Request failed (${httpStatus})`;
+  }
   return { code, message, status: httpStatus, details: err || root };
 }
 
@@ -880,6 +938,28 @@ function resolveApiUrl(apiBase, path) {
 }
 
 
+
+/**
+ * Parse 409 UPDATE_CONFLICT (contract v1.29): server write retries exhausted.
+ * Not SYNC_CONFLICT (no auto-retry loop) and not PRINT_HOST_ALREADY_CONFIGURED
+ * (no pairing auto-block). Caller keeps credentials and shows please-try-again.
+ */
+const MSG_UPDATE_CONFLICT = "Please try again.";
+/** Shown after deregister UPDATE_CONFLICT retries are exhausted (v1.29 / L10-I4). */
+const MSG_DEREGISTER_UPDATE_CONFLICT =
+  "Couldn't sign this device out, please try again";
+
+function parseUpdateConflictError(payload, _httpStatus) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const err = root.error && typeof root.error === "object" ? root.error : root;
+  const code = err.code != null ? String(err.code) : "";
+  if (code !== ERROR_CODES.UPDATE_CONFLICT) return null;
+  return {
+    code: ERROR_CODES.UPDATE_CONFLICT,
+    message: MSG_UPDATE_CONFLICT,
+  };
+}
+
 /**
  * Parse printers/sync 409 SYNC_CONFLICT (contract v1.4 §2.4 M5).
  * Distinguished from PRINT_HOST_ALREADY_CONFIGURED by error.code.
@@ -918,7 +998,12 @@ module.exports = {
   buildRegisterRequest,
   parseRegisterResponse,
   parseHostConflictError,
+  capHostDeviceLabel,
+  MAX_HOST_DEVICE_LABEL,
   parseSyncConflictError,
+  parseUpdateConflictError,
+  MSG_UPDATE_CONFLICT,
+  MSG_DEREGISTER_UPDATE_CONFLICT,
   syncConflictBackoffMs,
   buildHeartbeatRequest,
   parseHeartbeatResponse,

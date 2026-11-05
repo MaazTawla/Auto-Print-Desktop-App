@@ -4,3 +4,6 @@
 
 # Broker defaults for auto-connect (copy from rabbit.defaults.example.json)
 /rabbit.defaults.json
+
+# External QA dump copies (not product source)
+/qa/

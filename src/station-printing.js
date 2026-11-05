@@ -7,16 +7,19 @@
 "use strict";
 
 const os = require("os");
+const crypto = require("crypto");
 const { createHostOnlyPolicy } = require("./host-only-policy");
 const { getOrCreateAppId } = require("./app-identity");
 const { createPrinterRegistry } = require("./printer-registry");
 const { createAgentApi } = require("./agent-api");
+const pairingErrors = require("./pairing-errors");
 const {
   ASSUMPTIONS,
   REMAINING_GAPS,
   parsePrintMessage,
   ERROR_CODES,
   PLATFORM,
+  MSG_DEREGISTER_UPDATE_CONFLICT,
   syncConflictBackoffMs,
   rabbitConfigToPersistPatch,
   rabbitConnectionFingerprint,
@@ -24,6 +27,7 @@ const {
   resolveQueueName,
   normalizeRabbitConfig,
   normalizeAgentApiBase,
+  capHostDeviceLabel,
 } = require("./agent-contract");
 const {
   configHash: printerListConfigHash,
@@ -42,6 +46,10 @@ const {
   createAuthUnpairTracker,
   isAuthRelated,
 } = require("./agent-http-retry-policy");
+const {
+  formatPrinterSyncValidationError,
+  pickPrinterFromValidationError,
+} = require("./printer-field-limits");
 
 function createStationPrintingController(deps = {}) {
   const readConfig = deps.readConfig || (() => ({}));
@@ -67,9 +75,176 @@ function createStationPrintingController(deps = {}) {
     request: deps.request,
   });
 
+  // v1.23 / R5D-L1: code whose last register spent the shared failure budget (BUSY /
+  // BRANCH_MISMATCH / host conflict / AGENT_ALREADY_REGISTERED). Automatic callers
+  // (ensureSession on start/reconnect) must not resend it; only a user Retry/Connect
+  // (allowManualRegister), a branch change, or a different code does.
+  // Persist a SHA-256 of the blocked code (never the code itself) so a relaunch does
+  // not burn another budget slot (R5D-L1).
+  const BLOCKED_HASH_KEY = "pairing_auto_register_blocked_hash";
+  /** R8D-L1: minimal host-conflict snapshot so Join/banner survive relaunch. */
+  const BLOCKED_CONFLICT_KEY = "pairing_auto_register_blocked_conflict";
+  /**
+   * R10D-L1 / R11D-I1 / R12D-L1: BE uses PHP strtoupper (ASCII a-z only).
+   * Extra case forms for legacy hashes also use ASCII-only folding — never
+   * Unicode toLowerCase/toUpperCase — so é/É and straße/STRASSE stay distinct.
+   */
+  function asciiUpperPairingCode(code) {
+    return String(code || "")
+      .trim()
+      .replace(/[a-z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 32));
+  }
+  function asciiLowerForm(s) {
+    return String(s).replace(/[A-Z]/g, (ch) =>
+      String.fromCharCode(ch.charCodeAt(0) + 32)
+    );
+  }
+  function asciiUpperForm(s) {
+    return String(s).replace(/[a-z]/g, (ch) =>
+      String.fromCharCode(ch.charCodeAt(0) - 32)
+    );
+  }
+  function hashPairingCode(code) {
+    const c = asciiUpperPairingCode(code);
+    if (!c) return "";
+    return crypto.createHash("sha256").update(c, "utf8").digest("hex");
+  }
+  /** sha256 of an already-formed string (no further case change). */
+  function hashTrimmedForm(form) {
+    const c = String(form || "");
+    if (!c) return "";
+    return crypto.createHash("sha256").update(c, "utf8").digest("hex");
+  }
+  /**
+   * R12D-L1/L2: legacy (pre-normalisation) hash candidates only.
+   * Pairing codes are 8 chars → enumerate every ASCII-letter case variant
+   * (≤256). If length or letter count exceeds 8, fall back to the 3 ASCII
+   * forms (raw / ascii-lower / ascii-upper). Never Unicode case folding.
+   */
+  function legacyHashForms(code) {
+    const trimmed = String(code || "").trim();
+    if (!trimmed) return [];
+    const letterIdx = [];
+    for (let i = 0; i < trimmed.length; i++) {
+      const c = trimmed.charCodeAt(i);
+      if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) letterIdx.push(i);
+    }
+    const n = letterIdx.length;
+    if (trimmed.length > 8 || n > 8) {
+      const forms = [trimmed, asciiLowerForm(trimmed), asciiUpperForm(trimmed)];
+      return forms.filter((f, i) => forms.indexOf(f) === i);
+    }
+    if (n === 0) return [trimmed];
+    const out = [];
+    const total = 1 << n;
+    for (let mask = 0; mask < total; mask++) {
+      let s = "";
+      let bit = 0;
+      for (let i = 0; i < trimmed.length; i++) {
+        const c = trimmed.charCodeAt(i);
+        const isLetter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+        if (!isLetter) {
+          s += trimmed[i];
+          continue;
+        }
+        const base = c >= 97 ? c - 32 : c;
+        const upper = (mask & (1 << bit)) !== 0;
+        bit++;
+        s += String.fromCharCode(upper ? base : base + 32);
+      }
+      out.push(s);
+    }
+    return out;
+  }
+  function legacyHashMatches(code, blockedHash) {
+    if (!blockedHash) return false;
+    for (const form of legacyHashForms(code)) {
+      if (hashTrimmedForm(form) === blockedHash) return true;
+    }
+    return false;
+  }
+  function codeMatchesBlockedHash(code, blockedHash) {
+    if (!blockedHash) return false;
+    // Current-format hash (ASCII-upper normalisation) — never run legacy forms
+    // against this path (R12D-L1).
+    const cur = hashPairingCode(code);
+    if (cur && cur === blockedHash) return true;
+    return legacyHashMatches(code, blockedHash);
+  }
+  /** If the stored hash is a legacy form, rewrite to the ASCII-upper hash without dropping the snapshot. */
+  function migrateBlockedHashIfLegacy(code) {
+    if (!autoRegisterBlockedHash) return;
+    const cur = hashPairingCode(code);
+    if (!cur || cur === autoRegisterBlockedHash) return;
+    // Only migrate when the stored hash matched via the legacy path, not when
+    // it already is the current-format hash of this code.
+    if (!legacyHashMatches(code, autoRegisterBlockedHash)) return;
+    const saved = readConfig()[BLOCKED_CONFLICT_KEY];
+    persistBlockedHash(cur, saved != null ? saved : null);
+  }
+  let autoRegisterBlockedHash = String(readConfig()[BLOCKED_HASH_KEY] || "").trim();
+  /** Hash cleared by allowManualRegister; restored if that manual attempt throws (R5D-L2). */
+  let lastClearedBlockedHash = "";
+  let lastClearedBlockedConflict = null;
+  function conflictSnapshotFrom(conflict) {
+    if (!conflict || typeof conflict !== "object") return null;
+    const host = conflict.current_host;
+    if (!host || typeof host !== "object") {
+      return { device_label: "", is_online: null };
+    }
+    const raw = host.device_label != null ? String(host.device_label).trim() : "";
+    const label = raw && !/^(null|undefined)$/i.test(raw) ? raw : "";
+    const online =
+      host.is_online === true ? true : host.is_online === false ? false : null;
+    return { device_label: label, is_online: online };
+  }
+  function hostConflictFromSnapshot(snap) {
+    if (!snap || typeof snap !== "object") return null;
+    // R9D-I1 + R10D-I1: string-only, 120 Unicode code points (not UTF-16 units).
+    const label = capHostDeviceLabel(snap.device_label);
+    const online =
+      snap.is_online === true ? true : snap.is_online === false ? false : null;
+    return {
+      code: "PRINT_HOST_ALREADY_CONFIGURED",
+      message:
+        "Another device is already configured as print host for this branch.",
+      current_host: { device_label: label, is_online: online },
+    };
+  }
+  /**
+   * Persist the auto-block hash. When clearing (empty hash), also drop the
+   * conflict snapshot. When blocking with a host conflict, pass its snapshot
+   * so a relaunch can restore the banner + Join (R8D-L1).
+   */
+  function persistBlockedHash(hash, conflictSnapshot) {
+    const h = hash ? String(hash).trim() : "";
+    autoRegisterBlockedHash = h;
+    const patch = { [BLOCKED_HASH_KEY]: h };
+    if (!h) {
+      patch[BLOCKED_CONFLICT_KEY] = null;
+    } else if (conflictSnapshot !== undefined) {
+      patch[BLOCKED_CONFLICT_KEY] = conflictSnapshot;
+    }
+    writeConfig(patch);
+  }
   let hostConflict = null; // 409 payload for UI
+  // R8D-L1 + R9D-L1: restore banner/Join after relaunch only when the current
+  // pairing code still hashes to the blocked hash. A code change must never
+  // show a stale host label or an enabled Join for a code that was never sent.
+  if (autoRegisterBlockedHash) {
+    const currentCode = readConfig().pairing_code;
+    if (codeMatchesBlockedHash(currentCode, autoRegisterBlockedHash)) {
+      migrateBlockedHashIfLegacy(currentCode);
+      const saved = readConfig()[BLOCKED_CONFLICT_KEY];
+      const restored = hostConflictFromSnapshot(saved);
+      if (restored) hostConflict = restored;
+    } else {
+      persistBlockedHash("");
+    }
+  }
   let lastRegisterError = null; // { code, message } for inline UI
   let needsPairing = false; // prompt UI after token revoke / deregister
+  let lastPrinterSyncValidationError = null;
   let lastHeartbeatAt = null;
   let consumeEnabled = policy.shouldConsume();
   let flushPending = false;
@@ -106,7 +281,10 @@ function createStationPrintingController(deps = {}) {
       needsPairing: Boolean(needsPairing),
       pairingPrompt:
         needsPairing
-          ? "Agent token was revoked or cleared. Enter a fresh pairing code, then Save & register."
+          ? lastRegisterError &&
+            pairingErrors.isCodeRejected(401, lastRegisterError.code)
+            ? pairingErrors.MSG_CODE_INVALID
+            : "Agent token was revoked or cleared. Enter a fresh pairing code, then Save & register."
           : null,
       contractVersion: ASSUMPTIONS.contractVersion,
       rabbitQueue: resolveQueueName(readConfig(), readConfig().branch_id),
@@ -119,6 +297,8 @@ function createStationPrintingController(deps = {}) {
         policy.isPrintHost &&
           !(readConfig().rabbit_host && String(readConfig().rabbit_host).trim())
       ),
+      // R20D-I2: last printers/sync 422, cleared on success or printer fix/remove.
+      printerSyncError: lastPrinterSyncValidationError,
     };
   }
 
@@ -167,7 +347,19 @@ function createStationPrintingController(deps = {}) {
   }
 
   function setPairingCode(code) {
-    writeConfig({ pairing_code: String(code || "").trim() });
+    const next = String(code || "").trim();
+    writeConfig({ pairing_code: next });
+    // R9D-L1 / R10D-L1: a different code (after BE trim+upper) must drop the
+    // stale block + conflict snapshot. Case-only retypes keep the block.
+    if (autoRegisterBlockedHash) {
+      if (!codeMatchesBlockedHash(next, autoRegisterBlockedHash)) {
+        persistBlockedHash("");
+        hostConflict = null;
+        onStateChange(publicHostState());
+      } else {
+        migrateBlockedHashIfLegacy(next);
+      }
+    }
   }
 
   /**
@@ -216,6 +408,21 @@ function createStationPrintingController(deps = {}) {
   }
 
 
+  /** User pressed Retry / Save & register, or branch changed: allow one more register. */
+  function allowManualRegister() {
+    // R7D-L2: only remember a non-empty hash. A second Retry before a network
+    // attempt must not wipe the restore target with "" (2 Retries + throw still blocks).
+    if (autoRegisterBlockedHash) {
+      lastClearedBlockedHash = autoRegisterBlockedHash;
+      const saved = readConfig()[BLOCKED_CONFLICT_KEY];
+      lastClearedBlockedConflict =
+        saved && typeof saved === "object"
+          ? saved
+          : conflictSnapshotFrom(hostConflict);
+    }
+    persistBlockedHash("");
+  }
+
   function clearHostConflict() {
     hostConflict = null;
     onStateChange(publicHostState());
@@ -232,6 +439,11 @@ function createStationPrintingController(deps = {}) {
     consumeEnabled = false;
     needsPairing = true;
     hostConflict = null;
+    // R9D-L2: drop auto-block + conflict snapshot so a relaunch cannot show a
+    // stale banner with an empty pairing code.
+    persistBlockedHash("");
+    lastClearedBlockedHash = "";
+    lastClearedBlockedConflict = null;
     writeConfig({
       ...dropBrokerCredentialsPatch(),
       agent_token: "",
@@ -287,25 +499,86 @@ function createStationPrintingController(deps = {}) {
    * Register as print host. pairing_code + role print_host required (contract §2.1).
    * On 409, Rabbit must stay idle.
    */
-  async function registerAsHost({ branchId } = {}) {
+  let registerInFlight = null; // single-flight: { promise, sentCode }
+
+  /**
+   * One register at a time. A caller that arrives while one is running waits for it;
+   * if the stored code changed meanwhile (user saved a new one), it runs once more
+   * with the fresh settings instead of reusing the stale result.
+   */
+  async function registerAsHost(opts = {}) {
+    const role = String((opts && opts.role) || ASSUMPTIONS.registerRole).trim() || ASSUMPTIONS.registerRole;
+    while (registerInFlight) {
+      const running = registerInFlight;
+      let res;
+      let threw = false;
+      let error;
+      try {
+        res = await running.promise;
+      } catch (err) {
+        threw = true;
+        error = err;
+      }
+      if (registerInFlight === running) registerInFlight = null;
+      const nowCode = String(readConfig().pairing_code || "").trim();
+      // Same role + (same code, or code cleared by this successful register) → share.
+      // A mid-flight code edit to a different value, or a different role, re-runs.
+      if (role === running.role) {
+        const sameCode = nowCode === running.sentCode;
+        const clearedBySuccess =
+          Boolean(res && res.ok) && Boolean(running.sentCode) && nowCode === "";
+        if (sameCode || clearedBySuccess) {
+          if (threw) throw error;
+          return res;
+        }
+      }
+    }
+    const sentCode = String(readConfig().pairing_code || "").trim();
+    const entry = { sentCode, role, promise: null };
+    entry.promise = (async () => {
+      try {
+        return await registerAsHostOnce({ ...opts, role });
+      } finally {
+        if (registerInFlight === entry) registerInFlight = null;
+      }
+    })();
+    registerInFlight = entry;
+    return entry.promise;
+  }
+
+  function isRegisterInFlight() {
+    return Boolean(registerInFlight);
+  }
+
+  async function registerAsHostOnce({ branchId, role } = {}) {
     const cfg = readConfig();
+    const sentCode = String(cfg.pairing_code || "").trim();
+    const registerRole =
+      String(role || ASSUMPTIONS.registerRole).trim() || ASSUMPTIONS.registerRole;
     api.setApiBase(cfg.agent_api_base || "");
-    // Register never sends bearer — pairing_code only
-    api.setToken("");
+    // v1.24: re-pair of a live app_id needs the current token as Bearer (old one is
+    // revoked on success). First-time pair has no token — pairing_code only.
+    // Never log the token. Keep whatever is already on the api client / config.
+    const existingToken = String(cfg.agent_token || api.getToken() || "").trim();
+    api.setToken(existingToken);
 
     let result;
     try {
-      result = await api.register({
-        appId,
-        branchId: branchId || cfg.branch_id,
-        deviceLabel: cfg.device_label || defaultDeviceLabel(),
-        pairingCode: cfg.pairing_code || "",
-        role: ASSUMPTIONS.registerRole,
-        agentVersion:
-          agentVersion ||
-          cfg.agent_version ||
-          null,
-      });
+      // v1.23: single attempt — no automatic PAIRING_BUSY retry.
+      result = await api.register(
+        {
+          appId,
+          branchId: branchId || cfg.branch_id,
+          deviceLabel: cfg.device_label || defaultDeviceLabel(),
+          pairingCode: cfg.pairing_code || "",
+          role: registerRole,
+          agentVersion:
+            agentVersion ||
+            cfg.agent_version ||
+            null,
+        },
+        { bearerToken: existingToken || null }
+      );
     } catch (err) {
       if (
         err &&
@@ -319,6 +592,9 @@ function createStationPrintingController(deps = {}) {
         };
         log(`Register validation: ${lastRegisterError.message}`, "❌");
         onStateChange(publicHostState());
+        // Manual attempt consumed without a network throw — drop restore hint.
+        lastClearedBlockedHash = "";
+        lastClearedBlockedConflict = null;
         return {
           ok: false,
           error: lastRegisterError,
@@ -326,7 +602,46 @@ function createStationPrintingController(deps = {}) {
           shouldConsume: false,
         };
       }
+      // R5D-L2: a manual Retry that throws must re-block so the next timer/HB
+      // does not auto-resend (one click must not become 3 requests).
+      // R9D-L3(c): also re-persist + restore the conflict snapshot so the banner
+      // survives both the in-session Retry path (clearHostConflict) and a relaunch.
+      if (lastClearedBlockedHash) {
+        const snap = lastClearedBlockedConflict;
+        persistBlockedHash(lastClearedBlockedHash, snap);
+        const restored = hostConflictFromSnapshot(snap);
+        if (restored) {
+          hostConflict = restored;
+          onStateChange(publicHostState());
+        }
+        lastClearedBlockedHash = "";
+        lastClearedBlockedConflict = null;
+      }
       throw err;
+    }
+
+    // Manual attempt reached the server — do not restore the prior block on a later throw path.
+    lastClearedBlockedHash = "";
+    lastClearedBlockedConflict = null;
+
+    // R8D-L2: also block on 422 (e.g. device_label > 120) so a timer cannot
+    // auto-send print_host with the same code after a failed Join.
+    const statusNum = Number(result.status);
+    const budgetFail =
+      !result.ok &&
+      (result.conflict ||
+        statusNum === 422 ||
+        pairingErrors.isBudgetFailure(
+          result.status,
+          result.code || (result.error && result.error.code)
+        ));
+    if (budgetFail) {
+      persistBlockedHash(
+        hashPairingCode(sentCode),
+        result.conflict ? conflictSnapshotFrom(result.conflict) : null
+      );
+    } else if (result.ok) {
+      persistBlockedHash("");
     }
 
     if (!result.ok && result.conflict) {
@@ -346,6 +661,36 @@ function createStationPrintingController(deps = {}) {
     }
 
     if (!result.ok) {
+      const friendly = pairingErrors.friendlyRegisterError(result);
+      if (pairingErrors.isCodeRejected(result.status, result.code)) {
+        // Dead code: clear only if it is still the code we sent; prompt for a fresh one.
+        if (pairingErrors.shouldClearCode(readConfig().pairing_code, sentCode)) {
+          writeConfig({ pairing_code: "" });
+        }
+        needsPairing = true;
+      }
+      if (friendly) {
+        let out = friendly;
+        // R7D-I1: show the lost-token / Print devices hint whenever the server
+        // returned PRINT_AGENT_ALREADY_REGISTERED — including when a (stale/revoked)
+        // token was presented. Base it on the 409 response, not local token presence.
+        if (
+          friendly.code === "PRINT_AGENT_ALREADY_REGISTERED" &&
+          friendly.lostTokenHint
+        ) {
+          out = {
+            ...friendly,
+            message: `${friendly.message} ${friendly.lostTokenHint}`.trim(),
+          };
+        }
+        lastRegisterError = out;
+        log(
+          `Register failed: HTTP ${result.status} ${result.code || ""} — ${out.message}`.trim(),
+          "❌"
+        );
+        onStateChange(publicHostState());
+        return { ok: false, error: out, pairingError: out, code: out.code, shouldConsume: false };
+      }
       lastRegisterError = result.error || {
         code: "REGISTER_FAILED",
         message: "Register failed",
@@ -362,10 +707,13 @@ function createStationPrintingController(deps = {}) {
     lastRegisterError = null;
     needsPairing = false;
     if (result.token) {
-      writeConfig({ agent_token: result.token });
       api.setToken(result.token);
     }
     const patch = {};
+    // R7D-L4: token + cleared pairing_code (and the rest) in ONE writeConfig.
+    if (result.token) {
+      patch.agent_token = result.token;
+    }
     if (result.heartbeat_interval_seconds) {
       patch.heartbeat_interval_seconds = result.heartbeat_interval_seconds;
       patch.heartbeat_ttl_seconds = result.heartbeat_ttl_seconds || 90;
@@ -457,7 +805,7 @@ function createStationPrintingController(deps = {}) {
     if (applied.promoted && consumeEnabled) flushPending = true;
     if (!result.is_print_host) {
       log(
-        "Not the print host — Rabbit credentials are only sent to the print host. Consumer stays idle.",
+        "Connected as backup device — Rabbit credentials stay with the print host. Consumer idle until promoted.",
         "ℹ️"
       );
     }
@@ -466,12 +814,14 @@ function createStationPrintingController(deps = {}) {
     log(
       result.is_print_host
         ? `Registered as print host (epoch ${result.host_epoch}).`
-        : "Registered — not print host; Rabbit consumer stays idle.",
+        : "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices.",
       result.is_print_host ? "✅" : "ℹ️"
     );
     return {
       ok: true,
       shouldConsume: consumeEnabled,
+      isPrintHost: Boolean(result.is_print_host),
+      role: result.is_print_host ? "print_host" : "observer",
       promoted: applied.promoted,
       revoked: applied.revoked,
       rabbit: result.rabbit || null,
@@ -479,7 +829,27 @@ function createStationPrintingController(deps = {}) {
       rabbitChanged: Boolean(rabbitChanged),
       waitingForRabbitCreds: waitingForCreds,
       branch_id: result.branch_id != null ? String(result.branch_id) : afterCfg.branch_id || null,
+      message: result.is_print_host
+        ? null
+        : "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices.",
     };
+  }
+
+  /**
+   * Manual Join as backup (observer) after a PRINT_HOST_ALREADY_CONFIGURED 409.
+   * Never called from ensureSession / auto-resume. Same pairing code + app_id,
+   * role=observer; Bearer sent when a token is stored. Passes the persisted block
+   * (allowManualRegister); a throw restores it. Success clears hostConflict.
+   * Double-click shares one in-flight request (registerAsHost key = code+role).
+   */
+  async function joinAsBackupDevice(opts = {}) {
+    allowManualRegister();
+    const result = await registerAsHost({ ...opts, role: "observer" });
+    if (result && result.ok) {
+      hostConflict = null;
+      onStateChange(publicHostState());
+    }
+    return result;
   }
 
   const sleep =
@@ -709,11 +1079,13 @@ function createStationPrintingController(deps = {}) {
             message: "Heartbeat failed",
           },
         syncConflict: Boolean(live && live.syncConflict),
+        updateConflict: Boolean(live && live.updateConflict),
         retriesExhausted: Boolean(live && live.retriesExhausted),
         shouldConsume: consumeEnabled,
         consecutiveHbFailures,
         retrySoonMs,
         status,
+        code: live && live.code,
       };
     }
     if (consecutiveHbFailures > 0) {
@@ -850,13 +1222,160 @@ function createStationPrintingController(deps = {}) {
     };
   }
 
-  async function deregister() {
+  /**
+   * Sign this device out via POST /deregister.
+   * v1.29 / L10-I4 / R15D: on UPDATE_CONFLICT, 5xx, 429, or network failure retry
+   * up to 2 more times (~1s then ~3s). Exhausted / other failures keep the
+   * session and show MSG_DEREGISTER_UPDATE_CONFLICT (never raw "Request failed").
+   * Clear local auth only on 2xx, 404 AGENT_NOT_FOUND, or 401.
+   * R15D-L2: one in-flight deregister shared across concurrent callers (like register).
+   */
+  let deregisterInFlight = null;
+
+  function isDeregisterRetryable(result) {
+    if (result == null) return true; // network / thrown request
+    if (
+      result.updateConflict === true ||
+      result.code === ERROR_CODES.UPDATE_CONFLICT
+    ) {
+      return true;
+    }
+    const status = result.status != null ? Number(result.status) : null;
+    // R16D-I4: 408 matches heartbeat httpIsRetryable class.
+    if (status === 408 || status === 429) return true;
+    if (status != null && status >= 500 && status < 600) return true;
+    return false;
+  }
+
+  /** Cap 429 Retry-After for deregister backoff (R16D-I2). */
+  const DEREGISTER_RETRY_AFTER_MAX_MS = 10000;
+
+  function deregisterBackoffMs(attempt, result) {
+    const base = attempt <= 1 ? 1000 : 3000;
+    const status = result && result.status != null ? Number(result.status) : null;
+    if (status !== 429) return base;
+    const headers = (result && result.headers) || {};
+    const raw = headers["retry-after"] || headers["Retry-After"];
+    const ra = parseRetryAfterMs(raw, Date.now(), DEREGISTER_RETRY_AFTER_MAX_MS);
+    if (ra == null) return base;
+    return Math.max(base, ra);
+  }
+
+  function deregisterKeepFailure(result, extras = {}) {
+    const status = result && result.status != null ? Number(result.status) : null;
+    const code =
+      (result && result.code) ||
+      (result && result.error && result.error.code) ||
+      extras.code ||
+      "DEREGISTER_FAILED";
+    const message = MSG_DEREGISTER_UPDATE_CONFLICT;
     try {
-      await api.deregister({ reason: "explicit_deregister" });
+      log(
+        `Deregister failed (${status != null ? status : "network"}): ${message}`,
+        "⚠️"
+      );
     } catch (_) {}
-    // Explicit deregister revokes token and clears host on server — mirror locally.
-    clearLocalAuth("deregister");
-    return { ok: true, needsPairing: true };
+    onStateChange(publicHostState());
+    return {
+      ok: false,
+      needsPairing: false,
+      status,
+      code,
+      error: { code, message },
+      message,
+      ...extras,
+    };
+  }
+
+  async function deregisterOnce() {
+    // R16D-I5: no token → already signed out; never POST.
+    const cfg0 = readConfig();
+    const token = String(api.getToken() || cfg0.agent_token || "").trim();
+    if (!token) {
+      clearLocalAuth("deregister_no_token");
+      return { ok: true, needsPairing: true, alreadySignedOut: true };
+    }
+
+    const DEREGISTER_MAX_ATTEMPTS = 3;
+    let result = null;
+    for (let attempt = 1; attempt <= DEREGISTER_MAX_ATTEMPTS; attempt++) {
+      try {
+        result = await api.deregister({ reason: "explicit_deregister" });
+      } catch (_) {
+        // Thrown request must never be treated as success (R15D-I4 / V20).
+        result = null;
+      }
+      if (!isDeregisterRetryable(result)) break;
+      if (attempt >= DEREGISTER_MAX_ATTEMPTS) break;
+      const delay = deregisterBackoffMs(attempt, result);
+      try {
+        const label =
+          result == null
+            ? "network"
+            : result.updateConflict || result.code === ERROR_CODES.UPDATE_CONFLICT
+              ? "UPDATE_CONFLICT"
+              : `HTTP ${result.status}`;
+        log(
+          `Deregister ${label} (attempt ${attempt}/${DEREGISTER_MAX_ATTEMPTS}) — retry in ${delay}ms.`,
+          "⚠️"
+        );
+      } catch (_) {}
+      await sleep(delay);
+    }
+
+    // Success — server confirmed deregister.
+    if (result && result.ok) {
+      clearLocalAuth("deregister");
+      return { ok: true, needsPairing: true };
+    }
+
+    const status = result && result.status != null ? Number(result.status) : null;
+    const code =
+      (result && result.code) ||
+      (result && result.error && result.error.code) ||
+      "";
+
+    // Already gone / token rejected — safe to clear locally.
+    // 403 and other 404s must NOT clear (R15D-I4 / V9 / V10).
+    if (
+      status === 401 ||
+      (status === 404 && String(code) === ERROR_CODES.AGENT_NOT_FOUND)
+    ) {
+      clearLocalAuth(
+        status === 401 ? "deregister_unauthorized" : "deregister_not_found"
+      );
+      return { ok: true, needsPairing: true, clearedOn: status };
+    }
+
+    if (
+      result &&
+      (result.updateConflict === true ||
+        result.code === ERROR_CODES.UPDATE_CONFLICT)
+    ) {
+      return deregisterKeepFailure(result, {
+        updateConflict: true,
+        retriesExhausted: true,
+        code: ERROR_CODES.UPDATE_CONFLICT,
+      });
+    }
+
+    // Any other failure (403, other 409s, exhausted 5xx/429/network, …) — keep session.
+    return deregisterKeepFailure(result, {
+      retriesExhausted: isDeregisterRetryable(result),
+    });
+  }
+
+  async function deregister() {
+    if (deregisterInFlight) return deregisterInFlight;
+    const p = deregisterOnce().finally(() => {
+      if (deregisterInFlight === p) deregisterInFlight = null;
+    });
+    deregisterInFlight = p;
+    return p;
+  }
+
+  function isDeregisterInFlight() {
+    return Boolean(deregisterInFlight);
   }
 
   /**
@@ -866,8 +1385,12 @@ function createStationPrintingController(deps = {}) {
   async function ensureSession({ branchId } = {}) {
     const cfg = readConfig();
     api.setApiBase(cfg.agent_api_base || "");
-    const token = api.getToken() || cfg.agent_token || "";
-    if (token && String(token).trim()) {
+    const token = String(api.getToken() || cfg.agent_token || "").trim();
+    const code = String(cfg.pairing_code || "").trim();
+    // v1.24: a non-empty pairing code means the user wants to (re)pair. Prefer
+    // register (sending Bearer when we still have a token) over heartbeat resume.
+    // After a successful register the code is cleared, so normal restarts heartbeat.
+    if (token && !code) {
       api.setToken(token);
       const hb = await heartbeat({ branchId });
       if (hb.authError || hb.needsPairing) {
@@ -900,7 +1423,20 @@ function createStationPrintingController(deps = {}) {
         flushPending: hb.flushPending || flushPending,
       };
     }
-    // No token — must register with pairing code
+    // Register with pairing code (Bearer attached inside registerAsHostOnce when present).
+    // v1.23 / R5D-L1: never auto-resend a code whose hash matches the persisted block.
+    if (code && autoRegisterBlockedHash && codeMatchesBlockedHash(code, autoRegisterBlockedHash)) {
+      migrateBlockedHashIfLegacy(code);
+      log("Register not retried automatically for this pairing code — use Retry or enter a new code.", "ℹ️");
+      return {
+        ok: false,
+        resumed: false,
+        autoRetryBlocked: true,
+        pairingError: lastRegisterError,
+        error: lastRegisterError,
+        shouldConsume: false,
+      };
+    }
     const reg = await registerAsHost({ branchId });
     return { ...reg, resumed: false };
   }
@@ -927,7 +1463,7 @@ function createStationPrintingController(deps = {}) {
     }
     return withPrinterSyncSingleFlight(() =>
       withSyncConflictRetries("Printers sync", async (_attempt, { timeoutMs }) => {
-        const result = await api.syncPrinters({
+        let result = await api.syncPrinters({
           appId,
           branchId: branchId || cfg.branch_id,
           printers: payload,
@@ -944,6 +1480,7 @@ function createStationPrintingController(deps = {}) {
           };
         }
         if (result.ok) {
+          lastPrinterSyncValidationError = null;
           if (Array.isArray(result.printers) && result.printers.length) {
             printers.applyServerSync(result.printers);
             persistHostFlags();
@@ -964,10 +1501,41 @@ function createStationPrintingController(deps = {}) {
           } catch (_) {}
         } else {
           try {
-            const msg =
+            let msg =
               (result && result.error && result.error.message) ||
               (result && result.error) ||
               "Printer sync failed";
+            // L13-L1: 422 VALIDATION_ERROR — name the printer from details.
+            const statusNum = result && result.status != null ? Number(result.status) : null;
+            const code =
+              (result && result.code) ||
+              (result && result.error && result.error.code) ||
+              "";
+            if (
+              statusNum === 422 ||
+              code === "VALIDATION_ERROR" ||
+              code === ERROR_CODES.VALIDATION_ERROR
+            ) {
+              msg = formatPrinterSyncValidationError(result.error || result, payload);
+              result = {
+                ...result,
+                message: msg,
+                error:
+                  result.error && typeof result.error === "object"
+                    ? { ...result.error, message: msg }
+                    : { code: "VALIDATION_ERROR", message: msg },
+              };
+                            // R20D-I2: keep naming the printer until a sync succeeds or it is fixed/removed.
+              const hit = pickPrinterFromValidationError(result.error || result, payload);
+              lastPrinterSyncValidationError = {
+                message: msg,
+                code: "VALIDATION_ERROR",
+                externalId: (hit && hit.row && hit.row.external_id) || null,
+                printerLabel: (hit && hit.label) || null,
+                field: (hit && hit.field) || null,
+              };
+              onStateChange(publicHostState());
+            }
             log(`Printer sync failed: ${msg}`, "⚠️");
           } catch (_) {}
         }
@@ -1151,6 +1719,14 @@ function createStationPrintingController(deps = {}) {
     if (!id) return { ok: false, error: "Missing printer external_id." };
     const removed = printers.remove(id);
     if (!removed) return { ok: false, error: "Printer not found." };
+    if (
+      lastPrinterSyncValidationError &&
+      (!lastPrinterSyncValidationError.externalId ||
+        String(lastPrinterSyncValidationError.externalId).toLowerCase() ===
+          String((removed && removed.external_id) || id).toLowerCase())
+    ) {
+      lastPrinterSyncValidationError = null;
+    }
     persistHostFlags();
     onStateChange(publicHostState());
     return { ok: true, removed };
@@ -1280,6 +1856,10 @@ function createStationPrintingController(deps = {}) {
     handleAuthFailure,
     evaluateAuthFailure: handleAuthFailure,
     registerAsHost,
+    allowManualRegister,
+    joinAsBackupDevice,
+    isRegisterInFlight,
+    isDeregisterInFlight,
     ensureSession,
     heartbeat,
     deregister,

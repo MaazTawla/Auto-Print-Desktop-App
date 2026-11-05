@@ -1838,6 +1838,10 @@ ipcMain.handle("set-branch-id", async (_e, rawId) => {
     state.branchId = "";
     state.channel = "";
     saveUserConfig({ branch_id: "" });
+    try {
+      const sp = getStationPrinting();
+      if (sp && typeof sp.allowManualRegister === "function") sp.allowManualRegister();
+    } catch (_) {}
     log("Branch ID cleared — set a branch before consuming orders.", "📌");
     pushState();
     resetRabbitReconnectBackoff();
@@ -2024,10 +2028,103 @@ ipcMain.handle("set-agent-api-settings", async (_e, opts) => {
   }
 });
 
+ipcMain.handle("join-as-backup-device", async () => {
+  try {
+    const sp = getStationPrinting();
+    // Manual only — never from ensureSession. allowManualRegister is inside joinAsBackupDevice.
+    const cfg = readUserConfig();
+    if (!(cfg.pairing_code && String(cfg.pairing_code).trim())) {
+      const pairingError = {
+        code: "PAIRING_CODE_REQUIRED",
+        message: "Pairing code is required.",
+      };
+      pushState();
+      return {
+        ok: false,
+        error: pairingError.message,
+        code: pairingError.code,
+        pairingError,
+        stationPrinting: sp.publicHostState(),
+      };
+    }
+    const result = await sp.joinAsBackupDevice({ branchId: cfg.branch_id });
+    pushState();
+    const st = sp.publicHostState();
+    if (!result || !result.ok) {
+      return {
+        ok: false,
+        error:
+          (result && result.pairingError && result.pairingError.message) ||
+          (result && result.error && result.error.message) ||
+          (st.lastRegisterError && st.lastRegisterError.message) ||
+          (st.hostConflict && st.hostConflict.message) ||
+          "Could not join as backup device.",
+        code:
+          (result && (result.code || (result.pairingError && result.pairingError.code))) ||
+          (st.lastRegisterError && st.lastRegisterError.code) ||
+          (st.hostConflict && st.hostConflict.code) ||
+          "JOIN_BACKUP_FAILED",
+        pairingError: (result && result.pairingError) || st.lastRegisterError || null,
+        stationPrinting: st,
+      };
+    }
+    return {
+      ok: true,
+      role: "observer",
+      isPrintHost: false,
+      message:
+        result.message ||
+        "Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices.",
+      stationPrinting: st,
+    };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle("deregister-print-agent", async () => {
+  try {
+    const sp = getStationPrinting();
+    const result = await sp.deregister();
+    pushState();
+    const st = sp.publicHostState();
+    if (!result || !result.ok) {
+      const message =
+        (result && result.message) ||
+        (result && result.error && result.error.message) ||
+        "Couldn't sign this device out, please try again";
+      return {
+        ok: false,
+        error: message,
+        code: (result && result.code) || "DEREGISTER_FAILED",
+        updateConflict: Boolean(result && result.updateConflict),
+        retriesExhausted: Boolean(result && result.retriesExhausted),
+        needsPairing: false,
+        stationPrinting: st,
+      };
+    }
+    return {
+      ok: true,
+      needsPairing: true,
+      message: "Signed out of print agent on this device.",
+      stationPrinting: st,
+    };
+  } catch (_err) {
+    // R16D-I3: never surface raw exception text to the renderer.
+    return {
+      ok: false,
+      error: "Couldn't sign this device out, please try again",
+      code: "DEREGISTER_FAILED",
+    };
+  }
+});
+
 ipcMain.handle("retry-print-host-register", async () => {
   try {
     const sp = getStationPrinting();
     sp.clearHostConflict();
+    // v1.23: a user Retry/Connect may resend a code that auto-resume will not.
+    sp.allowManualRegister();
     const cfg = readUserConfig();
     if (!(cfg.pairing_code && String(cfg.pairing_code).trim())) {
       const pairingError = {
@@ -2184,9 +2281,21 @@ ipcMain.handle("add-discovered-printer", async (_e, raw) => {
     sp.printers.upsert(row);
     if (makeDefault) sp.setDefaultPrinter(row.external_id);
     try { saveUserConfig({ last_printer_list_sync_hash: "" }); } catch (_) {}
-    await sp.syncPrintersToServer({ branchId: state.branchId, force: true });
+    const sync = await sp.syncPrintersToServer({ branchId: state.branchId, force: true });
     try { await sp.pushPrinterStatusesIfChanged(); } catch (_) {}
     pushState();
+    if (sync && sync.ok === false && !sync.skipped) {
+      return {
+        ok: false,
+        error:
+          (sync.error && sync.error.message) ||
+          sync.message ||
+          sync.error ||
+          "Printer sync failed.",
+        printers: sp.printers.list(),
+        added: row,
+      };
+    }
     return { ok: true, printers: sp.printers.list(), added: row };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
@@ -2203,6 +2312,8 @@ ipcMain.handle("set-printer-mapping", async (_e, opts) => {
       if (hostErr) {
         return { ok: false, error: hostErr, code: "NOT_PRINT_HOST" };
       }
+      const nameReject = lanHostValidation.rejectMappingIfNameTooLong(o.name);
+      if (nameReject) return nameReject;
       let connection = String(o.connection || "lan").trim() || "lan";
       let externalId = String(o.externalId).trim();
       let host = String(o.host || o.ip_address || "").trim();
@@ -2963,7 +3074,7 @@ async function runAgentHeartbeat() {
 }
 
 async function stopRabbit() {
-  // Keep heartbeat running while registered; only clear on full quit via clear on before-quit.
+  // Keep heartbeat running while registered. Quit no longer deregisters (R15D-L1).
   clearRabbitHealthCheck();
   if (rabbitReconnectTimer) {
     clearTimeout(rabbitReconnectTimer);
@@ -3085,7 +3196,7 @@ async function startRabbit() {
           if (sess && sess.conflict) {
             state.rabbitmq = "idle";
             log(
-              "RabbitMQ consumer idle — another device is print host (or this is a reinstall with a new app_id). Ask admin to Change print host in Settings → Printing to this device, then Retry.",
+              "RabbitMQ consumer idle — another device is print host (or this is a reinstall with a new app_id). Ask admin to Change print host in Settings → Printing → Print devices to this device, then Retry.",
               "⚠️"
             );
             pushState();
@@ -3386,6 +3497,12 @@ async function applyBranchId(id) {
   state.branchId = id;
   state.channel = resolveRoutingKey(getRoutingKeyTemplate(), id);
   saveUserConfig({ branch_id: id });
+  // R5D-L3: a branch change unblocks auto-register so a BRANCH_MISMATCH user
+  // who fixed the branch does not also have to tap Retry.
+  try {
+    const sp = getStationPrinting();
+    if (sp && typeof sp.allowManualRegister === "function") sp.allowManualRegister();
+  } catch (_) {}
   log(`Branch ID set to ${id} — listening on ${state.channel || "(set routing key)"}`, "📌");
   pushState();
   // Nested call from startRabbit (or race while rabbitStarting): state already synced;
@@ -3975,9 +4092,9 @@ if (!gotSingleInstanceLock) {
     if (diskSpaceCheckTimer) clearInterval(diskSpaceCheckTimer);
     clearNetworkOnlineMonitor();
     stopAgentHeartbeatLoop();
-    try {
-      await getStationPrinting().deregister();
-    } catch (_) {}
+    // R15D-L1 (Maaz): quit must keep the device paired. Do NOT deregister —
+    // credentials survive quit/relaunch so ensureSession resumes without re-pairing.
+    // Only the explicit "Sign out this device" action calls deregister.
     await stopRabbit();
   });
 }

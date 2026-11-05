@@ -5,7 +5,11 @@ const assert = require("node:assert/strict");
 const crypto = require("crypto");
 const {
   parseHostConflictError,
+  capHostDeviceLabel,
   parseSyncConflictError,
+  parseUpdateConflictError,
+  MSG_UPDATE_CONFLICT,
+  MSG_DEREGISTER_UPDATE_CONFLICT,
   syncConflictBackoffMs,
   parsePrintMessage,
   parseRegisterResponse,
@@ -309,7 +313,8 @@ describe("SYNC_CONFLICT vs PRINT_HOST_ALREADY_CONFIGURED", () => {
       409
     );
     assert.equal(h.code, ERROR_CODES.PRINT_HOST_ALREADY_CONFIGURED);
-    assert.equal(h.current_host.app_id, "other");
+    assert.equal(h.current_host.app_id, undefined);
+    assert.equal(h.current_host.device_label, "Old");
   });
 
   it("syncConflictBackoffMs is short and jittered", () => {
@@ -322,3 +327,148 @@ describe("SYNC_CONFLICT vs PRINT_HOST_ALREADY_CONFIGURED", () => {
   });
 });
 
+describe("v1.29 UPDATE_CONFLICT", () => {
+  it("ERROR_CODES.UPDATE_CONFLICT is defined", () => {
+    assert.equal(ERROR_CODES.UPDATE_CONFLICT, "UPDATE_CONFLICT");
+  });
+
+  it("parseUpdateConflictError forces please-try-again message", () => {
+    const c = parseUpdateConflictError(
+      {
+        error: {
+          code: "UPDATE_CONFLICT",
+          message: "concurrent change; retry.",
+        },
+      },
+      409
+    );
+    assert.ok(c);
+    assert.equal(c.code, ERROR_CODES.UPDATE_CONFLICT);
+    assert.equal(c.message, MSG_UPDATE_CONFLICT);
+    assert.match(c.message, /please try again/i);
+  });
+
+  it("MSG_DEREGISTER_UPDATE_CONFLICT is the sign-out copy", () => {
+    assert.match(
+      MSG_DEREGISTER_UPDATE_CONFLICT,
+      /Couldn't sign this device out, please try again/i
+    );
+  });
+
+  it("parseSyncConflictError returns null for UPDATE_CONFLICT (no auto-retry)", () => {
+    assert.equal(
+      parseSyncConflictError(
+        { error: { code: "UPDATE_CONFLICT", message: "x" } },
+        409
+      ),
+      null
+    );
+  });
+
+  it("parseHostConflictError returns null for UPDATE_CONFLICT (no pairing auto-block)", () => {
+    assert.equal(
+      parseHostConflictError(
+        { error: { code: "UPDATE_CONFLICT", message: "x" } },
+        409
+      ),
+      null
+    );
+  });
+
+  it("parseUpdateConflictError returns null for SYNC_CONFLICT", () => {
+    assert.equal(
+      parseUpdateConflictError(
+        { error: { code: "SYNC_CONFLICT", message: "x" } },
+        409
+      ),
+      null
+    );
+  });
+});
+
+describe("R10D-I2 capHostDeviceLabel / live 409", () => {
+  it("caps at 120 code points and rejects non-strings", () => {
+    assert.equal(capHostDeviceLabel({ x: 1 }), "");
+    assert.equal(capHostDeviceLabel(42), "");
+    assert.equal(capHostDeviceLabel("B".repeat(200)), "B".repeat(120));
+    const emoji = "😀";
+    assert.equal(capHostDeviceLabel(emoji.repeat(200)), emoji.repeat(120));
+    assert.equal(Array.from(capHostDeviceLabel("a" + emoji.repeat(70))).length, 71);
+  });
+});
+
+describe("R11D-I2 grapheme cap", () => {
+  it("uses Intl.Segmenter so a ZWJ family counts as one grapheme under dual 120 cap", () => {
+    const family = "👨‍👩‍👧‍👦";
+    assert.ok(Array.from(family).length > 1);
+    const capped = capHostDeviceLabel(family.repeat(150));
+    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    assert.ok([...seg.segment(capped)].length <= 120);
+    assert.ok(Array.from(capped).length <= 120);
+    assert.equal(capped, family.repeat(Math.floor(120 / Array.from(family).length)));
+  });
+});
+
+describe("R12D-I1/I3 dual cap + survivor guards", () => {
+  const family = "👨‍👩‍👧‍👦";
+  const emoji = "😀";
+
+  it("R12D-I1: never exceeds 120 graphemes or 120 code points", () => {
+    const capped = capHostDeviceLabel(family.repeat(200));
+    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    assert.ok([...seg.segment(capped)].length <= 120);
+    assert.ok(Array.from(capped).length <= 120);
+    assert.ok(family.repeat(200).startsWith(capped));
+  });
+
+  it("R12D-I3: off-by-one — 121 units must still cut to 120 (kills cap121)", () => {
+    assert.equal(capHostDeviceLabel("A".repeat(121)), "A".repeat(120));
+    assert.equal(capHostDeviceLabel(emoji.repeat(121)), emoji.repeat(120));
+    const live = parseHostConflictError(
+      {
+        error: {
+          code: "PRINT_HOST_ALREADY_CONFIGURED",
+          current_host: { device_label: "B".repeat(121), is_online: true },
+        },
+      },
+      409
+    );
+    assert.equal(live.current_host.device_label, "B".repeat(120));
+  });
+
+  it("R12D-I3: Segmenter throw still caps (never returns raw uncut)", () => {
+    const S = Intl.Segmenter;
+    try {
+      Intl.Segmenter = function () {
+        throw new Error("boom");
+      };
+      const o = capHostDeviceLabel(emoji.repeat(200));
+      assert.equal(Array.from(o).length, 120);
+      assert.equal(o, emoji.repeat(120));
+    } finally {
+      Intl.Segmenter = S;
+    }
+  });
+
+  it("R12D-I3: code-point fallback uses Array.from not UTF-16 slice", () => {
+    const S = Intl.Segmenter;
+    try {
+      Intl.Segmenter = undefined;
+      // "a" + 70 emoji → 71 code points, 141 UTF-16 units; must not split.
+      const raw = "a" + emoji.repeat(70);
+      assert.ok(raw.length > 120);
+      const o = capHostDeviceLabel(raw);
+      assert.equal(Array.from(o).length, 71);
+      assert.equal(o, raw);
+      const huge = emoji.repeat(200);
+      const capped = capHostDeviceLabel(huge);
+      assert.equal(Array.from(capped).length, 120);
+      assert.equal(capped, emoji.repeat(120));
+      // UTF-16 slice(0,120) would leave a lone surrogate for emoji-only input
+      const bad = huge.slice(0, 120);
+      assert.notEqual(capped, bad);
+    } finally {
+      Intl.Segmenter = S;
+    }
+  });
+});

@@ -180,3 +180,83 @@ describe("printer-registry remove + edit replace", () => {
     assert.deepEqual(ids, ["lan:10.0.0.9:9101"]);
   });
 });
+
+
+describe("R20D registry external_id boundary", () => {
+  const { capExternalId, codePointLength } = require("../src/printer-field-limits");
+
+  it("R20D-M1: long Windows printer keeps server_id, custom name, default across sync", () => {
+    const name = "P".repeat(252);
+    const reg = createPrinterRegistry();
+    reg.syncFromWindowsList([{ name }]);
+    assert.equal(reg.list().length, 1);
+    const eid = reg.list()[0].external_id;
+    assert.equal(codePointLength(eid), 255);
+    reg.upsert({
+      external_id: eid,
+      name: "Front Counter",
+      server_id: 77,
+      is_default: true,
+      windows_name: name,
+    });
+    reg.syncFromWindowsList([{ name }]);
+    assert.equal(reg.list().length, 1);
+    const row = reg.list()[0];
+    assert.equal(row.server_id, 77);
+    assert.equal(row.name, "Front Counter");
+    assert.equal(row.is_default, true);
+    assert.equal(row.external_id, eid);
+    // Dropping the printer from Windows list should still prune by capped id
+    reg.syncFromWindowsList([]);
+    assert.equal(reg.list().length, 0);
+  });
+
+  it("R20D-M2: hydrate migrates legacy over-255 default and aliases", () => {
+    const raw = "win:" + "Q".repeat(300);
+    const capped = capExternalId(raw);
+    const reg = createPrinterRegistry();
+    reg.hydrate({
+      printers: [
+        { external_id: raw, name: "Legacy" },
+        { external_id: "win:Other", name: "Other" },
+      ],
+      defaultExternalId: raw,
+      eidAliases: { [raw]: "win:Other" },
+    });
+    assert.equal(reg.serialize().defaultExternalId, capped);
+    assert.equal(reg.getDefault().name, "Legacy");
+    // Alias values are capped; legacy raw keys may remain for lookup.
+    const aliases = reg.serialize().eidAliases || {};
+    assert.ok(Object.keys(aliases).length > 0);
+    assert.ok(
+      Object.values(aliases).every((v) => codePointLength(String(v)) <= 255)
+    );
+    assert.equal(aliases[capped.toLowerCase()], "win:Other");
+    const route = reg.routeMessage({});
+    assert.equal(route.ok, true);
+    assert.equal(route.printer.name, "Legacy");
+  });
+
+  it("upsert always caps external_id at the boundary", () => {
+    const raw = "lan:" + "h".repeat(280) + ":9100";
+    const reg = createPrinterRegistry();
+    const row = reg.upsert({ external_id: raw, name: "LongHost" });
+    assert.equal(row.external_id, capExternalId(raw));
+    assert.notEqual(row.external_id, raw);
+  });
+});
+
+
+describe("R21D-I2 alias migration", () => {
+  const { migrateStoredAliases, normalizeExternalId } = require("../src/printer-registry");
+  const { codePointLength } = require("../src/printer-field-limits");
+
+  it("alias migration drops over-255 raw keys on first pass", () => {
+    const raw = "win:" + "Z".repeat(300);
+    const m1 = migrateStoredAliases({ [raw]: "lan:1.2.3.4:9100" });
+    const m2 = migrateStoredAliases(m1);
+    assert.deepEqual(m1, m2);
+    assert.ok(Object.keys(m1).every((k) => codePointLength(k) <= 255));
+    assert.equal(m1[normalizeExternalId(raw).toLowerCase()], "lan:1.2.3.4:9100");
+  });
+});

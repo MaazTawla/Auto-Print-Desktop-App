@@ -7,8 +7,9 @@
     "start": "node scripts/ensure-rabbit-defaults.js && electron .",
     "generate:ico": "node scripts/generate-win-icon.js",
     "dist": "node scripts/ensure-rabbit-defaults.js && node scripts/generate-win-icon.js && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --x64",
-    "test": "node --test test/**/*.test.js",
-    "lint": "eslint src test scripts eslint.config.js"
+    "test": "node --test test/*.js",
+    "lint": "eslint src test scripts eslint.config.js",
+    "test:qa": "node --test qa/*.test.js"
   },
   "build": {
     "appId": "com.tawla.print-agent",
@@ -54,6 +55,7 @@
     "electron-builder": "^24.9.1",
     "eslint": "^9.39.5",
     "globals": "^17.13.0",
+    "jsdom": "29.1.1",
     "sharp": "^0.34.5",
     "to-ico": "^1.1.5"
   },

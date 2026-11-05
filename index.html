@@ -837,6 +837,26 @@
       opacity: 0.45;
       cursor: not-allowed;
     }
+    .btn-secondary {
+      padding: 10px 18px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-secondary:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: var(--surface-hi);
+    }
+    .btn-secondary:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
     .inline-actions {
       display: flex;
       flex-wrap: wrap;
@@ -2384,10 +2404,11 @@
       <div class="hc-title">Print host already configured</div>
       <div class="hc-msg" id="host-conflict-message"></div>
       <div class="hc-meta" id="host-conflict-meta"></div>
-      <div class="hc-meta">Ask admin to Change print host in Settings → Printing.</div>
+      <div class="hc-meta">Join as a backup device with this pairing code, or ask an admin to Change print host / enter a different code.</div>
     </div>
     <div class="hc-actions">
-      <button type="button" class="btn-primary" id="host-conflict-retry">Retry</button>
+      <button type="button" class="btn-primary" id="host-conflict-join-backup">Join as backup device</button>
+      <button type="button" class="btn-secondary" id="host-conflict-retry">Retry as print host</button>
     </div>
   </div>
   <div id="queue-precondition-banner" role="status" aria-live="polite">
@@ -2625,11 +2646,12 @@
                 <div class="field">
                   <label for="settings-pairing-code">Pairing code</label>
                   <input type="text" id="settings-pairing-code" placeholder="From merchant / branch" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
-                  <div class="field-hint">From Settings → Printing → Generate pairing code. Blank codes are blocked.</div>
+                  <div class="field-hint">From Settings → Printing → Print devices (Generate pairing code). Blank codes are blocked.</div>
                 </div>
                 <div class="field-hint">App ID: <span class="mono" id="settings-app-id">—</span></div>
                 <div class="err-text" id="settings-agent-err"></div>
                 <div class="settings-card-actions settings-card-actions-split">
+                  <button type="button" class="btn-outline" id="settings-agent-sign-out" hidden>Sign out this device</button>
                   <button type="button" class="btn-outline" id="settings-agent-retry">Retry</button>
                   <button type="button" class="btn-primary" id="settings-agent-save">
                     <span class="btn-label" id="settings-agent-save-label">Connect</span>
@@ -2793,7 +2815,8 @@
                     <input type="hidden" id="settings-manual-printer-edit-id" value="" />
                     <div class="field">
                       <label for="settings-manual-printer-name">Name</label>
-                      <input type="text" id="settings-manual-printer-name" placeholder="Kitchen" autocomplete="off" />
+                      <input type="text" id="settings-manual-printer-name" placeholder="Kitchen" autocomplete="off" maxlength="510" />
+                      <p class="field-hint" style="margin:4px 0 0;">Max 255 characters (emoji OK; maxlength allows UTF-16 pairs).</p>
                     </div>
                     <div class="field" id="settings-manual-printer-eid-field" style="display:none;">
                       <label for="settings-manual-printer-eid">External ID (locked)</label>
@@ -2801,7 +2824,8 @@
                     </div>
                     <div class="field">
                       <label for="settings-manual-printer-host">Host / IP</label>
-                      <input type="text" id="settings-manual-printer-host" placeholder="192.168.1.50" autocomplete="off" />
+                      <input type="text" id="settings-manual-printer-host" placeholder="192.168.1.50" autocomplete="off" maxlength="506" />
+                      <p class="field-hint" style="margin:4px 0 0;">Max 253 characters (DNS; maxlength allows UTF-16 pairs).</p>
                     </div>
                     <div class="field">
                       <label for="settings-manual-printer-port">Port</label>
@@ -2815,6 +2839,7 @@
                   </div>
                 </details>
                 <p class="settings-card-lead" style="margin-bottom:8px;">Added printers</p>
+                <p class="err-text" id="settings-printer-sync-err" style="display:none; margin:0 0 8px;" role="alert"></p>
                 <div style="overflow:auto;">
                   <table class="printer-map-table" id="settings-printer-map-table">
                     <thead>
@@ -3023,6 +3048,7 @@
   </div>
 </div>
 
+<script src="src/pairing-ui-policy.js"></script>
 <script>
   let currentTab = 'home';
   let isRestarting = false;
@@ -3928,14 +3954,11 @@
         const meta = document.getElementById('host-conflict-meta');
         if (msg) msg.textContent = conflict.message || 'Another device is already configured as print host for this branch.';
         if (meta) {
-          const host = conflict.current_host;
-          if (host) {
-            const online = host.is_online ? 'online' : 'offline';
-            meta.textContent = 'Current host: ' + (host.device_label || host.app_id || '—') + ' (' + online + '). If you reinstalled this app, your app id changed — admin must Change print host to this PC.';
-          } else {
-            meta.textContent = 'If you reinstalled this app, your app id changed — admin must Change print host to this PC, then tap Retry.';
-          }
+          meta.textContent = window.PairingUiPolicy.hostConflictMeta(conflict.current_host);
         }
+        const joinBtn = document.getElementById('host-conflict-join-backup');
+        // Fresh conflict + code still present → Join available (never auto).
+        if (joinBtn && sp.pairingCodeConfigured) joinBtn.disabled = false;
       }
     }
     if (pairingBanner) {
@@ -4021,6 +4044,17 @@
   function renderPrinterMap(s) {
     const tbody = document.getElementById('settings-printer-map-tbody');
     if (!tbody) return;
+    const syncErrEl = document.getElementById('settings-printer-sync-err');
+    const syncErr = s.stationPrinting && s.stationPrinting.printerSyncError;
+    if (syncErrEl) {
+      if (syncErr && syncErr.message) {
+        syncErrEl.textContent = syncErr.message;
+        syncErrEl.style.display = '';
+      } else {
+        syncErrEl.textContent = '';
+        syncErrEl.style.display = 'none';
+      }
+    }
     const list = (s.stationPrinting && s.stationPrinting.printers) || [];
     const canEdit = !!(s.stationPrinting && s.stationPrinting.isPrintHost);
     if (!list.length) {
@@ -4126,8 +4160,15 @@
     if (details) details.open = false;
   }
 
+  const pairingFieldClearTracker = window.PairingUiPolicy.createFieldClearTracker();
   function applyPrintHostForm(s) {
     const sp = s && s.stationPrinting;
+    {
+      // R4-I3: clear the dead code from the field once when fresh pairing is newly requested.
+      const pairingInput = document.getElementById('settings-pairing-code');
+      const typing = !!(pairingInput && document.activeElement === pairingInput);
+      if (pairingFieldClearTracker.update(sp, typing) && pairingInput) pairingInput.value = '';
+    }
     const secureWarn = document.getElementById('secure-storage-warning');
     if (secureWarn) {
       if (sp && sp.secretsEncryptionUnavailable) {
@@ -4170,7 +4211,7 @@
         const q = rabbit === 'error' ? ' · queue offline' : (rabbit === 'idle' ? ' · queue idle' : '');
         status.innerHTML = '<span class="host-status-pill on">Connected as print host</span> epoch ' + escHtml(String(sp.hostEpoch)) + branchNote + q;
       } else if (sp.agentTokenConfigured) {
-        status.innerHTML = '<span class="host-status-pill off">Registered</span> Not print host — consumer idle.';
+        status.innerHTML = '<span class="host-status-pill on">Backup device</span> Connected as backup — no print queue (heartbeats only).' + branchNote;
       } else if (sp.needsPairing) {
         status.innerHTML = '<span class="host-status-pill off">Offline</span> Enter a fresh pairing code, then Connect.';
       } else {
@@ -4180,6 +4221,12 @@
     const saveLabel = document.getElementById('settings-agent-save-label');
     if (saveLabel && !saveLabel.dataset.busy) {
       saveLabel.textContent = (sp && sp.agentTokenConfigured) ? 'Reconnect' : 'Connect';
+    }
+    const signOutBtn = document.getElementById('settings-agent-sign-out');
+    if (signOutBtn && !signOutBtn.dataset.busy) {
+      const signedIn = !!(sp && sp.agentTokenConfigured);
+      signOutBtn.hidden = !signedIn;
+      signOutBtn.disabled = false;
     }
     const appIdEl = document.getElementById('settings-app-id');
     if (appIdEl) appIdEl.textContent = (sp && sp.appId) || '—';
@@ -4194,7 +4241,7 @@
     const errEl = document.getElementById('settings-agent-err');
     if (errEl && sp && sp.lastRegisterError && !editing) {
       const e = sp.lastRegisterError;
-      errEl.textContent = (e.code ? e.code + ': ' : '') + (e.message || '');
+      errEl.textContent = window.PairingUiPolicy.errorText(e);
     }
   }
 
@@ -4417,6 +4464,37 @@
   }
 
   
+  const hostJoinBackupBtn = document.getElementById('host-conflict-join-backup');
+  if (hostJoinBackupBtn) {
+    hostJoinBackupBtn.addEventListener('click', async () => {
+      // Success consumes the pairing code — disable after one tap so a second Join
+      // cannot fire the same (now-dead) code → 401 PAIRING_CODE_INVALID.
+      if (hostJoinBackupBtn.disabled) return;
+      hostJoinBackupBtn.disabled = true;
+      try {
+        const res = await window.api.joinAsBackupDevice();
+        if (!res || !res.ok) {
+          showToast((res && res.error) || 'Could not join as backup device.', 'error', 3400);
+          // Re-enable only when the code is still configured (conflict kept / error path).
+          const still =
+            res &&
+            res.stationPrinting &&
+            res.stationPrinting.pairingCodeConfigured &&
+            res.stationPrinting.hostConflict;
+          hostJoinBackupBtn.disabled = !still;
+          return;
+        }
+        showToast(
+          (res && res.message) ||
+            'Connected as backup device. An admin can make this device the print host in Tawla Settings → Printing → Print devices.'
+        );
+      } catch (err) {
+        hostJoinBackupBtn.disabled = false;
+        showToast((err && err.message) || 'Could not join as backup device.', 'error', 3400);
+      }
+    });
+  }
+
   const hostRetryBtn = document.getElementById('host-conflict-retry');
   if (hostRetryBtn) {
     hostRetryBtn.addEventListener('click', async () => {
@@ -4441,13 +4519,73 @@
           (res && res.error) ||
           'Retry failed.';
         const code = res && (res.code || (res.pairingError && res.pairingError.code));
-        if (errEl) errEl.textContent = code ? `${code}: ${msg}` : msg;
+        if (code) console.warn('Pairing/register error', code);
+        if (errEl) errEl.textContent = msg;
         showToast(msg, 'error', 3400);
         return;
       }
       showToast('Retried print-host registration.');
     });
   }
+
+  document.getElementById('settings-agent-sign-out').addEventListener('click', async () => {
+    const errEl = document.getElementById('settings-agent-err');
+    const btn = document.getElementById('settings-agent-sign-out');
+    if (btn && btn.dataset.busy) return;
+    // R16D-I1: confirm before removing this device from the branch.
+    const okConfirm = window.confirm(
+      "Sign out this device?\n\nThis removes this device from the branch. You will need to pair again to reconnect."
+    );
+    if (!okConfirm) return;
+    if (errEl) errEl.textContent = '';
+    if (btn) {
+      btn.dataset.busy = '1';
+      btn.disabled = true;
+    }
+    let signedOutOk = false;
+    try {
+      const res = await window.api.deregisterPrintAgent();
+      // R16D-L1: clear busy before applyState so visibility can update.
+      if (btn) delete btn.dataset.busy;
+      try { applyState(await window.api.getState()); } catch (_) {}
+      if (res && res.ok) {
+        signedOutOk = true;
+        if (errEl) errEl.textContent = '';
+        showToast(res.message || 'Signed out of print agent on this device.', 'success', 3400);
+        if (btn) {
+          btn.hidden = true;
+          btn.disabled = false;
+        }
+      } else {
+        const msg =
+          (res && res.error) ||
+          "Couldn't sign this device out, please try again";
+        if (errEl) errEl.textContent = msg;
+        showToast(msg, 'error', 4200);
+        if (btn) {
+          btn.disabled = false;
+          btn.hidden = false;
+        }
+      }
+    } catch (_err) {
+      // R16D-I3: never show raw exception text.
+      const msg = "Couldn't sign this device out, please try again";
+      if (errEl) errEl.textContent = msg;
+      showToast(msg, 'error', 4200);
+      if (btn) {
+        btn.disabled = false;
+        btn.hidden = false;
+      }
+    } finally {
+      if (btn) {
+        delete btn.dataset.busy;
+        if (signedOutOk) {
+          btn.hidden = true;
+          btn.disabled = false;
+        }
+      }
+    }
+  });
 
   document.getElementById('settings-agent-save').addEventListener('click', async () => {
     const errEl = document.getElementById('settings-agent-err');
@@ -4490,7 +4628,8 @@
           (reg && reg.error) ||
           'Connect failed.';
         const code = reg && (reg.code || (reg.pairingError && reg.pairingError.code));
-        if (errEl) errEl.textContent = code ? `${code}: ${msg}` : msg;
+        if (code) console.warn('Pairing/register error', code);
+        if (errEl) errEl.textContent = msg;
         showToast(msg, 'error', 3400);
         return;
       }
@@ -4633,6 +4772,16 @@
       const name = (document.getElementById('settings-manual-printer-name') || {}).value || '';
       const host = String((document.getElementById('settings-manual-printer-host') || {}).value || '').trim();
       const portRaw = (document.getElementById('settings-manual-printer-port') || {}).value;
+      // L13-L1: BE v1.32 field caps (name ≤255, host ≤253).
+      function codePointLen(s) { return Array.from(String(s || '')).length; }
+      if (codePointLen(name) > 255) {
+        if (errEl) errEl.textContent = 'Name must be at most 255 characters.';
+        return;
+      }
+      if (host && codePointLen(host) > 253) {
+        if (errEl) errEl.textContent = 'Host / IP must be at most 253 characters.';
+        return;
+      }
       // Inline validation (mirrors src/lan-host-validation.js / BE v1.6)
       function isIpv6(h) {
         let x = String(h || '').trim();
@@ -4694,6 +4843,10 @@
         return;
       }
       const externalId = 'lan:' + host + ':' + usePort;
+      if (codePointLen(externalId) > 255) {
+        if (errEl) errEl.textContent = 'That host and port make an external id over 255 characters. Shorten the host.';
+        return;
+      }
       if (editingId) {
         if (!window.api || typeof window.api.setPrinterMapping !== 'function') return;
         manualAddBtn.disabled = true;

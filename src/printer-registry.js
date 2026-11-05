@@ -10,9 +10,22 @@ const {
   windowsPrinterExternalId,
   inferNetworkEndpointFromWindowsPrinter,
 } = require("./windows-external-id");
+const {
+  capExternalId,
+  capSyncPrinterRow,
+  resolvePrinterName,
+  sanitizePort,
+  normalizeStatusFields,
+  isStatusValueProvided,
+  codePointLength,
+} = require("./printer-field-limits");
 
+/**
+ * Registry boundary: every external_id is trimmed then passed through the
+ * single capExternalId (R20D-M1/M2). Idempotent for already-capped ids.
+ */
 function normalizeExternalId(raw) {
-  return String(raw || "").trim();
+  return capExternalId(String(raw || "").trim());
 }
 
 function normalizeAliasKey(raw) {
@@ -49,10 +62,41 @@ function resolveEidAlias(externalId, aliases) {
     const key = cur.toLowerCase();
     if (seen.has(key)) return cur;
     seen.add(key);
-    const next = normalizeExternalId(map[key]);
+    const nextRaw = map[key];
+    const next = nextRaw != null ? normalizeExternalId(nextRaw) : "";
     if (!next || next.toLowerCase() === cur.toLowerCase()) return cur;
     cur = next;
   }
+}
+
+/**
+ * One-time migration of persisted eidAliases: cap keys and values, and keep a
+ * lowercase(raw) → capped mapping so legacy lookups still resolve (R20D-M2).
+ */
+function migrateStoredAliases(existing) {
+  const out = {};
+  const map = existing && typeof existing === "object" ? existing : {};
+  for (const [k, v] of Object.entries(map)) {
+    const rawKey = String(k || "").trim();
+    const rawVal = String(v || "").trim();
+    if (!rawKey || !rawVal) continue;
+    const cappedKey = normalizeExternalId(rawKey);
+    const cappedVal = normalizeExternalId(rawVal);
+    if (!cappedKey || !cappedVal) continue;
+    if (cappedKey.toLowerCase() !== cappedVal.toLowerCase()) {
+      out[cappedKey.toLowerCase()] = cappedVal;
+    }
+    // Lookups always normalize/cap first, so a raw key over 255 is never
+    // consulted — drop it so migration is idempotent (R21D-I2).
+    const rawKeyLower = rawKey.toLowerCase();
+    if (
+      rawKeyLower !== cappedKey.toLowerCase() &&
+      codePointLength(rawKey) <= 255
+    ) {
+      out[rawKeyLower] = cappedVal;
+    }
+  }
+  return out;
 }
 
 function createPrinterRegistry(initial = {}) {
@@ -61,7 +105,7 @@ function createPrinterRegistry(initial = {}) {
   /** @type {Record<string, string>} old eid → new eid */
   let eidAliases =
     initial.eidAliases && typeof initial.eidAliases === "object"
-      ? { ...initial.eidAliases }
+      ? migrateStoredAliases(initial.eidAliases)
       : {};
   let defaultExternalId =
     initial.defaultExternalId != null
@@ -102,17 +146,56 @@ function createPrinterRegistry(initial = {}) {
       printer.connection ||
       (prev && prev.connection) ||
       "lan";
+    const rawName =
+      printer.name != null
+        ? String(printer.name)
+        : windowsName || (prev && prev.name) || "";
+    const cleanedName = resolvePrinterName(rawName, externalId);
+    // R24D / R25D-L2 / R26D-L1: status/detail change only when a real value
+    // is provided. null | undefined | "" | whitespace | invisible-only ⇒ not
+    // provided (keep stored; never clamp to error).
+    const statusProvided =
+      Object.prototype.hasOwnProperty.call(printer, "status") &&
+      isStatusValueProvided(printer.status);
+    const detailProvided = Object.prototype.hasOwnProperty.call(
+      printer,
+      "status_detail"
+    );
+    let statusOut = (prev && prev.status) || "online";
+    let detailOut =
+      prev && prev.status_detail != null ? prev.status_detail : null;
+    if (statusProvided || detailProvided) {
+      const statusRaw = statusProvided
+        ? printer.status
+        : (prev && prev.status) || "online";
+      let detailIn = null;
+      if (detailProvided) {
+        detailIn =
+          printer.status_detail != null ? String(printer.status_detail) : null;
+      } else if (prev && prev.status_detail != null) {
+        detailIn = prev.status_detail;
+      }
+      const statusFields = normalizeStatusFields(statusRaw, detailIn, {
+        detailProvided,
+        statusProvided,
+      });
+      if (statusProvided) statusOut = statusFields.status || "online";
+      detailOut = statusFields.status_detail;
+    }
+    // R22D-L3 / L14-I4: invalid or omitted ('' / whitespace) port keeps stored.
+    let port = prev && prev.port != null ? prev.port : null;
+    if (Object.prototype.hasOwnProperty.call(printer, "port")) {
+      const sanitized = sanitizePort(printer.port);
+      if (sanitized !== undefined) port = sanitized;
+    }
     const row = {
       external_id: externalId,
-      name: String(printer.name || windowsName).trim() || externalId,
+      name: cleanedName,
       windows_name: windowsName || (prev && prev.windows_name) || externalId,
       connection,
       connection_type: connection,
-      status: printer.status || (prev && prev.status) || "online",
-      status_detail:
-        printer.status_detail != null
-          ? String(printer.status_detail)
-          : (prev && prev.status_detail) || null,
+      status: statusOut,
+      status_detail: detailOut,
       is_default: Boolean(printer.is_default ?? printer.isDefault),
       model:
         printer.model != null
@@ -124,10 +207,7 @@ function createPrinterRegistry(initial = {}) {
         printer.ip_address != null
           ? String(printer.ip_address)
           : (prev && prev.ip_address) || null,
-      port:
-        printer.port != null && Number.isFinite(Number(printer.port))
-          ? Number(printer.port)
-          : (prev && prev.port) || null,
+      port: port != null ? port : null,
       // Server-assigned numeric id from printers/sync
       server_id:
         printer.server_id != null
@@ -155,14 +235,15 @@ function createPrinterRegistry(initial = {}) {
       const externalId = normalizeExternalId(p.external_id);
       if (!externalId) continue;
       const prev = byExternalId.get(externalId);
-      upsert({
+      // R24D-L1 / R25D-L1 / R26D-L1: only pass status / status_detail when the
+      // server sent a real value (not undefined/null/blank/invisible-only).
+      // Never fall back to stored status.
+      const syncRow = {
         ...(prev || {}),
         external_id: externalId,
         name: p.name || (prev && prev.name) || externalId,
         windows_name: (prev && prev.windows_name) || p.name || externalId,
         connection: p.connection_type || p.connection || (prev && prev.connection),
-        status: p.status || (prev && prev.status) || "online",
-        status_detail: p.status_detail,
         is_default:
           p.is_default != null
             ? Boolean(p.is_default)
@@ -171,7 +252,18 @@ function createPrinterRegistry(initial = {}) {
         ip_address: p.ip_address,
         server_id: p.id,
         id: p.id,
-      });
+      };
+      if (isStatusValueProvided(p.status)) {
+        syncRow.status = p.status;
+      } else {
+        delete syncRow.status;
+      }
+      if (p.status_detail !== undefined) {
+        syncRow.status_detail = p.status_detail;
+      } else {
+        delete syncRow.status_detail;
+      }
+      upsert(syncRow);
     }
     return list();
   }
@@ -185,8 +277,9 @@ function createPrinterRegistry(initial = {}) {
         (p && (p.name || p.deviceName || p.printerName)) || ""
       ).trim();
       if (!name) continue;
-      // Backend confirmed: win:{Windows printer name}
-      const externalId = windowsPrinterExternalId(name);
+      // Backend confirmed: win:{Windows printer name}. Cap at the registry
+      // boundary so seen/prev match the hashed key upsert stores (R20D-M1).
+      const externalId = normalizeExternalId(windowsPrinterExternalId(name));
       seen.add(externalId);
       const prev = byExternalId.get(externalId);
       const net = inferNetworkEndpointFromWindowsPrinter(p);
@@ -232,7 +325,11 @@ function createPrinterRegistry(initial = {}) {
     let id = normalizeExternalId(externalId);
     if (!id) return false;
     if (!byExternalId.has(id)) {
-      const winId = windowsPrinterExternalId(id.replace(/^win:/i, "") || id);
+      const winId = normalizeExternalId(
+        windowsPrinterExternalId(
+          String(externalId || "").trim().replace(/^win:/i, "") || id
+        )
+      );
       if (byExternalId.has(winId)) id = winId;
       else {
         for (const row of byExternalId.values()) {
@@ -280,22 +377,40 @@ function createPrinterRegistry(initial = {}) {
   }
 
   function routeMessage(msg) {
-    const externalId =
-      msg && msg.printer_external_id
-        ? normalizeExternalId(msg.printer_external_id)
+    // Keep the trimmed ORIGINAL id for name_fallback (R21D-L1). Hashing it
+    // first broke bare Windows names over 251 chars that used to match.
+    const rawPrinterId =
+      msg && msg.printer_external_id != null
+        ? String(msg.printer_external_id).trim()
         : "";
+    const externalId = rawPrinterId ? normalizeExternalId(rawPrinterId) : "";
     if (externalId) {
       const resolved = resolveEidAlias(externalId, eidAliases);
       let found = byExternalId.get(resolved) || byExternalId.get(externalId);
       if (!found && !/^win:/i.test(resolved)) {
-        found = byExternalId.get(windowsPrinterExternalId(resolved));
+        found = byExternalId.get(
+          normalizeExternalId(windowsPrinterExternalId(resolved))
+        );
       }
       if (!found && !/^win:/i.test(externalId)) {
-        found = byExternalId.get(windowsPrinterExternalId(externalId));
+        found = byExternalId.get(
+          normalizeExternalId(windowsPrinterExternalId(externalId))
+        );
+      }
+      if (!found && rawPrinterId && !/^win:/i.test(rawPrinterId)) {
+        found = byExternalId.get(
+          normalizeExternalId(windowsPrinterExternalId(rawPrinterId))
+        );
       }
       if (found) return { ok: true, printer: found, matchedBy: "external_id" };
+      const bare = rawPrinterId.replace(/^win:/i, "");
       for (const row of byExternalId.values()) {
-        if (row.windows_name === externalId || row.name === externalId) {
+        if (
+          row.windows_name === rawPrinterId ||
+          row.name === rawPrinterId ||
+          (bare &&
+            (row.windows_name === bare || row.name === bare))
+        ) {
           return { ok: true, printer: row, matchedBy: "name_fallback" };
         }
       }
@@ -311,21 +426,22 @@ function createPrinterRegistry(initial = {}) {
   }
 
   function toSyncPayload() {
-    return list().map((p) => ({
-      external_id: p.external_id,
-      name: p.name,
-      connection: p.connection,
-      connection_type: p.connection_type || p.connection,
-      status: p.status === "out_of_paper" ? "error" : p.status,
-      status_detail:
-        p.status === "out_of_paper"
-          ? p.status_detail || "Out of paper"
-          : p.status_detail,
-      is_default: p.is_default,
-      model: p.model,
-      ip_address: p.ip_address,
-      ...(p.port != null ? { port: p.port } : {}),
-    }));
+    // L13-L1 / BE v1.32: truncate OS/hardware fields at grapheme boundaries
+    // before send; cap status at 16; keep external_id ≤ 255 (hash suffix).
+    return list().map((p) =>
+      capSyncPrinterRow({
+        external_id: p.external_id,
+        name: p.name,
+        connection: p.connection,
+        connection_type: p.connection_type || p.connection,
+        status: p.status,
+        status_detail: p.status_detail,
+        is_default: p.is_default,
+        model: p.model,
+        ip_address: p.ip_address,
+        ...(sanitizePort(p.port) != null ? { port: sanitizePort(p.port) } : {}),
+      })
+    );
   }
 
   function serialize() {
@@ -343,9 +459,22 @@ function createPrinterRegistry(initial = {}) {
     if (!data || typeof data !== "object") return;
     const printers = Array.isArray(data.printers) ? data.printers : [];
     for (const p of printers) upsert(p);
-    if (data.defaultExternalId) setDefault(data.defaultExternalId);
+    // One-time migration: default + aliases through capExternalId (R20D-M2).
     if (data.eidAliases && typeof data.eidAliases === "object") {
-      eidAliases = { ...data.eidAliases };
+      eidAliases = migrateStoredAliases(data.eidAliases);
+    }
+    if (data.defaultExternalId) {
+      const ok = setDefault(data.defaultExternalId);
+      if (!ok) {
+        // Raw over-255 default: rows were re-keyed by upsert; try capped form.
+        setDefault(normalizeExternalId(data.defaultExternalId));
+      }
+    }
+    // Ensure is_default flags match defaultExternalId after migration.
+    if (defaultExternalId && byExternalId.has(defaultExternalId)) {
+      for (const row of byExternalId.values()) {
+        row.is_default = row.external_id === defaultExternalId;
+      }
     }
   }
 
@@ -354,7 +483,8 @@ function createPrinterRegistry(initial = {}) {
   }
 
   function setEidAliases(next) {
-    eidAliases = next && typeof next === "object" ? { ...next } : {};
+    eidAliases =
+      next && typeof next === "object" ? migrateStoredAliases(next) : {};
     return getEidAliases();
   }
 
@@ -451,4 +581,5 @@ module.exports = {
   normalizeExternalId,
   migrateEidAlias,
   resolveEidAlias,
+  migrateStoredAliases,
 };
