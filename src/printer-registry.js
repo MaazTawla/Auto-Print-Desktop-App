@@ -15,8 +15,12 @@ const {
   capSyncPrinterRow,
 } = require("./printer-field-limits");
 
+/**
+ * Registry boundary: every external_id is trimmed then passed through the
+ * single capExternalId (R20D-M1/M2). Idempotent for already-capped ids.
+ */
 function normalizeExternalId(raw) {
-  return String(raw || "").trim();
+  return capExternalId(String(raw || "").trim());
 }
 
 function normalizeAliasKey(raw) {
@@ -53,10 +57,36 @@ function resolveEidAlias(externalId, aliases) {
     const key = cur.toLowerCase();
     if (seen.has(key)) return cur;
     seen.add(key);
-    const next = normalizeExternalId(map[key]);
+    const nextRaw = map[key];
+    const next = nextRaw != null ? normalizeExternalId(nextRaw) : "";
     if (!next || next.toLowerCase() === cur.toLowerCase()) return cur;
     cur = next;
   }
+}
+
+/**
+ * One-time migration of persisted eidAliases: cap keys and values, and keep a
+ * lowercase(raw) → capped mapping so legacy lookups still resolve (R20D-M2).
+ */
+function migrateStoredAliases(existing) {
+  const out = {};
+  const map = existing && typeof existing === "object" ? existing : {};
+  for (const [k, v] of Object.entries(map)) {
+    const rawKey = String(k || "").trim();
+    const rawVal = String(v || "").trim();
+    if (!rawKey || !rawVal) continue;
+    const cappedKey = normalizeExternalId(rawKey);
+    const cappedVal = normalizeExternalId(rawVal);
+    if (!cappedKey || !cappedVal) continue;
+    if (cappedKey.toLowerCase() !== cappedVal.toLowerCase()) {
+      out[cappedKey.toLowerCase()] = cappedVal;
+    }
+    const rawKeyLower = rawKey.toLowerCase();
+    if (rawKeyLower !== cappedKey.toLowerCase()) {
+      out[rawKeyLower] = cappedVal;
+    }
+  }
+  return out;
 }
 
 function createPrinterRegistry(initial = {}) {
@@ -65,7 +95,7 @@ function createPrinterRegistry(initial = {}) {
   /** @type {Record<string, string>} old eid → new eid */
   let eidAliases =
     initial.eidAliases && typeof initial.eidAliases === "object"
-      ? { ...initial.eidAliases }
+      ? migrateStoredAliases(initial.eidAliases)
       : {};
   let defaultExternalId =
     initial.defaultExternalId != null
@@ -94,12 +124,10 @@ function createPrinterRegistry(initial = {}) {
     const windowsName = String(
       printer.windows_name || printer.name || printer.external_id || ""
     ).trim();
-    const externalId = capExternalId(
-      normalizeExternalId(
-        printer.external_id ||
-          printer.externalId ||
-          (windowsName ? windowsPrinterExternalId(windowsName) : "")
-      )
+    const externalId = normalizeExternalId(
+      printer.external_id ||
+        printer.externalId ||
+        (windowsName ? windowsPrinterExternalId(windowsName) : "")
     );
     if (!externalId) return null;
     const prev = byExternalId.get(externalId);
@@ -191,8 +219,9 @@ function createPrinterRegistry(initial = {}) {
         (p && (p.name || p.deviceName || p.printerName)) || ""
       ).trim();
       if (!name) continue;
-      // Backend confirmed: win:{Windows printer name}
-      const externalId = windowsPrinterExternalId(name);
+      // Backend confirmed: win:{Windows printer name}. Cap at the registry
+      // boundary so seen/prev match the hashed key upsert stores (R20D-M1).
+      const externalId = normalizeExternalId(windowsPrinterExternalId(name));
       seen.add(externalId);
       const prev = byExternalId.get(externalId);
       const net = inferNetworkEndpointFromWindowsPrinter(p);
@@ -238,7 +267,11 @@ function createPrinterRegistry(initial = {}) {
     let id = normalizeExternalId(externalId);
     if (!id) return false;
     if (!byExternalId.has(id)) {
-      const winId = windowsPrinterExternalId(id.replace(/^win:/i, "") || id);
+      const winId = normalizeExternalId(
+        windowsPrinterExternalId(
+          String(externalId || "").trim().replace(/^win:/i, "") || id
+        )
+      );
       if (byExternalId.has(winId)) id = winId;
       else {
         for (const row of byExternalId.values()) {
@@ -294,10 +327,14 @@ function createPrinterRegistry(initial = {}) {
       const resolved = resolveEidAlias(externalId, eidAliases);
       let found = byExternalId.get(resolved) || byExternalId.get(externalId);
       if (!found && !/^win:/i.test(resolved)) {
-        found = byExternalId.get(windowsPrinterExternalId(resolved));
+        found = byExternalId.get(
+          normalizeExternalId(windowsPrinterExternalId(resolved))
+        );
       }
       if (!found && !/^win:/i.test(externalId)) {
-        found = byExternalId.get(windowsPrinterExternalId(externalId));
+        found = byExternalId.get(
+          normalizeExternalId(windowsPrinterExternalId(externalId))
+        );
       }
       if (found) return { ok: true, printer: found, matchedBy: "external_id" };
       for (const row of byExternalId.values()) {
@@ -353,9 +390,22 @@ function createPrinterRegistry(initial = {}) {
     if (!data || typeof data !== "object") return;
     const printers = Array.isArray(data.printers) ? data.printers : [];
     for (const p of printers) upsert(p);
-    if (data.defaultExternalId) setDefault(data.defaultExternalId);
+    // One-time migration: default + aliases through capExternalId (R20D-M2).
     if (data.eidAliases && typeof data.eidAliases === "object") {
-      eidAliases = { ...data.eidAliases };
+      eidAliases = migrateStoredAliases(data.eidAliases);
+    }
+    if (data.defaultExternalId) {
+      const ok = setDefault(data.defaultExternalId);
+      if (!ok) {
+        // Raw over-255 default: rows were re-keyed by upsert; try capped form.
+        setDefault(normalizeExternalId(data.defaultExternalId));
+      }
+    }
+    // Ensure is_default flags match defaultExternalId after migration.
+    if (defaultExternalId && byExternalId.has(defaultExternalId)) {
+      for (const row of byExternalId.values()) {
+        row.is_default = row.external_id === defaultExternalId;
+      }
     }
   }
 
@@ -364,7 +414,8 @@ function createPrinterRegistry(initial = {}) {
   }
 
   function setEidAliases(next) {
-    eidAliases = next && typeof next === "object" ? { ...next } : {};
+    eidAliases =
+      next && typeof next === "object" ? migrateStoredAliases(next) : {};
     return getEidAliases();
   }
 
@@ -461,4 +512,5 @@ module.exports = {
   normalizeExternalId,
   migrateEidAlias,
   resolveEidAlias,
+  migrateStoredAliases,
 };

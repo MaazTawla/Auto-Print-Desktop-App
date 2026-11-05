@@ -48,6 +48,7 @@ const {
 } = require("./agent-http-retry-policy");
 const {
   formatPrinterSyncValidationError,
+  pickPrinterFromValidationError,
 } = require("./printer-field-limits");
 
 function createStationPrintingController(deps = {}) {
@@ -243,6 +244,7 @@ function createStationPrintingController(deps = {}) {
   }
   let lastRegisterError = null; // { code, message } for inline UI
   let needsPairing = false; // prompt UI after token revoke / deregister
+  let lastPrinterSyncValidationError = null;
   let lastHeartbeatAt = null;
   let consumeEnabled = policy.shouldConsume();
   let flushPending = false;
@@ -295,6 +297,8 @@ function createStationPrintingController(deps = {}) {
         policy.isPrintHost &&
           !(readConfig().rabbit_host && String(readConfig().rabbit_host).trim())
       ),
+      // R20D-I2: last printers/sync 422, cleared on success or printer fix/remove.
+      printerSyncError: lastPrinterSyncValidationError,
     };
   }
 
@@ -1476,6 +1480,7 @@ function createStationPrintingController(deps = {}) {
           };
         }
         if (result.ok) {
+          lastPrinterSyncValidationError = null;
           if (Array.isArray(result.printers) && result.printers.length) {
             printers.applyServerSync(result.printers);
             persistHostFlags();
@@ -1520,6 +1525,16 @@ function createStationPrintingController(deps = {}) {
                     ? { ...result.error, message: msg }
                     : { code: "VALIDATION_ERROR", message: msg },
               };
+                            // R20D-I2: keep naming the printer until a sync succeeds or it is fixed/removed.
+              const hit = pickPrinterFromValidationError(result.error || result, payload);
+              lastPrinterSyncValidationError = {
+                message: msg,
+                code: "VALIDATION_ERROR",
+                externalId: (hit && hit.row && hit.row.external_id) || null,
+                printerLabel: (hit && hit.label) || null,
+                field: (hit && hit.field) || null,
+              };
+              onStateChange(publicHostState());
             }
             log(`Printer sync failed: ${msg}`, "⚠️");
           } catch (_) {}
@@ -1704,6 +1719,14 @@ function createStationPrintingController(deps = {}) {
     if (!id) return { ok: false, error: "Missing printer external_id." };
     const removed = printers.remove(id);
     if (!removed) return { ok: false, error: "Printer not found." };
+    if (
+      lastPrinterSyncValidationError &&
+      (!lastPrinterSyncValidationError.externalId ||
+        String(lastPrinterSyncValidationError.externalId).toLowerCase() ===
+          String((removed && removed.external_id) || id).toLowerCase())
+    ) {
+      lastPrinterSyncValidationError = null;
+    }
     persistHostFlags();
     onStateChange(publicHostState());
     return { ok: true, removed };

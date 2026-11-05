@@ -30,6 +30,20 @@ function codePointLength(s) {
  * Intl.Segmenter is available. Fallback: Array.from code-point cut (never
  * UTF-16 string.slice). Non-strings → "".
  */
+function truncateByCodePoints(raw, maxCodePoints) {
+  const chars = Array.from(raw);
+  return chars.length > maxCodePoints
+    ? chars.slice(0, maxCodePoints).join("")
+    : raw;
+}
+
+/**
+ * Truncate to at most maxCodePoints, cutting back to a grapheme boundary when
+ * Intl.Segmenter is available. Fallback: Array.from code-point cut (never
+ * UTF-16 string.slice). R20D-L2: if a single grapheme exceeds the budget,
+ * fall back to a code-point cut — never return "" for a non-empty input.
+ * Non-strings → "".
+ */
 function truncateAtGraphemeBoundary(raw, maxCodePoints) {
   if (typeof raw !== "string") return "";
   if (!Number.isFinite(maxCodePoints) || maxCodePoints <= 0) return "";
@@ -45,15 +59,14 @@ function truncateAtGraphemeBoundary(raw, maxCodePoints) {
         parts.push(segment);
         cps += segCp;
       }
-      return parts.join("");
+      if (parts.length > 0) return parts.join("");
+      // First grapheme alone is over budget — code-point cut, never empty.
+      return truncateByCodePoints(raw, maxCodePoints);
     } catch (_) {
       /* fall through */
     }
   }
-  const chars = Array.from(raw);
-  return chars.length > maxCodePoints
-    ? chars.slice(0, maxCodePoints).join("")
-    : raw;
+  return truncateByCodePoints(raw, maxCodePoints);
 }
 
 /**
@@ -153,6 +166,29 @@ function extractValidationFieldDetails(error) {
   return candidates[0] || {};
 }
 
+
+/**
+ * @returns {{ index: number, field: string, row: object|null, label: string }|null}
+ */
+function pickPrinterFromValidationError(error, payload) {
+  const details = extractValidationFieldDetails(error);
+  const re = /^printers\.(\d+)\.([A-Za-z0-9_]+)$/;
+  for (const k of Object.keys(details || {})) {
+    const m = k.match(re);
+    if (!m) continue;
+    const idx = Number(m[1]);
+    const field = m[2];
+    const list = Array.isArray(payload) ? payload : [];
+    const row = list[idx] || null;
+    const label =
+      (row && row.name && String(row.name).trim()) ||
+      (row && row.external_id && String(row.external_id).trim()) ||
+      `printer #${idx + 1}`;
+    return { index: idx, field, row, label };
+  }
+  return null;
+}
+
 function formatPrinterSyncValidationError(error, payload) {
   const details = extractValidationFieldDetails(error);
   const keys = Object.keys(details);
@@ -193,6 +229,7 @@ module.exports = {
   EXTERNAL_ID_TOO_LONG,
   codePointLength,
   truncateAtGraphemeBoundary,
+  truncateByCodePoints,
   capExternalId,
   capStatus,
   capOptionalField,
@@ -201,4 +238,5 @@ module.exports = {
   validateManualPrinterHost,
   validateManualLanExternalId,
   formatPrinterSyncValidationError,
+  pickPrinterFromValidationError,
 };
