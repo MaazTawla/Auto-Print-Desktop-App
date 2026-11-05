@@ -1217,31 +1217,77 @@ function createStationPrintingController(deps = {}) {
 
   /**
    * Sign this device out via POST /deregister.
-   * v1.29 / L10-I4: on 409 UPDATE_CONFLICT retry up to 2 more times with ~1s then
-   * ~3s backoff. If still conflicting, keep credentials/session, show
-   * MSG_DEREGISTER_UPDATE_CONFLICT, leave the UI enabled (no pairing auto-block).
-   * Clear local auth only on 2xx success, 404 AGENT_NOT_FOUND, or 401.
+   * v1.29 / L10-I4 / R15D: on UPDATE_CONFLICT, 5xx, 429, or network failure retry
+   * up to 2 more times (~1s then ~3s). Exhausted / other failures keep the
+   * session and show MSG_DEREGISTER_UPDATE_CONFLICT (never raw "Request failed").
+   * Clear local auth only on 2xx, 404 AGENT_NOT_FOUND, or 401.
+   * R15D-L2: one in-flight deregister shared across concurrent callers (like register).
    */
-  async function deregister() {
-    const DEREGISTER_UPDATE_MAX_ATTEMPTS = 3;
-    const DEREGISTER_UPDATE_BACKOFF_MS = [1000, 3000];
+  let deregisterInFlight = null;
+
+  function isDeregisterRetryable(result) {
+    if (result == null) return true; // network / thrown request
+    if (
+      result.updateConflict === true ||
+      result.code === ERROR_CODES.UPDATE_CONFLICT
+    ) {
+      return true;
+    }
+    const status = result.status != null ? Number(result.status) : null;
+    if (status === 429) return true;
+    if (status != null && status >= 500 && status < 600) return true;
+    return false;
+  }
+
+  function deregisterKeepFailure(result, extras = {}) {
+    const status = result && result.status != null ? Number(result.status) : null;
+    const code =
+      (result && result.code) ||
+      (result && result.error && result.error.code) ||
+      extras.code ||
+      "DEREGISTER_FAILED";
+    const message = MSG_DEREGISTER_UPDATE_CONFLICT;
+    try {
+      log(
+        `Deregister failed (${status != null ? status : "network"}): ${message}`,
+        "⚠️"
+      );
+    } catch (_) {}
+    onStateChange(publicHostState());
+    return {
+      ok: false,
+      needsPairing: false,
+      status,
+      code,
+      error: { code, message },
+      message,
+      ...extras,
+    };
+  }
+
+  async function deregisterOnce() {
+    const DEREGISTER_MAX_ATTEMPTS = 3;
+    const DEREGISTER_BACKOFF_MS = [1000, 3000];
     let result = null;
-    for (let attempt = 1; attempt <= DEREGISTER_UPDATE_MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= DEREGISTER_MAX_ATTEMPTS; attempt++) {
       try {
         result = await api.deregister({ reason: "explicit_deregister" });
       } catch (_) {
+        // Thrown request must never be treated as success (R15D-I4 / V20).
         result = null;
       }
-      const isUpdateConflict =
-        result &&
-        (result.updateConflict === true ||
-          result.code === ERROR_CODES.UPDATE_CONFLICT);
-      if (!isUpdateConflict) break;
-      if (attempt >= DEREGISTER_UPDATE_MAX_ATTEMPTS) break;
-      const delay = DEREGISTER_UPDATE_BACKOFF_MS[attempt - 1] || 3000;
+      if (!isDeregisterRetryable(result)) break;
+      if (attempt >= DEREGISTER_MAX_ATTEMPTS) break;
+      const delay = DEREGISTER_BACKOFF_MS[attempt - 1] || 3000;
       try {
+        const label =
+          result == null
+            ? "network"
+            : result.updateConflict || result.code === ERROR_CODES.UPDATE_CONFLICT
+              ? "UPDATE_CONFLICT"
+              : `HTTP ${result.status}`;
         log(
-          `Deregister UPDATE_CONFLICT (attempt ${attempt}/${DEREGISTER_UPDATE_MAX_ATTEMPTS}) — retry in ${delay}ms.`,
+          `Deregister ${label} (attempt ${attempt}/${DEREGISTER_MAX_ATTEMPTS}) — retry in ${delay}ms.`,
           "⚠️"
         );
       } catch (_) {}
@@ -1261,6 +1307,7 @@ function createStationPrintingController(deps = {}) {
       "";
 
     // Already gone / token rejected — safe to clear locally.
+    // 403 and other 404s must NOT clear (R15D-I4 / V9 / V10).
     if (
       status === 401 ||
       (status === 404 && String(code) === ERROR_CODES.AGENT_NOT_FOUND)
@@ -1271,48 +1318,35 @@ function createStationPrintingController(deps = {}) {
       return { ok: true, needsPairing: true, clearedOn: status };
     }
 
-    // v1.29: UPDATE_CONFLICT after retries — keep session; please try again.
     if (
       result &&
       (result.updateConflict === true ||
         result.code === ERROR_CODES.UPDATE_CONFLICT)
     ) {
-      const message = MSG_DEREGISTER_UPDATE_CONFLICT;
-      try {
-        log(`Deregister conflicted: ${message}`, "⚠️");
-      } catch (_) {}
-      onStateChange(publicHostState());
-      return {
-        ok: false,
+      return deregisterKeepFailure(result, {
         updateConflict: true,
         retriesExhausted: true,
-        needsPairing: false,
         code: ERROR_CODES.UPDATE_CONFLICT,
-        error: {
-          code: ERROR_CODES.UPDATE_CONFLICT,
-          message,
-        },
-        message,
-      };
+      });
     }
 
-    // Any other failure — keep credentials (server may still have the agent).
-    const message =
-      (result && result.error && result.error.message) ||
-      (result && result.message) ||
-      MSG_DEREGISTER_UPDATE_CONFLICT;
-    try {
-      log(`Deregister failed (${status || "network"}): ${message}`, "⚠️");
-    } catch (_) {}
-    onStateChange(publicHostState());
-    return {
-      ok: false,
-      needsPairing: false,
-      status,
-      code: code || "DEREGISTER_FAILED",
-      error: { code: code || "DEREGISTER_FAILED", message },
-      message,
-    };
+    // Any other failure (403, other 409s, exhausted 5xx/429/network, …) — keep session.
+    return deregisterKeepFailure(result, {
+      retriesExhausted: isDeregisterRetryable(result),
+    });
+  }
+
+  async function deregister() {
+    if (deregisterInFlight) return deregisterInFlight;
+    const p = deregisterOnce().finally(() => {
+      if (deregisterInFlight === p) deregisterInFlight = null;
+    });
+    deregisterInFlight = p;
+    return p;
+  }
+
+  function isDeregisterInFlight() {
+    return Boolean(deregisterInFlight);
   }
 
   /**
@@ -1756,6 +1790,7 @@ function createStationPrintingController(deps = {}) {
     allowManualRegister,
     joinAsBackupDevice,
     isRegisterInFlight,
+    isDeregisterInFlight,
     ensureSession,
     heartbeat,
     deregister,

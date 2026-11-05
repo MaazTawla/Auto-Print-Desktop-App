@@ -377,6 +377,209 @@ describe("station-printing controller", () => {
     }
   });
 
+  it("R15D-I4/V9: 403 does not clear local auth", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok-403",
+      pairing_code: "PAIR",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 3,
+    });
+    const ctrl = createStationPrintingController({
+      ...store,
+      request: async () => ({
+        status: 403,
+        data: { error: { code: "BRANCH_MISMATCH", message: "Request failed (403)" } },
+        headers: {},
+      }),
+      log: () => {},
+      sleep: async () => {},
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 3 });
+    const res = await ctrl.deregister();
+    assert.equal(res.ok, false);
+    assert.equal(res.needsPairing, false);
+    assert.equal(store.get().agent_token, "tok-403");
+    assert.equal(store.get().is_print_host, true);
+    assert.equal(ctrl.api.getToken(), "tok-403");
+    assert.match(res.message, /Couldn't sign this device out, please try again/i);
+  });
+
+  it("R15D-I4/V10: 404 without AGENT_NOT_FOUND does not clear", async () => {
+    for (const data of [
+      { message: "Not Found" },
+      { error: { code: "ROUTE_NOT_FOUND", message: "x" } },
+    ]) {
+      const store = memoryStore({
+        agent_api_base: "https://api.example.com",
+        agent_token: "tok-404",
+        pairing_code: "PAIR",
+        branch_id: "147",
+        is_print_host: true,
+        host_epoch: 3,
+      });
+      const ctrl = createStationPrintingController({
+        ...store,
+        request: async () => ({ status: 404, data, headers: {} }),
+        log: () => {},
+        sleep: async () => {},
+      });
+      ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 3 });
+      const res = await ctrl.deregister();
+      assert.equal(res.ok, false);
+      assert.equal(store.get().agent_token, "tok-404");
+      assert.equal(ctrl.api.getToken(), "tok-404");
+      assert.match(res.message, /Couldn't sign this device out, please try again/i);
+    }
+  });
+
+  it("R15D-I4/V13: other failures (PAIRING_BUSY 409) do not clear", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok-busy",
+      pairing_code: "PAIR",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 3,
+    });
+    let calls = 0;
+    const ctrl = createStationPrintingController({
+      ...store,
+      request: async () => {
+        calls += 1;
+        return {
+          status: 409,
+          data: { error: { code: "PAIRING_BUSY", message: "Request failed (409)" } },
+          headers: {},
+        };
+      },
+      log: () => {},
+      sleep: async () => {},
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 3 });
+    const res = await ctrl.deregister();
+    assert.equal(calls, 1, "non-retryable 409 is a single attempt");
+    assert.equal(res.ok, false);
+    assert.equal(store.get().agent_token, "tok-busy");
+    assert.match(res.message, /Couldn't sign this device out, please try again/i);
+    assert.doesNotMatch(res.message, /Request failed/i);
+  });
+
+  it("R15D-I4/V20: thrown request is never treated as success", async () => {
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok-throw",
+      pairing_code: "PAIR",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 3,
+    });
+    let calls = 0;
+    const sleeps = [];
+    const ctrl = createStationPrintingController({
+      ...store,
+      request: async () => {
+        calls += 1;
+        const e = new Error("ECONNREFUSED");
+        e.code = "ECONNREFUSED";
+        throw e;
+      },
+      log: () => {},
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 3 });
+    const res = await ctrl.deregister();
+    assert.equal(res.ok, false, "throw must not clear / succeed");
+    assert.equal(res.needsPairing, false);
+    assert.equal(store.get().agent_token, "tok-throw");
+    assert.equal(ctrl.api.getToken(), "tok-throw");
+    assert.equal(calls, 3, "network throws retry like UPDATE_CONFLICT");
+    assert.deepEqual(sleeps, [1000, 3000]);
+    assert.match(res.message, /Couldn't sign this device out, please try again/i);
+  });
+
+  it("R15D-I2: 5xx and 429 retry then keep session with friendly message", async () => {
+    for (const [status, data] of [
+      [500, { message: "Server error" }],
+      [503, "<html>bad</html>"],
+      [429, { error: { code: "RATE_LIMITED" } }],
+    ]) {
+      const store = memoryStore({
+        agent_api_base: "https://api.example.com",
+        agent_token: "tok-5xx",
+        pairing_code: "PAIR",
+        branch_id: "147",
+        is_print_host: true,
+        host_epoch: 3,
+      });
+      let calls = 0;
+      const sleeps = [];
+      const ctrl = createStationPrintingController({
+        ...store,
+        request: async () => {
+          calls += 1;
+          return { status, data, headers: {} };
+        },
+        log: () => {},
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      });
+      ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 3 });
+      const res = await ctrl.deregister();
+      assert.equal(calls, 3, String(status));
+      assert.deepEqual(sleeps, [1000, 3000], String(status));
+      assert.equal(res.ok, false, String(status));
+      assert.equal(store.get().agent_token, "tok-5xx", String(status));
+      assert.match(res.message, /Couldn't sign this device out, please try again/i);
+    }
+  });
+
+  it("R15D-L2: concurrent deregister shares one in-flight loop", async () => {
+    let release;
+    const gate = new Promise((r) => {
+      release = r;
+    });
+    const store = memoryStore({
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      pairing_code: "PAIR",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 7,
+    });
+    let calls = 0;
+    const ctrl = createStationPrintingController({
+      ...store,
+      request: async () => {
+        calls += 1;
+        return {
+          status: 409,
+          data: { error: { code: "UPDATE_CONFLICT", message: "x" } },
+          headers: {},
+        };
+      },
+      log: () => {},
+      sleep: async () => {
+        await gate;
+      },
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 7 });
+    const a = ctrl.deregister();
+    const b = ctrl.deregister();
+    assert.equal(ctrl.isDeregisterInFlight(), true);
+    await new Promise((r) => setImmediate(r));
+    release();
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.equal(calls, 3, "shared in-flight must not double the loop");
+    assert.equal(ra.ok, false);
+    assert.equal(rb.ok, false);
+    assert.equal(store.get().agent_token, "tok");
+  });
+
   it("v1.29 sync UPDATE_CONFLICT is one attempt (not SYNC_CONFLICT retry loop)", async () => {
     // Mutation: treating UPDATE_CONFLICT as SYNC_CONFLICT would call 3 times + sleep.
     const store = memoryStore({
