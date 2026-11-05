@@ -8,6 +8,7 @@ const {
   MANUAL_HOST_MAX,
   codePointLength,
   truncateAtGraphemeBoundary,
+  truncateByCodePoints,
   capExternalId,
   capStatus,
   capSyncPrinterRow,
@@ -162,15 +163,15 @@ describe("L13-L1 mutations (wiring)", () => {
   const root = path.join(__dirname, "..");
   const rd = (f) => fs.readFileSync(path.join(root, f), "utf8");
 
-  it("manual form has maxlength 255/253 and visible hints", () => {
+  it("manual form has maxlength 510/506 (UTF-16) and visible code-point hints", () => {
     const html = rd("index.html");
     assert.match(
       html,
-      /id="settings-manual-printer-name"[^>]*maxlength="255"/
+      /id="settings-manual-printer-name"[^>]*maxlength="510"/
     );
     assert.match(
       html,
-      /id="settings-manual-printer-host"[^>]*maxlength="253"/
+      /id="settings-manual-printer-host"[^>]*maxlength="506"/
     );
     assert.match(html, /Max 255 characters/);
     assert.match(html, /Max 253 characters/);
@@ -233,5 +234,147 @@ describe("L13-L1 syncPrintersToServer 422 names printer", () => {
     assert.equal(res.ok, false);
     assert.match(String(res.error && res.error.message), /LongNamePrinter/);
     assert.match(String(res.message || (res.error && res.error.message)), /LongNamePrinter/);
+  });
+});
+
+
+describe("R20D-L2 oversized grapheme", () => {
+  it("never returns empty for a single grapheme longer than the budget", () => {
+    const huge = "e" + "\u0301".repeat(400);
+    const out = truncateAtGraphemeBoundary(huge, 16);
+    assert.ok(out.length > 0);
+    assert.ok(codePointLength(out) <= 16);
+    assert.ok(huge.startsWith(out) || out === truncateByCodePoints(huge, 16));
+    const status = capStatus("e" + "\u0301".repeat(40));
+    assert.ok(String(status).length > 0);
+    assert.ok(codePointLength(status) <= 16);
+  });
+});
+
+describe("R20D-I1 mutant killers (wiring)", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const root = path.join(__dirname, "..");
+  const rd = (f) => fs.readFileSync(path.join(root, f), "utf8");
+
+  it("W7: set-printer-mapping checks validateManualPrinterName", () => {
+    const src = rd("src/main.js");
+    const i = src.indexOf('ipcMain.handle("set-printer-mapping"');
+    assert.ok(i >= 0);
+    const slice = src.slice(i, i + 2500);
+    assert.match(slice, /validateManualPrinterName/);
+    assert.match(slice, /FIELD_TOO_LONG/);
+  });
+
+  it("H3: client-side form name check uses codePointLen > 255", () => {
+    const html = rd("index.html");
+    assert.match(html, /codePointLen\(name\) > 255/);
+    assert.match(html, /Name must be at most 255 characters/);
+  });
+
+  it("S2: add-discovered-printer reports failed sync", () => {
+    const src = rd("src/main.js");
+    const i = src.indexOf('ipcMain.handle("add-discovered-printer"');
+    assert.ok(i >= 0);
+    assert.match(src.slice(i, i + 6000), /sync && sync\.ok === false && !sync\.skipped/);
+  });
+
+  it("W3: registry upsert stores capped external_id (fails if upsert skips cap)", () => {
+    const { createPrinterRegistry } = require("../src/printer-registry");
+    const raw = "win:" + "Z".repeat(300);
+    const r = createPrinterRegistry();
+    const row = r.upsert({ external_id: raw, name: "Z" });
+    assert.equal(row.external_id, capExternalId(raw));
+    assert.equal(codePointLength(row.external_id), 255);
+    assert.ok(r.get(raw), "get(raw) must resolve via normalize");
+    assert.ok(r.get(capExternalId(raw)));
+  });
+});
+
+describe("R20D-I2 persistent sync 422 state", () => {
+  const { createStationPrintingController } = require("../src/station-printing");
+
+  it("keeps named printerSyncError until success or remove", async () => {
+    let cfg = {
+      agent_api_base: "https://api.example.com",
+      agent_token: "tok",
+      pairing_code: "",
+      branch_id: "147",
+      is_print_host: true,
+      host_epoch: 1,
+    };
+    let fail = true;
+    const ctrl = createStationPrintingController({
+      readConfig: () => ({ ...cfg }),
+      writeConfig: (p) => {
+        cfg = { ...cfg, ...p };
+      },
+      request: async () => {
+        if (fail) {
+          return {
+            status: 422,
+            data: {
+              error: {
+                code: "VALIDATION_ERROR",
+                message: "The given data was invalid.",
+                details: {
+                  "printers.0.name": [
+                    "The printers.0.name may not be greater than 255 characters.",
+                  ],
+                },
+              },
+            },
+            headers: {},
+          };
+        }
+        return {
+          status: 200,
+          data: { printers: [] },
+          headers: {},
+        };
+      },
+      log: () => {},
+      sleep: async () => {},
+    });
+    ctrl.policy.applyServerState({ is_print_host: true, host_epoch: 1 });
+    ctrl.printers.upsert({
+      external_id: "win:Sticky",
+      name: "StickyPrinter",
+      connection: "usb",
+      status: "online",
+    });
+    const res = await ctrl.syncPrintersToServer({ force: true });
+    assert.equal(res.ok, false);
+    const st1 = ctrl.publicHostState();
+    assert.ok(st1.printerSyncError);
+    assert.match(String(st1.printerSyncError.message), /StickyPrinter/);
+    // Persists across subsequent state reads
+    assert.match(
+      String(ctrl.publicHostState().printerSyncError.message),
+      /StickyPrinter/
+    );
+    // Cleared on successful sync
+    fail = false;
+    const ok = await ctrl.syncPrintersToServer({ force: true });
+    assert.equal(ok.ok, true);
+    assert.equal(ctrl.publicHostState().printerSyncError, null);
+
+    // Set again then clear on remove
+    fail = true;
+    await ctrl.syncPrintersToServer({ force: true });
+    assert.ok(ctrl.publicHostState().printerSyncError);
+    ctrl.removeManagedPrinter("win:Sticky");
+    assert.equal(ctrl.publicHostState().printerSyncError, null);
+  });
+
+  it("settings UI renders persistent printerSyncError banner", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const html = fs.readFileSync(
+      path.join(__dirname, "..", "index.html"),
+      "utf8"
+    );
+    assert.match(html, /id="settings-printer-sync-err"/);
+    assert.match(html, /printerSyncError/);
   });
 });
