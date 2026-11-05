@@ -13,6 +13,10 @@ const {
 const {
   capExternalId,
   capSyncPrinterRow,
+  sanitizePrinterName,
+  sanitizePort,
+  capStatus,
+  codePointLength,
 } = require("./printer-field-limits");
 
 /**
@@ -81,8 +85,13 @@ function migrateStoredAliases(existing) {
     if (cappedKey.toLowerCase() !== cappedVal.toLowerCase()) {
       out[cappedKey.toLowerCase()] = cappedVal;
     }
+    // Lookups always normalize/cap first, so a raw key over 255 is never
+    // consulted — drop it so migration is idempotent (R21D-I2).
     const rawKeyLower = rawKey.toLowerCase();
-    if (rawKeyLower !== cappedKey.toLowerCase()) {
+    if (
+      rawKeyLower !== cappedKey.toLowerCase() &&
+      codePointLength(rawKey) <= 255
+    ) {
       out[rawKeyLower] = cappedVal;
     }
   }
@@ -136,13 +145,29 @@ function createPrinterRegistry(initial = {}) {
       printer.connection ||
       (prev && prev.connection) ||
       "lan";
+    const rawName =
+      printer.name != null
+        ? String(printer.name)
+        : windowsName || (prev && prev.name) || "";
+    const cleanedName = sanitizePrinterName(rawName) || externalId;
+    const statusRaw =
+      printer.status != null
+        ? printer.status
+        : (prev && prev.status) || "online";
+    const portRaw =
+      printer.port != null
+        ? printer.port
+        : prev && prev.port != null
+          ? prev.port
+          : null;
+    const port = sanitizePort(portRaw);
     const row = {
       external_id: externalId,
-      name: String(printer.name || windowsName).trim() || externalId,
+      name: cleanedName,
       windows_name: windowsName || (prev && prev.windows_name) || externalId,
       connection,
       connection_type: connection,
-      status: printer.status || (prev && prev.status) || "online",
+      status: capStatus(statusRaw) || "online",
       status_detail:
         printer.status_detail != null
           ? String(printer.status_detail)
@@ -158,10 +183,7 @@ function createPrinterRegistry(initial = {}) {
         printer.ip_address != null
           ? String(printer.ip_address)
           : (prev && prev.ip_address) || null,
-      port:
-        printer.port != null && Number.isFinite(Number(printer.port))
-          ? Number(printer.port)
-          : (prev && prev.port) || null,
+      port: port != null ? port : null,
       // Server-assigned numeric id from printers/sync
       server_id:
         printer.server_id != null
@@ -319,10 +341,13 @@ function createPrinterRegistry(initial = {}) {
   }
 
   function routeMessage(msg) {
-    const externalId =
-      msg && msg.printer_external_id
-        ? normalizeExternalId(msg.printer_external_id)
+    // Keep the trimmed ORIGINAL id for name_fallback (R21D-L1). Hashing it
+    // first broke bare Windows names over 251 chars that used to match.
+    const rawPrinterId =
+      msg && msg.printer_external_id != null
+        ? String(msg.printer_external_id).trim()
         : "";
+    const externalId = rawPrinterId ? normalizeExternalId(rawPrinterId) : "";
     if (externalId) {
       const resolved = resolveEidAlias(externalId, eidAliases);
       let found = byExternalId.get(resolved) || byExternalId.get(externalId);
@@ -336,9 +361,20 @@ function createPrinterRegistry(initial = {}) {
           normalizeExternalId(windowsPrinterExternalId(externalId))
         );
       }
+      if (!found && rawPrinterId && !/^win:/i.test(rawPrinterId)) {
+        found = byExternalId.get(
+          normalizeExternalId(windowsPrinterExternalId(rawPrinterId))
+        );
+      }
       if (found) return { ok: true, printer: found, matchedBy: "external_id" };
+      const bare = rawPrinterId.replace(/^win:/i, "");
       for (const row of byExternalId.values()) {
-        if (row.windows_name === externalId || row.name === externalId) {
+        if (
+          row.windows_name === rawPrinterId ||
+          row.name === rawPrinterId ||
+          (bare &&
+            (row.windows_name === bare || row.name === bare))
+        ) {
           return { ok: true, printer: row, matchedBy: "name_fallback" };
         }
       }
@@ -362,15 +398,12 @@ function createPrinterRegistry(initial = {}) {
         name: p.name,
         connection: p.connection,
         connection_type: p.connection_type || p.connection,
-        status: p.status === "out_of_paper" ? "error" : p.status,
-        status_detail:
-          p.status === "out_of_paper"
-            ? p.status_detail || "Out of paper"
-            : p.status_detail,
+        status: p.status,
+        status_detail: p.status_detail,
         is_default: p.is_default,
         model: p.model,
         ip_address: p.ip_address,
-        ...(p.port != null ? { port: p.port } : {}),
+        ...(sanitizePort(p.port) != null ? { port: sanitizePort(p.port) } : {}),
       })
     );
   }

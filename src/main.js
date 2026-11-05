@@ -2312,10 +2312,8 @@ ipcMain.handle("set-printer-mapping", async (_e, opts) => {
       if (hostErr) {
         return { ok: false, error: hostErr, code: "NOT_PRINT_HOST" };
       }
-      const nameLenErr = lanHostValidation.validateManualPrinterName(o.name);
-      if (nameLenErr) {
-        return { ok: false, error: nameLenErr, code: "FIELD_TOO_LONG" };
-      }
+      const nameReject = lanHostValidation.rejectMappingIfNameTooLong(o.name);
+      if (nameReject) return nameReject;
       let connection = String(o.connection || "lan").trim() || "lan";
       let externalId = String(o.externalId).trim();
       let host = String(o.host || o.ip_address || "").trim();

@@ -1,9 +1,10 @@
 /**
  * BE v1.32 (lockout13) printer field caps for printers/sync.
  * name/model/status_detail/ip_address/host/external_id: 255 code points;
- * status: 16. Manual host entry capped at 253 (DNS). Truncation cuts at a
- * grapheme boundary under the code-point budget (same dual-cap pattern as
- * device_label). Over-long external_id gets a stable hash suffix.
+ * status: online|offline|error (≤16). Manual host entry capped at 253 (DNS).
+ * Truncation cuts at a grapheme boundary under the code-point budget (same
+ * dual-cap pattern as device_label). Over-long external_id gets a stable
+ * hash suffix. Names: strip ZW/BOM then blank→fallback (BE v1.33).
  */
 "use strict";
 
@@ -84,12 +85,49 @@ function capExternalId(raw, maxCodePoints = PRINTER_FIELD_MAX) {
   return truncateAtGraphemeBoundary(s, budget) + suffix;
 }
 
+/** Zero-width / BOM / word-joiner code points stripped before blank check. */
+const NAME_INVISIBLE_CPS = new Set([
+  0x200b, // ZWSP
+  0x200c, // ZWNJ
+  0x200d, // ZWJ
+  0x2060, // WJ
+  0xfeff, // BOM
+]);
+
+/**
+ * Strip invisible/ZW characters, then trim (incl. NBSP). Empty → "".
+ * Used before the blank check so NBSP/ZWSP-only names fall back to the id.
+ */
+function sanitizePrinterName(raw) {
+  if (raw == null) return "";
+  let s = Array.from(String(raw))
+    .filter((ch) => !NAME_INVISIBLE_CPS.has(ch.codePointAt(0)))
+    .join("");
+  // NBSP and other Unicode spaces: turn into regular space then trim.
+  s = s.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+  return s;
+}
+
+/**
+ * BE v1.33 status vocabulary (case-insensitive). Anything else → "error".
+ * Still hard-capped at 16 code points as a guard.
+ */
 function capStatus(raw) {
   if (raw == null) return raw;
-  const s = String(raw);
-  // Keep known vocabulary short; still hard-cap at 16 as a guard.
-  const mapped = s === "out_of_paper" ? "error" : s;
+  const s = String(raw).trim().toLowerCase();
+  let mapped;
+  if (s === "online" || s === "offline" || s === "error") mapped = s;
+  else if (s === "out_of_paper") mapped = "error";
+  else mapped = "error";
   return truncateAtGraphemeBoundary(mapped, PRINTER_STATUS_MAX);
+}
+
+/** Port for the wire: integer 1..65535, else omit (undefined). */
+function sanitizePort(raw) {
+  if (raw == null || raw === "") return undefined;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return undefined;
+  return n;
 }
 
 function capOptionalField(raw, max = PRINTER_FIELD_MAX) {
@@ -105,18 +143,44 @@ function capSyncPrinterRow(row) {
   if (!row || typeof row !== "object") return row;
   const out = { ...row };
   if (out.external_id != null) out.external_id = capExternalId(out.external_id);
-  if (out.name != null) out.name = truncateAtGraphemeBoundary(String(out.name), PRINTER_FIELD_MAX);
+  if (out.name != null) {
+    const cleaned = sanitizePrinterName(out.name);
+    const fallback =
+      out.external_id != null ? String(out.external_id) : "";
+    out.name = truncateAtGraphemeBoundary(
+      cleaned || fallback,
+      PRINTER_FIELD_MAX
+    );
+  }
   if (out.model != null) out.model = capOptionalField(out.model);
   if (out.status_detail != null) out.status_detail = capOptionalField(out.status_detail);
   if (out.ip_address != null) out.ip_address = capOptionalField(out.ip_address);
   if (out.host != null) out.host = capOptionalField(out.host);
   if (out.status != null) out.status = capStatus(out.status);
+  if ("port" in out) {
+    const port = sanitizePort(out.port);
+    if (port === undefined) delete out.port;
+    else out.port = port;
+  }
   return out;
 }
 
 function validateManualPrinterName(name) {
   const s = String(name == null ? "" : name);
   if (codePointLength(s) > PRINTER_FIELD_MAX) return NAME_TOO_LONG;
+  return null;
+}
+
+/**
+ * Gate for set-printer-mapping: reject over-long names before upsert/sync.
+ * Returns a ready-to-return IPC failure object, or null when the name is OK.
+ * Keeps the if(nameLenErr) return in one place so the if(false) mutant dies.
+ */
+function rejectMappingIfNameTooLong(name) {
+  const nameLenErr = validateManualPrinterName(name);
+  if (nameLenErr) {
+    return { ok: false, error: nameLenErr, code: "FIELD_TOO_LONG" };
+  }
   return null;
 }
 
@@ -213,10 +277,13 @@ module.exports = {
   truncateAtGraphemeBoundary,
   truncateByCodePoints,
   capExternalId,
+  sanitizePrinterName,
+  sanitizePort,
   capStatus,
   capOptionalField,
   capSyncPrinterRow,
   validateManualPrinterName,
+  rejectMappingIfNameTooLong,
   validateManualPrinterHost,
   validateManualLanExternalId,
   formatPrinterSyncValidationError,

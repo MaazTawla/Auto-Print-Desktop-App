@@ -10,6 +10,7 @@ const {
   validateManualPrinterHost,
   validateManualPrinterName,
   validateManualLanExternalId,
+  rejectMappingIfNameTooLong,
   MANUAL_HOST_MAX,
   PRINTER_FIELD_MAX,
 } = require("./printer-field-limits");
@@ -78,5 +79,6 @@ module.exports = {
   validateManualLan,
   validateManualPrinterName,
   validateManualPrinterHost,
+  rejectMappingIfNameTooLong,
   assertPrintHostCanAdd,
 };
