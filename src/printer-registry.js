@@ -13,9 +13,9 @@ const {
 const {
   capExternalId,
   capSyncPrinterRow,
-  sanitizePrinterName,
+  resolvePrinterName,
   sanitizePort,
-  capStatus,
+  normalizeStatusFields,
   codePointLength,
 } = require("./printer-field-limits");
 
@@ -149,29 +149,32 @@ function createPrinterRegistry(initial = {}) {
       printer.name != null
         ? String(printer.name)
         : windowsName || (prev && prev.name) || "";
-    const cleanedName = sanitizePrinterName(rawName) || externalId;
+    const cleanedName = resolvePrinterName(rawName, externalId);
     const statusRaw =
       printer.status != null
         ? printer.status
         : (prev && prev.status) || "online";
-    const portRaw =
-      printer.port != null
-        ? printer.port
-        : prev && prev.port != null
-          ? prev.port
+    const detailIn =
+      printer.status_detail != null
+        ? String(printer.status_detail)
+        : prev && prev.status_detail != null
+          ? prev.status_detail
           : null;
-    const port = sanitizePort(portRaw);
+    const statusFields = normalizeStatusFields(statusRaw, detailIn);
+    // R22D-L3: invalid incoming port keeps the previously stored port.
+    let port = prev && prev.port != null ? prev.port : null;
+    if (Object.prototype.hasOwnProperty.call(printer, "port")) {
+      const sanitized = sanitizePort(printer.port);
+      if (sanitized !== undefined) port = sanitized;
+    }
     const row = {
       external_id: externalId,
       name: cleanedName,
       windows_name: windowsName || (prev && prev.windows_name) || externalId,
       connection,
       connection_type: connection,
-      status: capStatus(statusRaw) || "online",
-      status_detail:
-        printer.status_detail != null
-          ? String(printer.status_detail)
-          : (prev && prev.status_detail) || null,
+      status: statusFields.status || "online",
+      status_detail: statusFields.status_detail,
       is_default: Boolean(printer.is_default ?? printer.isDefault),
       model:
         printer.model != null

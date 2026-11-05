@@ -85,28 +85,54 @@ function capExternalId(raw, maxCodePoints = PRINTER_FIELD_MAX) {
   return truncateAtGraphemeBoundary(s, budget) + suffix;
 }
 
-/** Zero-width / BOM / word-joiner code points stripped before blank check. */
-const NAME_INVISIBLE_CPS = new Set([
+/**
+ * Blank-making code points stripped for the blank check only (R22D-L2).
+ * ZWJ (U+200D) and ZWNJ (U+200C) are kept so emoji sequences stay intact.
+ */
+const NAME_BLANK_STRIP_CPS = new Set([
   0x200b, // ZWSP
-  0x200c, // ZWNJ
-  0x200d, // ZWJ
   0x2060, // WJ
   0xfeff, // BOM
 ]);
 
 /**
- * Strip invisible/ZW characters, then trim (incl. NBSP). Empty → "".
- * Used before the blank check so NBSP/ZWSP-only names fall back to the id.
+ * Copy used only for the blank check: strip ZWSP/WJ/BOM, treat NBSP as a
+ * normal space, then trim. Does not collapse inner spaces on the value we keep.
  */
-function sanitizePrinterName(raw) {
+function printerNameBlankCheck(raw) {
   if (raw == null) return "";
-  let s = Array.from(String(raw))
-    .filter((ch) => !NAME_INVISIBLE_CPS.has(ch.codePointAt(0)))
-    .join("");
-  // NBSP and other Unicode spaces: turn into regular space then trim.
-  s = s.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-  return s;
+  return Array.from(String(raw))
+    .filter((ch) => !NAME_BLANK_STRIP_CPS.has(ch.codePointAt(0)))
+    .join("")
+    .replace(/\u00a0/g, " ")
+    .trim();
 }
+
+/**
+ * If the blank-check copy is empty, return fallbackId. Otherwise return the
+ * original with only end spaces trimmed (no inner collapse; ZWJ/ZWNJ kept).
+ */
+function resolvePrinterName(raw, fallbackId) {
+  const fallback = fallbackId != null ? String(fallbackId) : "";
+  if (raw == null) return fallback;
+  const original = String(raw);
+  if (printerNameBlankCheck(original) === "") return fallback;
+  // Trim ordinary end spaces only — do not collapse "A  B", do not strip ZWJ.
+  return original.replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, "");
+}
+
+/** @deprecated blank-check form; prefer resolvePrinterName for stored values. */
+function sanitizePrinterName(raw) {
+  return printerNameBlankCheck(raw);
+}
+
+/** Known raw statuses → default status_detail when clamping to error (R22D-L1). */
+const KNOWN_STATUS_DETAILS = {
+  out_of_paper: "Out of paper",
+  paper_out: "Out of paper",
+  paperout: "Out of paper",
+  outofpaper: "Out of paper",
+};
 
 /**
  * BE v1.33 status vocabulary (case-insensitive). Anything else → "error".
@@ -114,20 +140,52 @@ function sanitizePrinterName(raw) {
  */
 function capStatus(raw) {
   if (raw == null) return raw;
-  const s = String(raw).trim().toLowerCase();
-  let mapped;
-  if (s === "online" || s === "offline" || s === "error") mapped = s;
-  else if (s === "out_of_paper") mapped = "error";
-  else mapped = "error";
-  return truncateAtGraphemeBoundary(mapped, PRINTER_STATUS_MAX);
+  return normalizeStatusFields(raw, null).status;
 }
 
-/** Port for the wire: integer 1..65535, else omit (undefined). */
+/**
+ * Clamp status and preserve/fill detail (R22D-L1). Never replaces an existing
+ * non-empty detail with null. out_of_paper → error + "Out of paper".
+ */
+function normalizeStatusFields(status, statusDetail) {
+  const lower =
+    status == null ? "" : String(status).trim().toLowerCase();
+  const existing =
+    statusDetail != null && String(statusDetail).trim() !== ""
+      ? String(statusDetail)
+      : null;
+  let next;
+  let detail = existing;
+  if (lower === "online" || lower === "offline" || lower === "error") {
+    next = lower;
+  } else if (KNOWN_STATUS_DETAILS[lower]) {
+    next = "error";
+    if (!detail) detail = KNOWN_STATUS_DETAILS[lower];
+  } else {
+    next = "error";
+  }
+  return {
+    status: truncateAtGraphemeBoundary(next, PRINTER_STATUS_MAX),
+    status_detail: detail,
+  };
+}
+
+/**
+ * Port for the wire / registry: integer number, or digit string /^[0-9]+$/,
+ * in 1..65535. Rejects booleans, hex, floats, padded strings (R22D-L3).
+ */
 function sanitizePort(raw) {
-  if (raw == null || raw === "") return undefined;
-  const n = typeof raw === "number" ? raw : Number(raw);
-  if (!Number.isInteger(n) || n < 1 || n > 65535) return undefined;
-  return n;
+  if (typeof raw === "number") {
+    if (!Number.isInteger(raw) || raw < 1 || raw > 65535) return undefined;
+    return raw;
+  }
+  if (typeof raw === "string") {
+    if (!/^[0-9]+$/.test(raw)) return undefined;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) return undefined;
+    return n;
+  }
+  return undefined;
 }
 
 function capOptionalField(raw, max = PRINTER_FIELD_MAX) {
@@ -144,19 +202,22 @@ function capSyncPrinterRow(row) {
   const out = { ...row };
   if (out.external_id != null) out.external_id = capExternalId(out.external_id);
   if (out.name != null) {
-    const cleaned = sanitizePrinterName(out.name);
     const fallback =
       out.external_id != null ? String(out.external_id) : "";
     out.name = truncateAtGraphemeBoundary(
-      cleaned || fallback,
+      resolvePrinterName(out.name, fallback),
       PRINTER_FIELD_MAX
     );
   }
   if (out.model != null) out.model = capOptionalField(out.model);
-  if (out.status_detail != null) out.status_detail = capOptionalField(out.status_detail);
   if (out.ip_address != null) out.ip_address = capOptionalField(out.ip_address);
   if (out.host != null) out.host = capOptionalField(out.host);
-  if (out.status != null) out.status = capStatus(out.status);
+  if (out.status != null || out.status_detail != null) {
+    const n = normalizeStatusFields(out.status, out.status_detail);
+    out.status = n.status;
+    out.status_detail =
+      n.status_detail != null ? capOptionalField(n.status_detail) : null;
+  }
   if ("port" in out) {
     const port = sanitizePort(out.port);
     if (port === undefined) delete out.port;
@@ -278,8 +339,11 @@ module.exports = {
   truncateByCodePoints,
   capExternalId,
   sanitizePrinterName,
+  printerNameBlankCheck,
+  resolvePrinterName,
   sanitizePort,
   capStatus,
+  normalizeStatusFields,
   capOptionalField,
   capSyncPrinterRow,
   validateManualPrinterName,
