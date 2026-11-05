@@ -6,7 +6,6 @@
 
 "use strict";
 
-const os = require("os");
 const crypto = require("crypto");
 const { createHostOnlyPolicy } = require("./host-only-policy");
 const { getOrCreateAppId } = require("./app-identity");
@@ -303,9 +302,6 @@ function createStationPrintingController(deps = {}) {
     };
   }
 
-  function defaultDeviceLabel() {
-    return deviceName.defaultDeviceName();
-  }
 
   function setApiBase(base) {
     const normalized = normalizeAgentApiBase(base);
