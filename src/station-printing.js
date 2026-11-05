@@ -1234,9 +1234,24 @@ function createStationPrintingController(deps = {}) {
       return true;
     }
     const status = result.status != null ? Number(result.status) : null;
-    if (status === 429) return true;
+    // R16D-I4: 408 matches heartbeat httpIsRetryable class.
+    if (status === 408 || status === 429) return true;
     if (status != null && status >= 500 && status < 600) return true;
     return false;
+  }
+
+  /** Cap 429 Retry-After for deregister backoff (R16D-I2). */
+  const DEREGISTER_RETRY_AFTER_MAX_MS = 10000;
+
+  function deregisterBackoffMs(attempt, result) {
+    const base = attempt <= 1 ? 1000 : 3000;
+    const status = result && result.status != null ? Number(result.status) : null;
+    if (status !== 429) return base;
+    const headers = (result && result.headers) || {};
+    const raw = headers["retry-after"] || headers["Retry-After"];
+    const ra = parseRetryAfterMs(raw, Date.now(), DEREGISTER_RETRY_AFTER_MAX_MS);
+    if (ra == null) return base;
+    return Math.max(base, ra);
   }
 
   function deregisterKeepFailure(result, extras = {}) {
@@ -1266,8 +1281,15 @@ function createStationPrintingController(deps = {}) {
   }
 
   async function deregisterOnce() {
+    // R16D-I5: no token → already signed out; never POST.
+    const cfg0 = readConfig();
+    const token = String(api.getToken() || cfg0.agent_token || "").trim();
+    if (!token) {
+      clearLocalAuth("deregister_no_token");
+      return { ok: true, needsPairing: true, alreadySignedOut: true };
+    }
+
     const DEREGISTER_MAX_ATTEMPTS = 3;
-    const DEREGISTER_BACKOFF_MS = [1000, 3000];
     let result = null;
     for (let attempt = 1; attempt <= DEREGISTER_MAX_ATTEMPTS; attempt++) {
       try {
@@ -1278,7 +1300,7 @@ function createStationPrintingController(deps = {}) {
       }
       if (!isDeregisterRetryable(result)) break;
       if (attempt >= DEREGISTER_MAX_ATTEMPTS) break;
-      const delay = DEREGISTER_BACKOFF_MS[attempt - 1] || 3000;
+      const delay = deregisterBackoffMs(attempt, result);
       try {
         const label =
           result == null

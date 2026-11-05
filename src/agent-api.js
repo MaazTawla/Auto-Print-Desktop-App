@@ -238,9 +238,13 @@ function createAgentApi(options = {}) {
       fields.reason != null
         ? { reason: String(fields.reason) }
         : {};
-    const { status, data } = await call("POST", ENDPOINTS.deregister, body);
+    const { status, data, headers } = await call(
+      "POST",
+      ENDPOINTS.deregister,
+      body
+    );
     if (status >= 200 && status < 300) {
-      return { ok: true, status, data };
+      return { ok: true, status, data, headers };
     }
     // v1.29: 409 UPDATE_CONFLICT — keep credentials; no pairing auto-block; no auto-loop.
     const updateConflict = parseUpdateConflictError(data, status);
@@ -253,6 +257,7 @@ function createAgentApi(options = {}) {
         error: updateConflict,
         message: updateConflict.message,
         data,
+        headers,
       };
     }
     const parsed = parseAgentError(data, status);
@@ -260,6 +265,7 @@ function createAgentApi(options = {}) {
       ok: false,
       status,
       data,
+      headers,
       error: parsed,
       code: parsed.code,
       message: parsed.message,

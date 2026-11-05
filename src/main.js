@@ -2109,10 +2109,11 @@ ipcMain.handle("deregister-print-agent", async () => {
       message: "Signed out of print agent on this device.",
       stationPrinting: st,
     };
-  } catch (err) {
+  } catch (_err) {
+    // R16D-I3: never surface raw exception text to the renderer.
     return {
       ok: false,
-      error: err.message || String(err) || "Couldn't sign this device out, please try again",
+      error: "Couldn't sign this device out, please try again",
       code: "DEREGISTER_FAILED",
     };
   }

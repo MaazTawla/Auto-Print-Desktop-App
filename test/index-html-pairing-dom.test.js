@@ -40,6 +40,7 @@ describe("index.html pairing UI (jsdom)", () => {
                     ? async () => ({ ...base, stationPrinting: { needsPairing: false, pairingCodeConfigured: true, agentTokenConfigured: !(deregRes && deregRes.ok) } })
                     : async () => ({ ok: true }),
         });
+        win.confirm = () => true; // R16D-I1: Sign out confirms before IPC
         win.matchMedia = win.matchMedia || (() => ({ matches: false, addListener() {}, addEventListener() {} }));
       },
     });
@@ -102,7 +103,7 @@ describe("index.html pairing UI (jsdom)", () => {
     assert.deepEqual(errs, []);
   });
 
-  it("R15D-L1 prep: Sign out this device shows when signed in and keeps enabled on failure", async () => {
+  it("Sign out this device shows when signed in and keeps enabled on failure (confirm OK)", async () => {
     const btn = d.getElementById("settings-agent-sign-out");
     assert.ok(btn, "Sign out button must exist");
     assert.match(btn.textContent, /Sign out this device/i);

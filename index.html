@@ -4516,32 +4516,46 @@
 
   document.getElementById('settings-agent-sign-out').addEventListener('click', async () => {
     const errEl = document.getElementById('settings-agent-err');
-    if (errEl) errEl.textContent = '';
     const btn = document.getElementById('settings-agent-sign-out');
+    if (btn && btn.dataset.busy) return;
+    // R16D-I1: confirm before removing this device from the branch.
+    const okConfirm = window.confirm(
+      "Sign out this device?\n\nThis removes this device from the branch. You will need to pair again to reconnect."
+    );
+    if (!okConfirm) return;
+    if (errEl) errEl.textContent = '';
     if (btn) {
       btn.dataset.busy = '1';
       btn.disabled = true;
     }
+    let signedOutOk = false;
     try {
       const res = await window.api.deregisterPrintAgent();
+      // R16D-L1: clear busy before applyState so visibility can update.
+      if (btn) delete btn.dataset.busy;
       try { applyState(await window.api.getState()); } catch (_) {}
       if (res && res.ok) {
+        signedOutOk = true;
         if (errEl) errEl.textContent = '';
         showToast(res.message || 'Signed out of print agent on this device.', 'success', 3400);
+        if (btn) {
+          btn.hidden = true;
+          btn.disabled = false;
+        }
       } else {
         const msg =
           (res && res.error) ||
           "Couldn't sign this device out, please try again";
         if (errEl) errEl.textContent = msg;
         showToast(msg, 'error', 4200);
-        // Leave button enabled so the user can retry (R15D-L1 prep).
         if (btn) {
           btn.disabled = false;
           btn.hidden = false;
         }
       }
-    } catch (err) {
-      const msg = (err && err.message) || "Couldn't sign this device out, please try again";
+    } catch (_err) {
+      // R16D-I3: never show raw exception text.
+      const msg = "Couldn't sign this device out, please try again";
       if (errEl) errEl.textContent = msg;
       showToast(msg, 'error', 4200);
       if (btn) {
@@ -4549,7 +4563,13 @@
         btn.hidden = false;
       }
     } finally {
-      if (btn) delete btn.dataset.busy;
+      if (btn) {
+        delete btn.dataset.busy;
+        if (signedOutOk) {
+          btn.hidden = true;
+          btn.disabled = false;
+        }
+      }
     }
   });
 
