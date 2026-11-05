@@ -565,10 +565,13 @@ describe("R22D mutations (survivor killers)", () => {
     assert.equal(filled.status_detail, "Out of paper");
     const kept = normalizeStatusFields("paused", "Door open");
     assert.equal(kept.status_detail, "Door open");
-    const onlineClears = normalizeStatusFields("online", "Door open"); // not provided
+    const onlineClears = normalizeStatusFields("online", "Door open", {
+      statusProvided: true,
+    });
     assert.equal(onlineClears.status_detail, null);
     const onlineFresh = normalizeStatusFields("online", "OK", {
       detailProvided: true,
+      statusProvided: true,
     });
     assert.equal(onlineFresh.status_detail, "OK");
   });
@@ -737,10 +740,12 @@ describe("R23D mutations (survivor killers)", () => {
   it("M1: offline without fresh detail clears; Windows fresh detail kept", () => {
     const cleared = normalizeStatusFields("offline", "stale", {
       detailProvided: false,
+      statusProvided: true,
     });
     assert.equal(cleared.status_detail, null);
     const fresh = normalizeStatusFields("offline", "offline", {
       detailProvided: true,
+      statusProvided: true,
     });
     assert.equal(fresh.status_detail, "offline");
   });
@@ -757,5 +762,106 @@ describe("R23D mutations (survivor killers)", () => {
     });
     assert.equal(n.status_detail, "Sensor trip");
     assert.notEqual(n.status_detail, "Out of paper");
+  });
+});
+
+describe("R24D-L1 / L2 / I1", () => {
+  it("R24D-L1: server sync without status_detail keeps local jam", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "error",
+      status_detail: "jam",
+    });
+    r.applyServerSync([
+      { external_id: "lan:a:9100", id: 42, name: "n", status: "error" },
+    ]);
+    assert.equal(r.get("lan:a:9100").status_detail, "jam");
+    assert.equal(r.get("lan:a:9100").server_id, 42);
+  });
+
+  it("R24D-L2: {server_id} only keeps offline unplugged detail", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "offline",
+      status_detail: "unplugged",
+    });
+    r.upsert({ external_id: "lan:a:9100", name: "n", server_id: 5 });
+    assert.equal(r.get("lan:a:9100").status, "offline");
+    assert.equal(r.get("lan:a:9100").status_detail, "unplugged");
+    assert.equal(r.get("lan:a:9100").server_id, 5);
+  });
+
+  it("R24D: offline then online clears; explicit null clears", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "offline",
+      status_detail: "unplugged",
+    });
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "online" });
+    assert.equal(r.get("lan:a:9100").status_detail, null);
+
+    const r2 = createPrinterRegistry();
+    r2.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "error",
+      status_detail: "jam",
+    });
+    r2.upsert({ external_id: "lan:a:9100", name: "n", status_detail: null });
+    assert.equal(r2.get("lan:a:9100").status_detail, null);
+  });
+});
+
+describe("R24D mutations (survivor killers)", () => {
+  it("L1: always-pass status_detail undefined must not wipe jam", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "error",
+      status_detail: "jam",
+    });
+    r.applyServerSync([
+      {
+        external_id: "lan:a:9100",
+        id: 1,
+        name: "n",
+        status: "error",
+        status_detail: undefined,
+      },
+    ]);
+    assert.equal(r.get("lan:a:9100").status_detail, "jam");
+  });
+
+  it("L2: status-less upsert must not clear offline detail", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "offline",
+      status_detail: "unplugged",
+    });
+    r.upsert({ external_id: "lan:a:9100", name: "Renamed" });
+    assert.equal(r.get("lan:a:9100").status_detail, "unplugged");
+  });
+
+  it("I1: explicit null still clears without a dead second branch", () => {
+    const n = normalizeStatusFields("error", null, {
+      detailProvided: true,
+      statusProvided: false,
+    });
+    assert.equal(n.status_detail, null);
+    // online + statusProvided with no detail key clears via statusProvided path
+    const o = normalizeStatusFields("online", "stale", {
+      statusProvided: true,
+      detailProvided: false,
+    });
+    assert.equal(o.status_detail, null);
   });
 });
