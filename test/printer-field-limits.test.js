@@ -18,6 +18,7 @@ const {
   resolvePrinterName,
   printerNameBlankCheck,
   normalizeStatusFields,
+  isStatusValueProvided,
   sanitizePort,
   validateManualPrinterHost,
   validateManualLanExternalId,
@@ -930,6 +931,66 @@ describe("R25D mutations (survivor killers)", () => {
       status_detail: "unplugged",
     });
     r.upsert({ external_id: "lan:a:9100", name: "n", status: null });
+    assert.equal(r.get("lan:a:9100").status, "offline");
+  });
+});
+
+describe("R26D-L1 blank status not provided", () => {
+  it("offline unplugged + status '' / '  ' stays offline unplugged", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "offline",
+      status_detail: "unplugged",
+    });
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "" });
+    assert.equal(r.get("lan:a:9100").status, "offline");
+    assert.equal(r.get("lan:a:9100").status_detail, "unplugged");
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "  " });
+    assert.equal(r.get("lan:a:9100").status, "offline");
+    assert.equal(r.get("lan:a:9100").status_detail, "unplugged");
+  });
+
+  it("invisible-only status and blank applyServerSync leave offline unplugged", () => {
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "offline",
+      status_detail: "unplugged",
+    });
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "\u00a0\u200b\u200c\u200d\u2060\ufeff",
+    });
+    assert.equal(r.get("lan:a:9100").status, "offline");
+    assert.equal(r.get("lan:a:9100").status_detail, "unplugged");
+    r.applyServerSync([
+      { id: 2, external_id: "lan:a:9100", status: "" },
+    ]);
+    assert.equal(r.get("lan:a:9100").status, "offline");
+    assert.equal(r.get("lan:a:9100").status_detail, "unplugged");
+  });
+});
+
+describe("R26D mutations (survivor killers)", () => {
+  it("L1: empty/whitespace status must not clamp to error", () => {
+    assert.equal(isStatusValueProvided(""), false);
+    assert.equal(isStatusValueProvided("  "), false);
+    assert.equal(isStatusValueProvided("\u200b"), false);
+    const n = normalizeStatusFields("", null, { statusProvided: true });
+    assert.equal(n.status, null);
+    assert.notEqual(n.status, "error");
+    const r = createPrinterRegistry();
+    r.upsert({
+      external_id: "lan:a:9100",
+      name: "n",
+      status: "offline",
+      status_detail: "unplugged",
+    });
+    r.upsert({ external_id: "lan:a:9100", name: "n", status: "" });
     assert.equal(r.get("lan:a:9100").status, "offline");
   });
 });
