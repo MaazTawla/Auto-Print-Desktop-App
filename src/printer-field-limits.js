@@ -158,15 +158,22 @@ function capStatus(raw) {
  */
 function normalizeStatusFields(status, statusDetail, opts = {}) {
   const detailProvided = opts.detailProvided === true;
-  const statusProvided = opts.statusProvided === true;
-  const lower =
-    status == null ? "" : String(status).trim().toLowerCase();
+  // R25D-L2: null/undefined status is never "provided" (avoids → error).
+  const statusProvided = opts.statusProvided === true && status != null;
   const incoming =
     statusDetail != null && String(statusDetail).trim() !== ""
       ? String(statusDetail)
       : null;
-  let next;
   let detail = incoming;
+  if (status == null) {
+    // Not a real status value — caller keeps stored status; detail only if provided.
+    return {
+      status: null,
+      status_detail: detailProvided ? detail : incoming,
+    };
+  }
+  const lower = String(status).trim().toLowerCase();
+  let next;
   if (lower === "online" || lower === "offline" || lower === "error") {
     next = lower;
   } else if (KNOWN_STATUS_DETAILS[lower]) {

@@ -150,29 +150,36 @@ function createPrinterRegistry(initial = {}) {
         ? String(printer.name)
         : windowsName || (prev && prev.name) || "";
     const cleanedName = resolvePrinterName(rawName, externalId);
-    // R24D: detail changes only when upsert includes status or status_detail.
-    const statusProvided = Object.prototype.hasOwnProperty.call(
-      printer,
-      "status"
-    );
+    // R24D / R25D-L2: status/detail change only when a real value is provided.
+    // status: null | undefined ⇒ not provided (keep stored; never clamp to error).
+    const statusProvided =
+      Object.prototype.hasOwnProperty.call(printer, "status") &&
+      printer.status != null;
     const detailProvided = Object.prototype.hasOwnProperty.call(
       printer,
       "status_detail"
     );
-    const statusRaw = statusProvided
-      ? printer.status
-      : (prev && prev.status) || "online";
-    let detailIn = null;
-    if (detailProvided) {
-      detailIn =
-        printer.status_detail != null ? String(printer.status_detail) : null;
-    } else if (prev && prev.status_detail != null) {
-      detailIn = prev.status_detail;
+    let statusOut = (prev && prev.status) || "online";
+    let detailOut =
+      prev && prev.status_detail != null ? prev.status_detail : null;
+    if (statusProvided || detailProvided) {
+      const statusRaw = statusProvided
+        ? printer.status
+        : (prev && prev.status) || "online";
+      let detailIn = null;
+      if (detailProvided) {
+        detailIn =
+          printer.status_detail != null ? String(printer.status_detail) : null;
+      } else if (prev && prev.status_detail != null) {
+        detailIn = prev.status_detail;
+      }
+      const statusFields = normalizeStatusFields(statusRaw, detailIn, {
+        detailProvided,
+        statusProvided,
+      });
+      if (statusProvided) statusOut = statusFields.status || "online";
+      detailOut = statusFields.status_detail;
     }
-    const statusFields = normalizeStatusFields(statusRaw, detailIn, {
-      detailProvided,
-      statusProvided,
-    });
     // R22D-L3 / L14-I4: invalid or omitted ('' / whitespace) port keeps stored.
     let port = prev && prev.port != null ? prev.port : null;
     if (Object.prototype.hasOwnProperty.call(printer, "port")) {
@@ -185,8 +192,8 @@ function createPrinterRegistry(initial = {}) {
       windows_name: windowsName || (prev && prev.windows_name) || externalId,
       connection,
       connection_type: connection,
-      status: statusFields.status || "online",
-      status_detail: statusFields.status_detail,
+      status: statusOut,
+      status_detail: detailOut,
       is_default: Boolean(printer.is_default ?? printer.isDefault),
       model:
         printer.model != null
@@ -226,15 +233,15 @@ function createPrinterRegistry(initial = {}) {
       const externalId = normalizeExternalId(p.external_id);
       if (!externalId) continue;
       const prev = byExternalId.get(externalId);
-      // R24D-L1: only pass status_detail when the server sent the field
-      // (undefined → omit key so a local error detail like "jam" is kept).
+      // R24D-L1 / R25D-L1: only pass status / status_detail when the server
+      // actually sent them (not undefined/null). Never fall back to stored
+      // status — a bare {id, external_id} must leave offline+"unplugged" alone.
       const syncRow = {
         ...(prev || {}),
         external_id: externalId,
         name: p.name || (prev && prev.name) || externalId,
         windows_name: (prev && prev.windows_name) || p.name || externalId,
         connection: p.connection_type || p.connection || (prev && prev.connection),
-        status: p.status || (prev && prev.status) || "online",
         is_default:
           p.is_default != null
             ? Boolean(p.is_default)
@@ -244,6 +251,11 @@ function createPrinterRegistry(initial = {}) {
         server_id: p.id,
         id: p.id,
       };
+      if (p.status != null) {
+        syncRow.status = p.status;
+      } else {
+        delete syncRow.status;
+      }
       if (p.status_detail !== undefined) {
         syncRow.status_detail = p.status_detail;
       } else {
