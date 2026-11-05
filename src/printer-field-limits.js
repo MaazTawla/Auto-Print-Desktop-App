@@ -112,6 +112,16 @@ function printerNameBlankCheck(raw) {
 }
 
 /**
+ * R26D-L1: a status counts as provided only when it has a visible character
+ * after the same invisible strip used for names (empty / whitespace /
+ * ZWSP/ZWNJ/ZWJ/WJ/BOM/NBSP-only → not provided).
+ */
+function isStatusValueProvided(status) {
+  if (status == null) return false;
+  return printerNameBlankCheck(String(status)) !== "";
+}
+
+/**
  * If the blank-check copy is empty (no visible characters), return fallbackId.
  * Otherwise return the original with only end spaces trimmed — keep ZWJ in
  * real emoji sequences; do not collapse inner spaces.
@@ -158,14 +168,15 @@ function capStatus(raw) {
  */
 function normalizeStatusFields(status, statusDetail, opts = {}) {
   const detailProvided = opts.detailProvided === true;
-  // R25D-L2: null/undefined status is never "provided" (avoids → error).
-  const statusProvided = opts.statusProvided === true && status != null;
+  // R25D-L2 / R26D-L1: null/undefined/blank/invisible-only → not provided.
+  const statusProvided =
+    opts.statusProvided === true && isStatusValueProvided(status);
   const incoming =
     statusDetail != null && String(statusDetail).trim() !== ""
       ? String(statusDetail)
       : null;
   let detail = incoming;
-  if (status == null) {
+  if (!isStatusValueProvided(status)) {
     // Not a real status value — caller keeps stored status; detail only if provided.
     return {
       status: null,
@@ -379,6 +390,7 @@ module.exports = {
   capExternalId,
   sanitizePrinterName,
   printerNameBlankCheck,
+  isStatusValueProvided,
   resolvePrinterName,
   sanitizePort,
   capStatus,

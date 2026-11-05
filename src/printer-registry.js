@@ -16,6 +16,7 @@ const {
   resolvePrinterName,
   sanitizePort,
   normalizeStatusFields,
+  isStatusValueProvided,
   codePointLength,
 } = require("./printer-field-limits");
 
@@ -150,11 +151,12 @@ function createPrinterRegistry(initial = {}) {
         ? String(printer.name)
         : windowsName || (prev && prev.name) || "";
     const cleanedName = resolvePrinterName(rawName, externalId);
-    // R24D / R25D-L2: status/detail change only when a real value is provided.
-    // status: null | undefined ⇒ not provided (keep stored; never clamp to error).
+    // R24D / R25D-L2 / R26D-L1: status/detail change only when a real value
+    // is provided. null | undefined | "" | whitespace | invisible-only ⇒ not
+    // provided (keep stored; never clamp to error).
     const statusProvided =
       Object.prototype.hasOwnProperty.call(printer, "status") &&
-      printer.status != null;
+      isStatusValueProvided(printer.status);
     const detailProvided = Object.prototype.hasOwnProperty.call(
       printer,
       "status_detail"
@@ -233,9 +235,9 @@ function createPrinterRegistry(initial = {}) {
       const externalId = normalizeExternalId(p.external_id);
       if (!externalId) continue;
       const prev = byExternalId.get(externalId);
-      // R24D-L1 / R25D-L1: only pass status / status_detail when the server
-      // actually sent them (not undefined/null). Never fall back to stored
-      // status — a bare {id, external_id} must leave offline+"unplugged" alone.
+      // R24D-L1 / R25D-L1 / R26D-L1: only pass status / status_detail when the
+      // server sent a real value (not undefined/null/blank/invisible-only).
+      // Never fall back to stored status.
       const syncRow = {
         ...(prev || {}),
         external_id: externalId,
@@ -251,7 +253,7 @@ function createPrinterRegistry(initial = {}) {
         server_id: p.id,
         id: p.id,
       };
-      if (p.status != null) {
+      if (isStatusValueProvided(p.status)) {
         syncRow.status = p.status;
       } else {
         delete syncRow.status;
