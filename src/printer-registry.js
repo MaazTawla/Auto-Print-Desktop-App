@@ -10,6 +10,10 @@ const {
   windowsPrinterExternalId,
   inferNetworkEndpointFromWindowsPrinter,
 } = require("./windows-external-id");
+const {
+  capExternalId,
+  capSyncPrinterRow,
+} = require("./printer-field-limits");
 
 function normalizeExternalId(raw) {
   return String(raw || "").trim();
@@ -90,10 +94,12 @@ function createPrinterRegistry(initial = {}) {
     const windowsName = String(
       printer.windows_name || printer.name || printer.external_id || ""
     ).trim();
-    const externalId = normalizeExternalId(
-      printer.external_id ||
-        printer.externalId ||
-        (windowsName ? windowsPrinterExternalId(windowsName) : "")
+    const externalId = capExternalId(
+      normalizeExternalId(
+        printer.external_id ||
+          printer.externalId ||
+          (windowsName ? windowsPrinterExternalId(windowsName) : "")
+      )
     );
     if (!externalId) return null;
     const prev = byExternalId.get(externalId);
@@ -311,21 +317,25 @@ function createPrinterRegistry(initial = {}) {
   }
 
   function toSyncPayload() {
-    return list().map((p) => ({
-      external_id: p.external_id,
-      name: p.name,
-      connection: p.connection,
-      connection_type: p.connection_type || p.connection,
-      status: p.status === "out_of_paper" ? "error" : p.status,
-      status_detail:
-        p.status === "out_of_paper"
-          ? p.status_detail || "Out of paper"
-          : p.status_detail,
-      is_default: p.is_default,
-      model: p.model,
-      ip_address: p.ip_address,
-      ...(p.port != null ? { port: p.port } : {}),
-    }));
+    // L13-L1 / BE v1.32: truncate OS/hardware fields at grapheme boundaries
+    // before send; cap status at 16; keep external_id ≤ 255 (hash suffix).
+    return list().map((p) =>
+      capSyncPrinterRow({
+        external_id: p.external_id,
+        name: p.name,
+        connection: p.connection,
+        connection_type: p.connection_type || p.connection,
+        status: p.status === "out_of_paper" ? "error" : p.status,
+        status_detail:
+          p.status === "out_of_paper"
+            ? p.status_detail || "Out of paper"
+            : p.status_detail,
+        is_default: p.is_default,
+        model: p.model,
+        ip_address: p.ip_address,
+        ...(p.port != null ? { port: p.port } : {}),
+      })
+    );
   }
 
   function serialize() {

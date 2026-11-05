@@ -6,6 +6,7 @@
 "use strict";
 
 const { windowsPrinterExternalId } = require("./windows-external-id");
+const { capExternalId } = require("./printer-field-limits");
 
 const DEFAULT_LAN_PORT = 9100;
 
@@ -18,7 +19,7 @@ function lanExternalId(ip, port = DEFAULT_LAN_PORT) {
       "LAN port must be 1..65535 (got " + port + "); refusing silent remap to " + DEFAULT_LAN_PORT
     );
   }
-  return `lan:${host}:${p}`;
+  return capExternalId(`lan:${host}:${p}`);
 }
 
 function btExternalId(mac) {
@@ -32,7 +33,7 @@ function fromWindowsPrinter(p) {
     (p && (p.name || p.deviceName || p.printerName)) || ""
   ).trim();
   if (!name) return null;
-  const externalId = windowsPrinterExternalId(name);
+  const externalId = capExternalId(windowsPrinterExternalId(name));
   const portName = String((p && (p.portName || p.port || p.deviceId)) || "").trim();
   const connection = inferWindowsConnection(p);
   const typeLabel =

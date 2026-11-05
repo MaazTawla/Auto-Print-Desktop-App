@@ -6,6 +6,13 @@
  */
 
 const net = require("net");
+const {
+  validateManualPrinterHost,
+  validateManualPrinterName,
+  validateManualLanExternalId,
+  MANUAL_HOST_MAX,
+  PRINTER_FIELD_MAX,
+} = require("./printer-field-limits");
 
 const PORT_RANGE_ERROR = "Port must be an integer between 1 and 65535.";
 const IPV6_ERROR =
@@ -44,8 +51,13 @@ function parsePortStrict(raw) {
 function validateManualLan(host, portRaw) {
   const h = host == null ? "" : String(host).trim();
   if (!h) return HOST_REQUIRED_ERROR;
+  const hostLenErr = validateManualPrinterHost(h);
+  if (hostLenErr) return hostLenErr;
   if (isIpv6Address(h)) return IPV6_ERROR;
   if (parsePortStrict(portRaw) == null) return PORT_RANGE_ERROR;
+  const port = parsePortStrict(portRaw);
+  const eidErr = validateManualLanExternalId(h, port);
+  if (eidErr) return eidErr;
   return null;
 }
 
@@ -59,8 +71,12 @@ module.exports = {
   IPV6_ERROR,
   HOST_REQUIRED_ERROR,
   NON_HOST_ADD_ERROR,
+  MANUAL_HOST_MAX,
+  PRINTER_FIELD_MAX,
   isIpv6Address,
   parsePortStrict,
   validateManualLan,
+  validateManualPrinterName,
+  validateManualPrinterHost,
   assertPrintHostCanAdd,
 };
