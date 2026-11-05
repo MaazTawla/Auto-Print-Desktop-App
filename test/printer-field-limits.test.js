@@ -16,6 +16,7 @@ const {
   rejectMappingIfNameTooLong,
   sanitizePrinterName,
   resolvePrinterName,
+  printerNameBlankCheck,
   normalizeStatusFields,
   sanitizePort,
   validateManualPrinterHost,
@@ -460,7 +461,7 @@ describe("R21D-L1/L2/L3 registry + wire", () => {
     assert.equal(hit.printer.external_id, "lan:10.0.0.9:9100");
   });
 
-  it("R21D-L2 / R22D-L2: blank-makers only; keep ZWJ and inner spaces", () => {
+  it("R21D-L2 / R22D-L2 / L14-I5: invisible-only blank; keep ZWJ in emoji", () => {
     assert.equal(sanitizePrinterName("\u00a0\u200b\u2060\ufeff "), "");
     assert.equal(resolvePrinterName("\u00a0\u200b ", "lan:a:9100"), "lan:a:9100");
     assert.equal(resolvePrinterName("A  B", "id"), "A  B");
@@ -568,10 +569,77 @@ describe("R22D mutations (survivor killers)", () => {
     assert.equal(onlineKeeps.status_detail, "Door open");
   });
 
-  it("L2: ZWJ kept; inner spaces kept; blank-makers only for blank check", () => {
+  it("L2/L14-I5: ZWJ kept in emoji; invisible-only falls back", () => {
     assert.equal(resolvePrinterName("👨‍👩‍👧", "id"), "👨‍👩‍👧");
     assert.equal(resolvePrinterName("A  B", "id"), "A  B");
-    assert.notEqual(resolvePrinterName("\u200c\u200d", "id"), "id"); // ZWNJ+ZWJ alone are NOT blank-makers
+    assert.equal(resolvePrinterName("\u200c\u200d", "id"), "id"); // ZWNJ+ZWJ alone → blank
     assert.equal(resolvePrinterName("\u200b\u2060\ufeff", "id"), "id");
+  });
+});
+
+describe("L14-I4 / L14-I5 BE v1.33 notes", () => {
+  it("L14-I4: empty/whitespace port omitted; keep stored; never send 0", () => {
+    assert.equal(sanitizePort(""), undefined);
+    assert.equal(sanitizePort("   "), undefined);
+    assert.equal(sanitizePort("\t"), undefined);
+    assert.equal(sanitizePort(0), undefined);
+    assert.equal(sanitizePort("0"), undefined);
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:p:9100", name: "n", port: 9100 });
+    r.upsert({ external_id: "lan:p:9100", name: "n", port: "" });
+    assert.equal(r.get("lan:p:9100").port, 9100);
+    r.upsert({ external_id: "lan:p:9100", name: "n", port: "  " });
+    assert.equal(r.get("lan:p:9100").port, 9100);
+    const wire = r.toSyncPayload()[0];
+    assert.equal(wire.port, 9100);
+    assert.notEqual(wire.port, 0);
+  });
+
+  it("L14-I5: ZWJ-only name falls back to id", () => {
+    assert.equal(resolvePrinterName("\u200d", "lan:z:9100"), "lan:z:9100");
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:z:9100", name: "\u200d" });
+    assert.equal(r.toSyncPayload()[0].name, "lan:z:9100");
+  });
+
+  it("L14-I5: mixed invisible-only name falls back", () => {
+    const mix = "\u00a0\u200b\u200c\u200d\u2060\ufeff \t";
+    assert.equal(printerNameBlankCheck(mix), "");
+    assert.equal(resolvePrinterName(mix, "lan:m:9100"), "lan:m:9100");
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:m:9100", name: mix });
+    assert.equal(r.toSyncPayload()[0].name, "lan:m:9100");
+  });
+
+  it("L14-I5: family emoji with ZWJ stays intact", () => {
+    const family = "👨‍👩‍👧";
+    assert.equal(resolvePrinterName(family, "id"), family);
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:e:9100", name: family });
+    assert.equal(r.toSyncPayload()[0].name, family);
+  });
+});
+
+describe("L14 mutations (survivor killers)", () => {
+  it("I4: empty-string port mutant must not wipe or emit 0", () => {
+    assert.equal(sanitizePort(""), undefined);
+    const r = createPrinterRegistry();
+    r.upsert({ external_id: "lan:k:9100", name: "n", port: 9100 });
+    r.upsert({ external_id: "lan:k:9100", name: "n", port: "" });
+    assert.equal(r.get("lan:k:9100").port, 9100);
+    const p = r.toSyncPayload()[0];
+    assert.equal(p.port, 9100);
+    // Direct 0 never on the wire
+    r.upsert({ external_id: "lan:k:9100", name: "n", port: 0 });
+    assert.equal(r.get("lan:k:9100").port, 9100);
+    assert.equal(r.toSyncPayload()[0].port, 9100);
+  });
+
+  it("I5: ZWJ-only / ZWNJ-only blank check must fall back (keep-ZWJ mutant dies)", () => {
+    assert.equal(resolvePrinterName("\u200d", "id"), "id");
+    assert.equal(resolvePrinterName("\u200c", "id"), "id");
+    assert.equal(resolvePrinterName("\u200d\u200c\u200d", "id"), "id");
+    // Visible + ZWJ still sends original
+    assert.equal(resolvePrinterName("👨\u200d👩", "id"), "👨\u200d👩");
   });
 });
