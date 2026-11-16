@@ -2688,15 +2688,14 @@ function branchBindingKeys(routingKey, branchId) {
 }
 
 /**
- * Exchanges to bind. Server publishes to auto_print (see merchant .env);
- * older agents sometimes bound to "Orders Print" / orders.print instead.
+ * Exchanges to bind. Server publishes to auto_print (see merchant .env).
+ * Do not bind a missing exchange (a 404 NOT_FOUND closes the channel).
  */
 function exchangesToBind(configuredExchange) {
   const set = new Set();
   const configured = String(configuredExchange || "").trim();
   if (configured) set.add(configured);
   set.add("auto_print");
-  set.add("orders.print");
   return [...set];
 }
 
@@ -2709,8 +2708,9 @@ async function bindBranchQueue(channel, queueName, exchange, routingKey, branchI
       try {
         await channel.bindQueue(queueName, ex, key);
         bound.push(`${ex} ← ${key}`);
-      } catch (_) {
-        // Exchange may not exist on this broker — skip.
+      } catch (err) {
+        const msg = err && err.message ? String(err.message) : String(err);
+        throw new Error(`bind to ${ex} failed: ${msg}`);
       }
     }
   }
@@ -2766,7 +2766,7 @@ async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
       (readUserConfig().rabbit_exchange_type &&
         String(readUserConfig().rabbit_exchange_type).trim()) ||
       "topic";
-    await withTempRabbitChannel(async (ch) => {
+    const bound = await withTempRabbitChannel(async (ch) => {
       await ch.assertExchange(exchange, exType, { durable: true });
       await ch.assertQueue(queueName, queueOpts);
       const keys = await bindBranchQueue(ch, queueName, exchange, routingKey, branchId);
@@ -2774,13 +2774,14 @@ async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
         `Queue ${queueName} ready (durable=${queueOpts.durable}, args=${JSON.stringify(queueOpts.arguments || {})}) — bound to ${exchange} [${keys.join(", ")}]. Only the print host consumes.`,
         "ℹ️"
       );
+      return keys;
     });
     try {
       if (readUserConfig().queue_precondition_hint) {
         saveUserConfig({ queue_precondition_hint: null });
       }
     } catch (_) {}
-    return;
+    return bound || [];
   } catch (err) {
     if (!isInequivalentArgError(err)) throw err;
   }
@@ -2799,9 +2800,9 @@ async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
     (readUserConfig().rabbit_exchange_type &&
       String(readUserConfig().rabbit_exchange_type).trim()) ||
     "topic";
-  await withTempRabbitChannel(async (ch) => {
+  return (await withTempRabbitChannel(async (ch) => {
     await ch.assertExchange(exchange, exTypeMigrate, { durable: true });
-    // Passive: verify queue exists without changing args
+    // Passive: verify queue exists without changing args. Never deleteQueue.
     await ch.checkQueue(queueName);
     try {
       const keys = await bindBranchQueue(ch, queueName, exchange, routingKey, branchId);
@@ -2809,13 +2810,15 @@ async function ensureHostPrintQueue(queueName, exchange, routingKey, branchId) {
         `Passive attach to existing queue ${queueName} — bound to ${exchange} [${keys.join(", ")}]. Redeclare via artisan when ready.`,
         "ℹ️"
       );
+      return keys;
     } catch (bindErr) {
       log(
         `Passive queue check ok but bind failed: ${bindErr && bindErr.message ? bindErr.message : String(bindErr)}. Redeclare via artisan.`,
         "⚠️"
       );
+      return [];
     }
-  });
+  })) || [];
 }
 
 /** @deprecated Use ensureHostPrintQueue — kept as alias for any external callers. */
@@ -3294,12 +3297,12 @@ async function startRabbit() {
       state.channel = liveRoutingKey;
 
       // Declare/bind on a throwaway connection first so a 406 cannot poison consume.
-      await ensureHostPrintQueue(
+      const bound = (await ensureHostPrintQueue(
         liveQueueName,
         rabbitOpts.exchange,
         liveRoutingKey,
         state.branchId
-      );
+      )) || [];
 
       const connection = await amqp.connect(rabbitOpts.url, {
         timeout: RABBIT_CONNECT_TIMEOUT_MS,
@@ -3337,13 +3340,8 @@ async function startRabbit() {
       }
       const liveChannel = rabbitChannel;
       await liveChannel.checkQueue(liveQueueName);
-      const bound = await bindBranchQueue(
-        liveChannel,
-        liveQueueName,
-        rabbitOpts.exchange,
-        liveRoutingKey,
-        state.branchId
-      );
+      // Bindings are durable and were made on the throwaway channel in ensureHostPrintQueue.
+      // Do not bind on the live channel: a missing exchange 404 would close it before consume.
       wireRabbitChannel(liveChannel);
 
       // Contract: exclusive=false; prefetch from register (default 1). SAC is on the queue declare.
